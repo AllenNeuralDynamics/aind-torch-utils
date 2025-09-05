@@ -1,6 +1,6 @@
 from typing import List, Optional, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class InferenceConfig(BaseModel):
@@ -61,3 +61,24 @@ class InferenceConfig(BaseModel):
     norm_percentile_upper: float = Field(
         default=99.9, description="Upper percentile for normalization"
     )
+
+
+    @model_validator(mode="after")
+    def _check_overlap_vs_trim(self):  
+        """Ensure overlap is sufficient for requested trimming when using seam_mode='trim'.
+
+        Requirement: overlap >= 2 * trim_voxels.
+
+        Trimming removes up to ``trim_voxels`` from both sides of a patch along an axis
+        (when not touching a block boundary). If the overlap is smaller than the total
+        trimmed width ( ``2 * trim_voxels`` ) there can be uncovered gaps or zero-weight
+        regions between adjacent patches.
+        """
+        if self.seam_mode == "trim" and self.trim_voxels is not None:
+            required = 2 * int(self.trim_voxels)
+            if self.overlap < required:
+                raise ValueError(
+                    f"overlap ({self.overlap}) must be >= 2 * trim_voxels "
+                    f"({self.trim_voxels}) == {required} when seam_mode='trim'"
+                )
+        return self
