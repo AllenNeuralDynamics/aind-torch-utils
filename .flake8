@@ -1,0 +1,9 @@
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    build,
+    .venv,
+    venv, 
+    .conda
+max-complexity = 10
