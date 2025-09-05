@@ -245,15 +245,24 @@ class PrepWorker:
 
                     raw = block[sz:ez, sy:ey, sx:ex].astype(np.float32, copy=False)
 
-                    mn, mx = np.percentile(
-                        raw,
-                        [
-                            self.cfg.norm_percentile_lower,
-                            self.cfg.norm_percentile_upper,
-                        ],
-                    )
-                    scale = max(mx, 1.0)  # "wrong" on purpose to match training
-                    norm = (raw - mn) / scale
+                    if (
+                        self.cfg.norm_percentile_lower
+                        == self.cfg.norm_percentile_upper
+                    ):
+                        # Bypass normalization entirely (identity path). Store
+                        # (0,1) so writer reconstructs raw via scale=1, mn=0.
+                        mn, mx = 0.0, 1.0
+                        norm = raw
+                    else:
+                        mn, mx = np.percentile(
+                            raw,
+                            [
+                                self.cfg.norm_percentile_lower,
+                                self.cfg.norm_percentile_upper,
+                            ],
+                        )
+                        scale = max(mx - mn, self.cfg.eps)
+                        norm = (raw - mn) / scale  # may extend outside [0,1]
 
                     host_in[bi, 0, :dz, :dy, :dx].copy_(torch.from_numpy(norm))
 
@@ -518,8 +527,9 @@ class WriterWorker:
                 dz, dy, dx = preds.valid_sizes[bi]
                 patch_pred = out_np[bi, 0]
                 mn, mx = preds.per_patch_mnmx[bi]
+                scale = max(mx - mn, self.cfg.eps)
                 pp = patch_pred.astype(np.float32, copy=False)
-                denorm = np.abs(pp * np.float32(mx) + np.float32(mn)).astype(
+                denorm = (pp * np.float32(scale) + np.float32(mn)).astype(
                     np.float32, copy=False
                 )
                 acc.add(denorm, (sz, sy, sx), (dz, dy, dx))
