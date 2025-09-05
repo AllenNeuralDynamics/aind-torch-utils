@@ -42,7 +42,8 @@ def dummy_data(temp_dir):
         },
     }
     data = ts.open(spec, create=True).result()
-    arr = np.random.randint(0, 255, size=shape, dtype=dtype)
+    # Min value 1 to indentify gaps in output due to incorrect stitching
+    arr = np.random.randint(1, 65535, size=shape, dtype=np.uint16)
     data.write(arr).result()
 
     # Prepare output spec
@@ -98,6 +99,8 @@ def test_run_pipeline(temp_dir, dummy_data):
     # The mock GpuWorker does not process data, so we only check for equality if cuda is available
     if torch.cuda.is_available():
         np.testing.assert_array_equal(input_data, output_data)
+        # assert all values are > 0 to check for gaps during stitching
+        assert np.all(output_data > 0)
     else:
         # If no cuda, output will be empty
         assert np.all(output_data == 0)
@@ -108,6 +111,8 @@ def _run_test_logic(input_store, output_store, metrics_json, devices, model):
     cfg = InferenceConfig(
         patch=(16, 16, 16),
         overlap=4,
+        trim_voxels=2,
+        seam_mode="trim",
         block=(32, 32, 32),
         batch_size=4,
         t_idx=0,
@@ -115,6 +120,8 @@ def _run_test_logic(input_store, output_store, metrics_json, devices, model):
         devices=devices,
         amp=False,
         max_inflight_batches=10,
+        norm_percentile_lower=0,
+        norm_percentile_upper=0
     )
 
     run(
