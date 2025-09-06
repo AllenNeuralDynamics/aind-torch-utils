@@ -88,3 +88,4 @@ secrets.py
 .codeocean
 data/
 environment/
+metadata/
