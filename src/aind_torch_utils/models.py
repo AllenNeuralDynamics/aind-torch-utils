@@ -8,7 +8,7 @@ from aind_torch_utils.model_registry import ModelRegistry
 
 
 # Register the UNet model
-@ModelRegistry.register("unet")
+@ModelRegistry.register("denoise-net")
 def load_unet(weights_path: Optional[str] = None) -> nn.Module:
     """Load UNet model with optional weights.
     
