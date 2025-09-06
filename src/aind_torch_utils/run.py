@@ -448,6 +448,69 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         default=["cuda:0"],
     )
     ap.add_argument("--no-amp", action="store_true")
+    ap.add_argument("--no-tf32", action="store_true", help="Disable TF32 (enabled by default)")
+    ap.add_argument("--compile", action="store_true", help="Enable torch.compile")
+    ap.add_argument(
+        "--compile-mode",
+        type=str,
+        default="reduce-overhead",
+        choices=["reduce-overhead", "max-autotune"],
+        help="torch.compile mode",
+    )
+    ap.add_argument(
+        "--no-compile-dynamic",
+        action="store_true",
+        help="Disable dynamic shape support for torch.compile",
+    )
+    ap.add_argument(
+        "--max-inflight-batches",
+        type=int,
+        default=64,
+        help="Maximum prepared batches allowed in queues",
+    )
+    ap.add_argument(
+        "--seam-mode",
+        type=str,
+        default="trim",
+        choices=["trim", "blend"],
+        help="Seam handling strategy",
+    )
+    ap.add_argument(
+        "--trim-voxels",
+        type=int,
+        default=5,
+        help="Voxels to trim from each non-boundary patch edge in trim mode",
+    )
+    ap.add_argument(
+        "--halo",
+        type=int,
+        default=None,
+        help="Explicit halo size (defaults to trim_voxels if omitted)",
+    )
+    ap.add_argument(
+        "--min-blend-weight",
+        type=float,
+        default=0.05,
+        help="Minimum blend weight floor (blend mode)",
+    )
+    ap.add_argument(
+        "--eps",
+        type=float,
+        default=1e-6,
+        help="Numerical epsilon for divisions",
+    )
+    ap.add_argument(
+        "--norm-lower",
+        type=float,
+        default=0.5,
+        help="Lower percentile for per-patch normalization",
+    )
+    ap.add_argument(
+        "--norm-upper",
+        type=float,
+        default=99.9,
+        help="Upper percentile for per-patch normalization",
+    )
     ap.add_argument(
         "--metrics-json",
         type=str,
@@ -499,6 +562,18 @@ def main(argv: Optional[List[str]] = None) -> None:
         c_idx=args.c,
         devices=args.devices,
         amp=not args.no_amp,
+        use_tf32=not args.no_tf32,
+        use_compile=args.compile,
+        compile_mode=args.compile_mode,
+        compile_dynamic=not args.no_compile_dynamic,
+        max_inflight_batches=args.max_inflight_batches,
+        seam_mode=args.seam_mode,
+        trim_voxels=args.trim_voxels,
+        halo=args.halo,
+        min_blend_weight=args.min_blend_weight,
+        eps=args.eps,
+        norm_percentile_lower=args.norm_lower,
+        norm_percentile_upper=args.norm_upper,
     )
 
     run(
