@@ -83,3 +83,8 @@ Thumbs.db
 *.env
 *.ini
 secrets.py
+
+.vscode
+.codeocean
+data/
+environment/
