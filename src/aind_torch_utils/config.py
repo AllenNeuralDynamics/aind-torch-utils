@@ -1,4 +1,5 @@
 from typing import List, Optional, Tuple
+import warnings
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -64,21 +65,94 @@ class InferenceConfig(BaseModel):
 
 
     @model_validator(mode="after")
-    def _check_overlap_vs_trim(self):  
-        """Ensure overlap is sufficient for requested trimming when using seam_mode='trim'.
-
-        Requirement: overlap >= 2 * trim_voxels.
-
-        Trimming removes up to ``trim_voxels`` from both sides of a patch along an axis
-        (when not touching a block boundary). If the overlap is smaller than the total
-        trimmed width ( ``2 * trim_voxels`` ) there can be uncovered gaps or zero-weight
-        regions between adjacent patches.
+    def _validate(self):
         """
-        if self.seam_mode == "trim" and self.trim_voxels is not None:
+        Cross-field validation & sanity checks.
+        """
+        # Basic geometry
+        if len(self.patch) != 3:
+            raise ValueError("patch must have exactly 3 dimensions (Z,Y,X)")
+        if any(d <= 0 for d in self.patch):
+            raise ValueError(f"patch dims must be >0, got {self.patch}")
+        if len(self.block) != 3:
+            raise ValueError("block must have exactly 3 dimensions (Z,Y,X)")
+        if any(d <= 0 for d in self.block):
+            raise ValueError(f"block dims must be >0, got {self.block}")
+
+        if self.overlap < 0:
+            raise ValueError("overlap must be >= 0")
+        min_patch = min(self.patch)
+        if self.overlap >= min_patch:
+            raise ValueError(
+                f"overlap ({self.overlap}) must be < smallest patch dim ({min_patch})"
+            )
+
+        # Block >= patch
+        if any(b < p for b, p in zip(self.block, self.patch)):
+            raise ValueError(
+                f"All block dims {self.block} must be >= patch dims {self.patch}"
+            )
+
+        # Stride validity
+        stride = tuple(p - self.overlap for p in self.patch)
+        if any(s <= 0 for s in stride):
+            raise ValueError(
+                f"Stride (patch - overlap) must be >0 in each dim; patch={self.patch} overlap={self.overlap} -> stride={stride}"
+            )
+
+        # Seam handling
+        if self.seam_mode not in {"trim", "blend"}:
+            raise ValueError("seam_mode must be 'trim' or 'blend'")
+
+        if self.seam_mode == "trim":
+            if self.trim_voxels is None:
+                raise ValueError("trim_voxels must be set when seam_mode='trim'")
+            if self.trim_voxels < 0:
+                raise ValueError("trim_voxels must be >= 0")
+            # Required overlap already validated below, but compute now
             required = 2 * int(self.trim_voxels)
             if self.overlap < required:
                 raise ValueError(
-                    f"overlap ({self.overlap}) must be >= 2 * trim_voxels "
-                    f"({self.trim_voxels}) == {required} when seam_mode='trim'"
+                    f"overlap ({self.overlap}) must be >= 2 * trim_voxels ({self.trim_voxels}) == {required} when seam_mode='trim'"
                 )
+            if required >= min_patch:
+                raise ValueError(
+                    f"2 * trim_voxels ({required}) must be < smallest patch dim ({min_patch})"
+                )
+        else:  # blend mode
+            if not (0 < self.min_blend_weight <= 1):
+                raise ValueError(
+                    f"min_blend_weight ({self.min_blend_weight}) must be in (0,1] for blend mode"
+                )
+            if self.overlap == 0:
+                raise ValueError("blend seam_mode requires overlap > 0")
+            if self.trim_voxels is not None:
+                warnings.warn(
+                    "trim_voxels specified but seam_mode='blend'; value will be ignored.",
+                    RuntimeWarning,
+                )
+
+        # Halo
+        if self.halo is not None:
+            if self.halo < 0:
+                raise ValueError(f"halo ({self.halo}) must be >= 0")
+
+        # Normalization percentiles
+        if not (0.0 <= self.norm_percentile_lower < self.norm_percentile_upper <= 100.0):
+            raise ValueError(
+                "Normalization percentiles must satisfy 0 <= lower < upper <= 100"
+            )
+
+        # Numerical params
+        if self.eps <= 0:
+            raise ValueError("eps must be > 0")
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+        if self.max_inflight_batches <= 0:
+            raise ValueError("max_inflight_batches must be > 0")
+
+        # Devices
+        if not self.devices:
+            raise ValueError("devices list must not be empty")
+
         return self
