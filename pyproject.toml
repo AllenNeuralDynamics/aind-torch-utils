@@ -24,7 +24,6 @@ dependencies = [
   "psutil",
   "tensorstore",
   "numpy",
-  "aind-exaspim-image-compression@git+https://github.com/AllenNeuralDynamics/aind-exaspim-image-compression.git@main",
 ]
 
 [project.optional-dependencies]
@@ -38,6 +37,7 @@ dev = [
     'furo'
 ]
 extras = ['matplotlib']
+denoise-net = ["aind-exaspim-image-compression@git+https://github.com/AllenNeuralDynamics/aind-exaspim-image-compression.git@main"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

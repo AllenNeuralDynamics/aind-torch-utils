@@ -11,14 +11,14 @@ import time
 from copy import deepcopy
 from typing import Any, List, Optional, Tuple
 
-import torch
-from aind_exaspim_image_compression.machine_learning.unet3d import UNet
 from torch import nn
 
+from aind_torch_utils.model_registry import ModelRegistry
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.monitoring import QueueMonitor, SystemMonitor
 from aind_torch_utils.utils import open_ts_spec
 from aind_torch_utils.workers import GpuWorker, PrepWorker, WriterWorker
+import aind_torch_utils.models  # This registers all models when imported
 
 logging.basicConfig(
     level=logging.INFO,
@@ -390,11 +390,13 @@ def run(
     logger.info(f"Throughput: {throughput:.2f}MB/s")
 
 
-def load_model(weights_path: Optional[str] = None) -> nn.Module:
-    """Loads a model from a weights file.
+def load_model(model_type: str, weights_path: Optional[str] = None) -> nn.Module:
+    """Loads a model from the registry.
 
     Parameters
     ----------
+    model_type : str
+        Type of model to load (must be registered).
     weights_path : Optional[str], optional
         Path to the model weights file, by default None.
 
@@ -406,15 +408,14 @@ def load_model(weights_path: Optional[str] = None) -> nn.Module:
     Raises
     ------
     FileNotFoundError
-        If the weights file is not found.
+        If the weights file is specified but not found.
+    KeyError
+        If the model type is not registered.
     """
-    model = UNet()
-    if weights_path and os.path.exists(weights_path):
-        sd = torch.load(weights_path, map_location="cpu")
-        model.load_state_dict(sd)
-    else:
+    if weights_path and not os.path.exists(weights_path):
         raise FileNotFoundError(f"Model weights not found at {weights_path}")
-    return model
+    
+    return ModelRegistry.load_model(model_type, weights_path)
 
 
 def _parse_args(argv: List[str]) -> argparse.Namespace:
@@ -433,6 +434,7 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Scalable pytorch inference pipeline")
     ap.add_argument("--in-spec", type=str, required=True)
     ap.add_argument("--out-spec", type=str, required=True)
+    ap.add_argument("--model-type", type=str, required=True, help="Type of model to use (must be registered)")
     ap.add_argument("--weights", type=str, help="Model weights path")
     ap.add_argument("--t", type=int, default=0)
     ap.add_argument("--c", type=int, default=0)
@@ -483,7 +485,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     """
     args = _parse_args(sys.argv[1:] if argv is None else argv)
 
-    model = load_model(args.weights)
+    model = load_model(args.model_type, args.weights)
 
     in_arr = open_ts_spec(args.in_spec)
     out_arr = open_ts_spec(args.out_spec)
