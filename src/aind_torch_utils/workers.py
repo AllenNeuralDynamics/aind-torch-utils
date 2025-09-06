@@ -210,10 +210,30 @@ class PrepWorker:
             halo_left = (z0 - z0e, y0 - y0e, x0 - x0e)
             acc_shape = (z1e - z0e, y1e - y0e, x1e - x0e)
 
-            # read expanded block
+            # read expanded block and cast to float32 for normalization
             view = self.reader[t, c, slice(z0e, z1e), slice(y0e, y1e), slice(x0e, x1e)]
-            block = view.read().result()
+            norm_block = view.read().result().astype(np.float32, copy=False)
             bz, by, bx = acc_shape
+
+            if (
+                self.cfg.norm_percentile_lower == self.cfg.norm_percentile_upper
+            ):
+                # Bypass normalization entirely (identity). We pretend (mn,mx)=(0,1)
+                # so the writer performs a no-op inverse transform.
+                block_mn, block_mx = 0.0, 1.0
+            else:
+                # calculate percentiles
+                block_mn, block_mx = np.percentile(
+                    norm_block,
+                    [
+                        self.cfg.norm_percentile_lower,
+                        self.cfg.norm_percentile_upper,
+                    ],
+                )
+                block_scale = max(block_mx - block_mn, self.cfg.eps)
+                # normalize the block in-place
+                norm_block -= block_mn
+                norm_block /= block_scale
 
             # patch starts over the expanded region (same stride/overlap)
             if (bz, by, bx) not in starts_cache:
@@ -243,31 +263,14 @@ class PrepWorker:
                     )
                     dz, dy, dx = ez - sz, ey - sy, ex - sx
 
-                    raw = block[sz:ez, sy:ey, sx:ex].astype(np.float32, copy=False)
-
-                    if (
-                        self.cfg.norm_percentile_lower
-                        == self.cfg.norm_percentile_upper
-                    ):
-                        # Bypass normalization entirely (identity path). Store
-                        # (0,1) so writer reconstructs raw via scale=1, mn=0.
-                        mn, mx = 0.0, 1.0
-                        norm = raw
-                    else:
-                        mn, mx = np.percentile(
-                            raw,
-                            [
-                                self.cfg.norm_percentile_lower,
-                                self.cfg.norm_percentile_upper,
-                            ],
-                        )
-                        scale = max(mx - mn, self.cfg.eps)
-                        norm = (raw - mn) / scale  # may extend outside [0,1]
+                    # Slice the already-normalized block
+                    norm = norm_block[sz:ez, sy:ey, sx:ex]
 
                     host_in[bi, 0, :dz, :dy, :dx].copy_(torch.from_numpy(norm))
 
                     valid_sizes.append((dz, dy, dx))
-                    per_patch_mnmx.append((float(mn), float(mx)))
+                    # Every patch in the block uses the same (mn, mx)
+                    per_patch_mnmx.append((float(block_mn), float(block_mx)))
 
                 batch = Batch(
                     block_idx=block_idx,
