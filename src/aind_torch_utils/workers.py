@@ -548,7 +548,15 @@ class WriterWorker:
 
                 lz, ly, lx = preds.halo_left
                 core = ext[lz : lz + core_bz, ly : ly + core_by, lx : lx + core_bx]
-                out_u16 = np.clip(core, 0.0, 65535.0).astype(np.uint16, copy=False)
+                # preserve target dtype from output store
+                target_dtype = self.writer.dtype.numpy_dtype
+                if np.issubdtype(target_dtype, np.integer):
+                    info = np.iinfo(target_dtype)
+                    out_arr = np.clip(core, info.min, info.max).astype(
+                        target_dtype, copy=False
+                    )
+                else:
+                    out_arr = core.astype(target_dtype, copy=False)
                 self.writer[self.cfg.t_idx, self.cfg.c_idx, zsl, ysl, xsl].write(
-                    out_u16
+                    out_arr
                 ).result()
