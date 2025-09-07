@@ -232,6 +232,13 @@ class PrepWorker:
                 # normalize the block in-place
                 norm_block -= block_mn
                 norm_block /= block_scale
+                # optional clipping
+                if self.cfg.clip_norm:
+                    if self.cfg.clip_norm is True:
+                        norm_block = np.clip(norm_block, 0.0, 1.0)
+                    else:
+                        lo, hi = self.cfg.clip_norm
+                        norm_block = np.clip(norm_block, lo, hi)
 
             # patch starts over the expanded region (same stride/overlap)
             if (bz, by, bx) not in starts_cache:

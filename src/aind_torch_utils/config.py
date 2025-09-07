@@ -1,5 +1,5 @@
 import warnings
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -61,6 +61,10 @@ class InferenceConfig(BaseModel):
     )
     norm_percentile_upper: float = Field(
         default=99.9, description="Upper percentile for normalization"
+    )
+    clip_norm: Union[bool, Tuple[float, float]] = Field(
+        default=False,
+        description="If True, clip normalized values to [0,1]; if (lo,hi), clip to that range.",
     )
 
     @model_validator(mode="after")
@@ -141,8 +145,15 @@ class InferenceConfig(BaseModel):
             0.0 <= self.norm_percentile_lower <= self.norm_percentile_upper <= 100.0
         ):
             raise ValueError(
-                "Normalization percentiles must satisfy 0 <= lower < upper <= 100"
+                "Normalization percentiles must satisfy 0 <= lower <= upper <= 100"
             )
+        # clip_norm validation
+        if isinstance(self.clip_norm, tuple):
+            if len(self.clip_norm) != 2:
+                raise ValueError("clip_norm tuple must be (low, high)")
+            lo, hi = self.clip_norm
+            if not (lo < hi):
+                raise ValueError("clip_norm lower bound must be < upper bound")
 
         # Numerical params
         if self.eps <= 0:

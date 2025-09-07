@@ -518,6 +518,18 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         help="Upper percentile for per-patch normalization",
     )
     ap.add_argument(
+        "--clip-norm",
+        nargs="*",
+        type=float,
+        default=None,
+        metavar=("LO", "HI"),
+        help=(
+            "Optional clipping after percentile normalization. Usage: "
+            "'--clip-norm' (no values) => clip to [0,1]; "
+            "'--clip-norm LO HI' => clip to [LO,HI]; omit flag => no clipping."
+        ),
+    )
+    ap.add_argument(
         "--metrics-json",
         type=str,
         default="/results/metrics.json",
@@ -580,6 +592,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         eps=args.eps,
         norm_percentile_lower=args.norm_lower,
         norm_percentile_upper=args.norm_upper,
+        clip_norm=(
+            False
+            if args.clip_norm is None
+            else (True if len(args.clip_norm) == 0 else tuple(args.clip_norm))
+        ),
     )
     logger.info(f"Inference config:\n{cfg}")
 
