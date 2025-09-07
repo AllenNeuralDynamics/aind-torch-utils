@@ -145,7 +145,7 @@ class PrepWorker:
 
         Parameters
         ----------
-        cfg : DenoiseConfig
+        cfg : InferenceConfig
             The denoising configuration.
         reader : ts.TensorStore
             The TensorStore reader for the input data.
@@ -320,7 +320,7 @@ class GpuWorker:
 
         Parameters
         ----------
-        cfg : DenoiseConfig
+        cfg : InferenceConfig
             The denoising configuration.
         model : nn.Module
             The PyTorch model to run.
@@ -466,7 +466,7 @@ class WriterWorker:
 
         Parameters
         ----------
-        cfg : DenoiseConfig
+        cfg : InferenceConfig
             The denoising configuration.
         writer : ts.TensorStore
             The TensorStore writer for the output data.

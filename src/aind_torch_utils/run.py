@@ -168,7 +168,7 @@ def _setup_workers(
         The input data store.
     output_store : Any
         The output data store.
-    cfg : DenoiseConfig
+    cfg : InferenceConfig
         The denoising configuration.
     num_prep_workers : int
         The number of prep workers to create.
@@ -224,7 +224,7 @@ def _setup_worker_threads(
         The input data store.
     output_store : Any
         The output data store.
-    cfg : DenoiseConfig
+    cfg : InferenceConfig
         The denoising configuration.
     stop_event : threading.Event
         An event to signal the threads to stop.
@@ -289,7 +289,7 @@ def run(
         The input data store.
     output_store : Any
         The output data store.
-    cfg : DenoiseConfig
+    cfg : InferenceConfig
         The denoising configuration.
     metrics_json : Optional[str], optional
         Path to the output JSON file for metrics, by default None.

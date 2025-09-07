@@ -42,7 +42,7 @@ def dummy_data(temp_dir):
         },
     }
     data = ts.open(spec, create=True).result()
-    # Min value 1 to indentify gaps in output due to incorrect stitching
+    # Min value 1 to identify gaps in output due to incorrect stitching
     arr = np.random.randint(1, 65535, size=shape, dtype=np.uint16)
     data.write(arr).result()
 
