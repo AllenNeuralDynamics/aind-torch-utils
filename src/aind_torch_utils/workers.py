@@ -215,9 +215,7 @@ class PrepWorker:
             norm_block = view.read().result().astype(np.float32, copy=False)
             bz, by, bx = acc_shape
 
-            if (
-                self.cfg.norm_percentile_lower == self.cfg.norm_percentile_upper
-            ):
+            if self.cfg.norm_percentile_lower == self.cfg.norm_percentile_upper:
                 # Bypass normalization entirely (identity). We pretend (mn,mx)=(0,1)
                 # so the writer performs a no-op inverse transform.
                 block_mn, block_mx = 0.0, 1.0

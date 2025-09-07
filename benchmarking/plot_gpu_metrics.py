@@ -49,9 +49,7 @@ def main() -> None:
 
             for need in (TS, IDX, NAME, MEM, UTIL):
                 if need not in header:
-                    print(
-                        f"Missing expected column '{need}' in CSV header: {header}"
-                    )
+                    print(f"Missing expected column '{need}' in CSV header: {header}")
                     return
 
             ts_i = header.index(TS)
@@ -100,9 +98,7 @@ def main() -> None:
     # Find shortest length among series so we can align indices safely
     min_len = min(len(v) for v in vram_by_gpu.values())
     for i in range(min_len - 1, -1, -1):
-        any_nonzero = any(
-            vram_by_gpu[key][i] > 0 for key in vram_by_gpu.keys()
-        )
+        any_nonzero = any(vram_by_gpu[key][i] > 0 for key in vram_by_gpu.keys())
         if any_nonzero:
             last_idx_global = min(i + 2, min_len)
             break

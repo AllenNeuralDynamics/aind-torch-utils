@@ -1,5 +1,5 @@
-from typing import List, Optional, Tuple
 import warnings
+from typing import List, Optional, Tuple
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -62,7 +62,6 @@ class InferenceConfig(BaseModel):
     norm_percentile_upper: float = Field(
         default=99.9, description="Upper percentile for normalization"
     )
-
 
     @model_validator(mode="after")
     def _validate(self):
@@ -138,7 +137,9 @@ class InferenceConfig(BaseModel):
                 raise ValueError(f"halo ({self.halo}) must be >= 0")
 
         # Normalization percentiles
-        if not (0.0 <= self.norm_percentile_lower <= self.norm_percentile_upper <= 100.0):
+        if not (
+            0.0 <= self.norm_percentile_lower <= self.norm_percentile_upper <= 100.0
+        ):
             raise ValueError(
                 "Normalization percentiles must satisfy 0 <= lower < upper <= 100"
             )

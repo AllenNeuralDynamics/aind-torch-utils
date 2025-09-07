@@ -11,7 +11,7 @@ from aind_torch_utils.model_registry import ModelRegistry
 @ModelRegistry.register("denoise-net")
 def load_unet(weights_path: Optional[str] = None) -> nn.Module:
     """Load UNet model with optional weights.
-    
+
     The import is done inside the function to avoid requiring the dependency
     unless this specific model is being used.
     """

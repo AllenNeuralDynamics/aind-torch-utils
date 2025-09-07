@@ -206,10 +206,12 @@ class SystemSample:
 
 class SystemMonitor:
     """
-    Periodically sample **process** CPU% and RAM, plus **system-wide** network and disk I/O rates.
+    Periodically sample **process** CPU% and RAM, plus **system-wide** network and 
+    disk I/O rates.
 
-    - CPU% uses psutil.Process.cpu_percent(interval=None). On multi-core systems, values
-      can exceed 100%. Set normalize_cpu_percent=True to scale to 0–100% by logical CPUs.
+    - CPU% uses psutil.Process.cpu_percent(interval=None). On multi-core systems, 
+      values can exceed 100%. Set normalize_cpu_percent=True to scale to 0–100% 
+      by logical CPUs.
     - RAM is Resident Set Size (RSS) in MiB (computed with 1024*1024).
     - Network/Disk rates are **system-wide totals**, not per-process (psutil lacks a
       cross-platform per-process network API). Units are MB/s (MiB/s by calculation).

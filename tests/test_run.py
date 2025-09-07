@@ -2,8 +2,8 @@ import unittest.mock
 
 import numpy as np
 import pytest
-import torch
 import tensorstore as ts
+import torch
 from torch import nn
 
 from aind_torch_utils.config import InferenceConfig
@@ -74,20 +74,14 @@ def test_run_pipeline(temp_dir, dummy_data):
 
     # If no CUDA devices, we need to patch GpuWorker to not use cuda streams
     if not torch.cuda.is_available():
-        with unittest.mock.patch(
-            "aind_torch_utils.run.GpuWorker"
-        ) as mock_gpu_worker:
+        with unittest.mock.patch("aind_torch_utils.run.GpuWorker") as mock_gpu_worker:
             # The mock needs to have a run method that can be called in a thread
-            mock_gpu_worker.return_value.run.side_effect = (
-                lambda stop_event: None
-            )
+            mock_gpu_worker.return_value.run.side_effect = lambda stop_event: None
             _run_test_logic(
                 input_store, output_store, metrics_json, devices, DummyModel()
             )
     else:
-        _run_test_logic(
-            input_store, output_store, metrics_json, devices, DummyModel()
-        )
+        _run_test_logic(input_store, output_store, metrics_json, devices, DummyModel())
 
     # Assertions
     assert metrics_json.exists()
@@ -121,7 +115,7 @@ def _run_test_logic(input_store, output_store, metrics_json, devices, model):
         amp=False,
         max_inflight_batches=10,
         norm_percentile_lower=0,
-        norm_percentile_upper=0
+        norm_percentile_upper=0,
     )
 
     run(

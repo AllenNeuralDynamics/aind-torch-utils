@@ -11,17 +11,17 @@ class ModelRegistry:
     @classmethod
     def register(cls, name: str) -> Callable:
         """Decorator to register a model loader function.
-        
+
         Parameters
         ----------
         name : str
             Name to register the model under.
-            
+
         Returns
         -------
         Callable
             Decorator function.
-            
+
         Example
         -------
         @ModelRegistry.register("unet")
@@ -32,27 +32,31 @@ class ModelRegistry:
                 model.load_state_dict(torch.load(weights_path, map_location="cpu"))
             return model
         """
+
         def decorator(func: Callable[[Optional[str]], nn.Module]) -> Callable:
             cls._registry[name] = func
             return func
+
         return decorator
-    
+
     @classmethod
-    def load_model(cls, model_type: str, weights_path: Optional[str] = None) -> nn.Module:
+    def load_model(
+        cls, model_type: str, weights_path: Optional[str] = None
+    ) -> nn.Module:
         """Load a model from the registry.
-        
+
         Parameters
         ----------
         model_type : str
             Type of model to load (must be registered).
         weights_path : Optional[str]
             Path to model weights file.
-            
+
         Returns
         -------
         nn.Module
             The loaded model.
-            
+
         Raises
         ------
         KeyError
@@ -64,13 +68,13 @@ class ModelRegistry:
                 f"Model type '{model_type}' not found in registry. "
                 f"Available models: {available}"
             )
-        
+
         return cls._registry[model_type](weights_path)
-    
+
     @classmethod
     def list_models(cls) -> list:
         """List all registered model types.
-        
+
         Returns
         -------
         list

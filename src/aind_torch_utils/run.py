@@ -13,13 +13,12 @@ from typing import Any, List, Optional, Tuple
 
 from torch import nn
 
-from aind_torch_utils.model_registry import ModelRegistry
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.model_registry import ModelRegistry
 from aind_torch_utils.monitoring import QueueMonitor, SystemMonitor
 from aind_torch_utils.utils import open_ts_spec
 from aind_torch_utils.workers import GpuWorker, PrepWorker, WriterWorker
 import aind_torch_utils.models  # This registers all models when imported
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -414,7 +413,7 @@ def load_model(model_type: str, weights_path: Optional[str] = None) -> nn.Module
     """
     if weights_path and not os.path.exists(weights_path):
         raise FileNotFoundError(f"Model weights not found at {weights_path}")
-    
+
     return ModelRegistry.load_model(model_type, weights_path)
 
 
@@ -434,7 +433,12 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Scalable pytorch inference pipeline")
     ap.add_argument("--in-spec", type=str, required=True)
     ap.add_argument("--out-spec", type=str, required=True)
-    ap.add_argument("--model-type", type=str, required=True, help="Type of model to use (must be registered)")
+    ap.add_argument(
+        "--model-type",
+        type=str,
+        required=True,
+        help="Type of model to use (must be registered)",
+    )
     ap.add_argument("--weights", type=str, help="Model weights path")
     ap.add_argument("--t", type=int, default=0)
     ap.add_argument("--c", type=int, default=0)
@@ -448,7 +452,9 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         default=["cuda:0"],
     )
     ap.add_argument("--no-amp", action="store_true")
-    ap.add_argument("--no-tf32", action="store_true", help="Disable TF32 (enabled by default)")
+    ap.add_argument(
+        "--no-tf32", action="store_true", help="Disable TF32 (enabled by default)"
+    )
     ap.add_argument("--compile", action="store_true", help="Enable torch.compile")
     ap.add_argument(
         "--compile-mode",

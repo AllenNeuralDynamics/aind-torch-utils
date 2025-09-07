@@ -281,9 +281,7 @@ def plot_system(
         plt.ylim(bottom=0)
         plt.legend()
         if out_path:
-            plt.savefig(
-                f"{out_path}_disk_io.png", dpi=150, bbox_inches="tight"
-            )
+            plt.savefig(f"{out_path}_disk_io.png", dpi=150, bbox_inches="tight")
 
 
 def main() -> None:
@@ -293,9 +291,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("json_path")
     ap.add_argument("--show", action="store_true", help="Show plot window")
-    ap.add_argument(
-        "--out", type=str, default=None, help="Save plot to file (prefix)"
-    )
+    ap.add_argument("--out", type=str, default=None, help="Save plot to file (prefix)")
     ap.add_argument(
         "--mean",
         action="store_true",
