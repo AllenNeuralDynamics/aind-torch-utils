@@ -19,7 +19,8 @@ pip install -e .
 ```
 Development (linting, docs, tests):
 ```bash
-pip install -e .[dev]
+python3 -m pip install --upgrade pip
+pip install -e . --group dev
 ```
 Optional extras (e.g. UNet dependency):
 ```bash
@@ -29,15 +30,15 @@ pip install -e .[denoise-net]
 ## CLI Example (Full Parameter Set)
 ```bash
 python -m aind_torch_utils.run \
-    --in-spec '{"driver":"zarr","kvstore":"s3://bucket/path/input.zarr/0"}' \
-    --out-spec '{"driver":"zarr","kvstore":{"driver":"s3","bucket":"bucket","path":"namespace/out.zarr"},"path":"0","metadata":{"shape":[1,1,512,2048,2048],"chunks":[1,1,256,256,256],"dtype":"uint16"},"create":true,"delete_existing":true}' \
+    --in-spec '{"driver": "zarr", "kvstore": "s3://my-bucket/in.zarr/0"}' \
+    --out-spec '{"driver":"zarr","kvstore":{"driver":"s3","bucket":"my-bucket","path":"out.zarr"},"path":"0","metadata":{"shape":[1,1,1024,1024,1024],"chunks":[1,1,256,256,256],"dtype":"<u2"},"create":true,"delete_existing":true}' \
     --model-type denoise-net \
-    --weights /path/to/weights.pth \
+    --weights /data/BM4DNet-20250905-169-0.0073.pth \
     --t 0 --c 0 \
     --patch 64 64 64 \
     --overlap 12 \
     --block 256 256 256 \
-    --batch 32 \
+    --batch 64 \
     --devices cuda:0 cuda:1 \
     --seam-mode trim \
     --trim-voxels 6 \
@@ -56,7 +57,8 @@ python -m aind_torch_utils.run \
 python -m aind_torch_utils.run \
     --in-spec "data/in_spec.json" \
     --out-spec "data/out_spec.json" \
-  --model-type denoise-net
+    --model-type denoise-net \
+    --weights /data/BM4DNet-20250905-169-0.0073.pth
 ```
 
 ## Programmatic Usage
@@ -82,7 +84,7 @@ out_spec = {
     "metadata": {
         "shape": [1, 1, 256, 1024, 1024],
         "chunks": [1, 1, 256, 256, 256],
-        "dtype": "uint16"
+        "dtype": "<u2"
     },
     "create": True,
     "delete_existing": True
