@@ -37,33 +37,25 @@ def open_ts_spec(path_or_json: Union[str, Dict[str, Any]]) -> Any:
     Parameters
     ----------
     path_or_json : str or dict
-        Either a filesystem path to a JSON spec file or an in-memory
-        dictionary representing a TensorStore spec.
+        One of:
+        * Raw JSON string (``"{...}"`` or ``"[...]"``)
+        * Filesystem path to a JSON spec file
+        * In-memory dictionary spec
 
     Returns
     -------
     Any
-        A opened (read-ready) TensorStore object (future already resolved).
-
-    Notes
-    -----
-    This is a light wrapper that loads JSON when a string path is provided
-    and immediately resolves the TensorStore future with ``.result()``.
-
-    Examples
-    --------
-    Open from a path::
-
-        ts_obj = open_ts_spec('my_spec.json')
-
-    Open from an in-memory dict::
-
-        spec = {"driver": "zarr", "kvstore": {"driver": "file", "path": "data.zarr"}}
-        ts_obj = open_ts_spec(spec)
+        An opened (read-ready) TensorStore object (future already resolved).
     """
     if isinstance(path_or_json, str):
-        with open(path_or_json, "r", encoding="utf-8") as f:
-            spec = json.load(f)
+        stripped = path_or_json.lstrip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            # Interpret as raw JSON literal provided directly.
+            spec = json.loads(stripped)
+        else:
+            # Treat as path to JSON file.
+            with open(path_or_json, "r", encoding="utf-8") as f:
+                spec = json.load(f)
     else:
         spec = path_or_json
     return ts.open(spec).result()
