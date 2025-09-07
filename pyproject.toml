@@ -26,21 +26,67 @@ dependencies = [
   "numpy",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
-    'black',
-    'coverage',
-    'flake8',
-    'interrogate',
-    'isort',
-    'Sphinx',
-    'furo'
+    "black",
+    "coverage",
+    "flake8",
+    "interrogate",
+    "isort",
+    "Sphinx",
+    "furo"
 ]
-extras = ['matplotlib']
+
+[project.optional-dependencies]
+extras = ["matplotlib"]
 denoise-net = ["aind-exaspim-image-compression@git+https://github.com/AllenNeuralDynamics/aind-exaspim-image-compression.git@main"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.dynamic]
+version = {attr = "aind_torch_utils.__version__"}
+
 [tool.black]
 line-length = 88
+target_version = ['py310']
+exclude = '''
+
+(
+  /(
+      \.eggs         # exclude a few common directories in the
+    | \.git          # root of the project
+    | \.hg
+    | \.mypy_cache
+    | \.tox
+    | \.venv
+    | _build
+    | build
+    | dist
+    | .conda
+  )/
+  | .gitignore
+)
+'''
+
+[tool.coverage.run]
+omit = ["*__init__*"]
+source = ["aind_torch_utils", "tests"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "if __name__ == .__main__.:",
+    "^from .* import .*",
+    "^import .*",
+    "pragma: no cover"
+]
+fail_under = 0
+
+[tool.isort]
+line_length = 88
+profile = "black"
+skip = [".conda"]
+
+[tool.interrogate]
+exclude = ["setup.py", "docs", "build", ".conda"]
+fail-under = 0
