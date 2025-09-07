@@ -581,6 +581,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         norm_percentile_lower=args.norm_lower,
         norm_percentile_upper=args.norm_upper,
     )
+    logger.info(f"Inference config:\n{cfg}")
 
     run(
         model,
