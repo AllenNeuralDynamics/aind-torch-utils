@@ -90,3 +90,6 @@ skip = [".conda"]
 [tool.interrogate]
 exclude = ["setup.py", "docs", "build", ".conda"]
 fail-under = 0
+
+[tool.flake8]
+max-line-length = 88
