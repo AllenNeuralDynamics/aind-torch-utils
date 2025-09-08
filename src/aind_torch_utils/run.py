@@ -509,13 +509,20 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "--norm-lower",
         type=float,
         default=0.5,
-        help="Lower percentile for per-patch normalization",
+        help="Lower percentile for per-patch normalization or global min.",
     )
     ap.add_argument(
         "--norm-upper",
         type=float,
         default=99.9,
-        help="Upper percentile for per-patch normalization",
+        help="Upper percentile for per-patch normalization or global max.",
+    )
+    ap.add_argument(
+        "--normalization-strategy",
+        type=str,
+        default="percentile",
+        choices=["percentile", "global", "false"],
+        help="Normalization strategy.",
     )
     ap.add_argument(
         "--clip-norm",
@@ -592,6 +599,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         eps=args.eps,
         norm_percentile_lower=args.norm_lower,
         norm_percentile_upper=args.norm_upper,
+        normalization_strategy=False
+        if args.normalization_strategy == "false"
+        else args.normalization_strategy,
         clip_norm=(
             False
             if args.clip_norm is None

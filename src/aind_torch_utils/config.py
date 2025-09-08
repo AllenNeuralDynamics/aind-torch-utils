@@ -1,5 +1,5 @@
 import warnings
-from typing import List, Optional, Tuple, Union
+from typing import List, Literal, Optional, Tuple, Union
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -57,10 +57,14 @@ class InferenceConfig(BaseModel):
     # Misc
     eps: float = Field(default=1e-6, description="Epsilon for division")
     norm_percentile_lower: float = Field(
-        default=0.5, description="Lower percentile for normalization"
+        default=0.5, description="Lower percentile for normalization, or global min."
     )
     norm_percentile_upper: float = Field(
-        default=99.9, description="Upper percentile for normalization"
+        default=99.9, description="Upper percentile for normalization, or global max."
+    )
+    normalization_strategy: Union[Literal["percentile", "global"], bool] = Field(
+        default="percentile",
+        description="Normalization strategy: 'percentile', 'global', or False to disable.",
     )
     clip_norm: Union[bool, Tuple[float, float]] = Field(
         default=False,
@@ -140,13 +144,22 @@ class InferenceConfig(BaseModel):
             if self.halo < 0:
                 raise ValueError(f"halo ({self.halo}) must be >= 0")
 
-        # Normalization percentiles
-        if not (
-            0.0 <= self.norm_percentile_lower <= self.norm_percentile_upper <= 100.0
-        ):
-            raise ValueError(
-                "Normalization percentiles must satisfy 0 <= lower <= upper <= 100"
-            )
+        # Normalization
+        if self.normalization_strategy == "percentile":
+            if not (
+                0.0 <= self.norm_percentile_lower
+                and self.norm_percentile_lower < self.norm_percentile_upper
+                and self.norm_percentile_upper <= 100.0
+            ):
+                raise ValueError(
+                    "For 'percentile' normalization, percentiles must be in [0, 100] with lower <= upper."
+                )
+        elif self.normalization_strategy == "global":
+            if self.norm_percentile_lower >= self.norm_percentile_upper:
+                raise ValueError(
+                    "For 'global' normalization, norm_percentile_lower must be < norm_percentile_upper."
+                )
+
         # clip_norm validation
         if isinstance(self.clip_norm, tuple):
             if len(self.clip_norm) != 2:

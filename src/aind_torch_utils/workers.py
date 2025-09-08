@@ -215,12 +215,7 @@ class PrepWorker:
             norm_block = view.read().result().astype(np.float32, copy=False)
             bz, by, bx = acc_shape
 
-            if self.cfg.norm_percentile_lower == self.cfg.norm_percentile_upper:
-                # Bypass normalization entirely (identity). We pretend (mn,mx)=(0,1)
-                # so the writer performs a no-op inverse transform.
-                block_mn, block_mx = 0.0, 1.0
-            else:
-                # calculate percentiles
+            if self.cfg.normalization_strategy == "percentile":
                 block_mn, block_mx = np.percentile(
                     norm_block,
                     [
@@ -232,13 +227,25 @@ class PrepWorker:
                 # normalize the block in-place
                 norm_block -= block_mn
                 norm_block /= block_scale
-                # optional clipping
-                if self.cfg.clip_norm:
-                    if self.cfg.clip_norm is True:
-                        norm_block = np.clip(norm_block, 0.0, 1.0)
-                    else:
-                        lo, hi = self.cfg.clip_norm
-                        norm_block = np.clip(norm_block, lo, hi)
+            elif self.cfg.normalization_strategy == "global":
+                block_mn = self.cfg.norm_percentile_lower
+                block_mx = self.cfg.norm_percentile_upper
+                block_scale = max(block_mx - block_mn, self.cfg.eps)
+                # normalize the block in-place
+                norm_block -= block_mn
+                norm_block /= block_scale
+            else:  # False
+                # Bypass normalization entirely (identity). We pretend (mn,mx)=(0,1)
+                # so the writer performs a no-op inverse transform.
+                block_mn, block_mx = 0.0, 1.0
+
+            # optional clipping
+            if self.cfg.clip_norm:
+                if self.cfg.clip_norm is True:
+                    norm_block = np.clip(norm_block, 0.0, 1.0)
+                else:
+                    lo, hi = self.cfg.clip_norm
+                    norm_block = np.clip(norm_block, lo, hi)
 
             # patch starts over the expanded region (same stride/overlap)
             if (bz, by, bx) not in starts_cache:
