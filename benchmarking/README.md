@@ -6,6 +6,22 @@ This document describes how to reproduce and interpret the benchmarking results 
 
 Benchmarks were run on an **AWS g5.12xlarge** (4 × NVIDIA A10G, 48 vCPU, 192 GB RAM).
 
+### Environment Setup
+
+The following commands reproduce the Python environment used for benchmarking
+
+```bash
+conda update conda -y
+conda update mamba -y
+mamba create -n compression -c conda-forge python=3.11 -y
+conda activate compression
+
+git clone https://github.com/AllenNeuralDynamics/aind-torch-utils.git
+cd aind-torch-utils
+git checkout dev
+pip install '.[denoise-net,extras]'
+```
+
 ## TensorStore Specs Used
 
 Input spec (`data/in_spec.json`):
