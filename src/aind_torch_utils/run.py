@@ -13,12 +13,13 @@ from typing import Any, List, Optional, Tuple
 
 from torch import nn
 
+import aind_torch_utils.models  # This registers all models when imported
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.model_registry import ModelRegistry
 from aind_torch_utils.monitoring import QueueMonitor, SystemMonitor
 from aind_torch_utils.utils import open_ts_spec
 from aind_torch_utils.workers import GpuWorker, PrepWorker, WriterWorker
-import aind_torch_utils.models  # This registers all models when imported
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",

@@ -114,7 +114,7 @@ def _run_test_logic(input_store, output_store, metrics_json, devices, model):
         devices=devices,
         amp=False,
         max_inflight_batches=10,
-        normalize=False  # so we get the same data out as we put in
+        normalize=False,  # so we get the same data out as we put in
     )
 
     run(
