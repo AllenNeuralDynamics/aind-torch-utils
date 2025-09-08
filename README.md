@@ -1,4 +1,6 @@
-# aind-torch-utils
+<p align="left">
+  <img src="assets/logo.png" alt="Project Logo" width="200">
+</p>
 
 Generic, queue-based, multi-GPU PyTorch inference pipeline for large volumetric (3D or 5D T,C,Z,Y,X) data.
 
