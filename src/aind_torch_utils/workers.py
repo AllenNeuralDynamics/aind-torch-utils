@@ -215,21 +215,21 @@ class PrepWorker:
             norm_block = view.read().result().astype(np.float32, copy=False)
             bz, by, bx = acc_shape
 
-            if self.cfg.normalization_strategy == "percentile":
+            if self.cfg.normalize == "percentile":
                 block_mn, block_mx = np.percentile(
                     norm_block,
                     [
-                        self.cfg.norm_percentile_lower,
-                        self.cfg.norm_percentile_upper,
+                        self.cfg.norm_lower,
+                        self.cfg.norm_upper,
                     ],
                 )
                 block_scale = max(block_mx - block_mn, self.cfg.eps)
                 # normalize the block in-place
                 norm_block -= block_mn
                 norm_block /= block_scale
-            elif self.cfg.normalization_strategy == "global":
-                block_mn = self.cfg.norm_percentile_lower
-                block_mx = self.cfg.norm_percentile_upper
+            elif self.cfg.normalize == "global":
+                block_mn = self.cfg.norm_lower
+                block_mx = self.cfg.norm_upper
                 block_scale = max(block_mx - block_mn, self.cfg.eps)
                 # normalize the block in-place
                 norm_block -= block_mn

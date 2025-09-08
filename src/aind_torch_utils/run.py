@@ -518,7 +518,7 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         help="Upper percentile for per-patch normalization or global max.",
     )
     ap.add_argument(
-        "--normalization-strategy",
+        "--normalize",
         type=str,
         default="percentile",
         choices=["percentile", "global", "false"],
@@ -597,11 +597,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         halo=args.halo,
         min_blend_weight=args.min_blend_weight,
         eps=args.eps,
-        norm_percentile_lower=args.norm_lower,
-        norm_percentile_upper=args.norm_upper,
-        normalization_strategy=False
-        if args.normalization_strategy == "false"
-        else args.normalization_strategy,
+        norm_lower=args.norm_lower,
+        norm_upper=args.norm_upper,
+        normalize=False if args.normalize == "false" else args.normalize,
         clip_norm=(
             False
             if args.clip_norm is None
