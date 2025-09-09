@@ -527,7 +527,6 @@ class WriterWorker:
             if acc is None:
                 acc = BlockAccumulator(
                     preds.acc_shape,
-                    self.cfg.patch,
                     self.cfg.eps,
                     overlap=self.cfg.overlap,
                     seam_mode=self.cfg.seam_mode,

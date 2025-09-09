@@ -11,7 +11,6 @@ class BlockAccumulator:
     def __init__(
         self,
         block_shape: Tuple[int, int, int],
-        patch: Tuple[int, int, int],
         eps: float,
         overlap: int,
         seam_mode: str,
@@ -25,8 +24,6 @@ class BlockAccumulator:
         ----------
         block_shape : Tuple[int, int, int]
             The shape of the block to accumulate.
-        patch : Tuple[int, int, int]
-            The shape of the patches being added.
         eps : float
             A small value to avoid division by zero.
         overlap : int
@@ -39,7 +36,6 @@ class BlockAccumulator:
             The minimum weight for blending.
         """
         self.block_shape = block_shape
-        self.patch = patch
         self.acc = np.zeros(block_shape, dtype=np.float32)
         self.wacc = np.zeros(block_shape, dtype=np.float32)
         self.eps = eps
