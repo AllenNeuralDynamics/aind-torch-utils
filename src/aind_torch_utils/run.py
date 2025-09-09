@@ -540,7 +540,7 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     ap.add_argument(
         "--metrics-json",
         type=str,
-        default="/results/metrics.json",
+        default="metrics.json",
         help="Write metrics over time to this JSON file",
     )
     ap.add_argument(
