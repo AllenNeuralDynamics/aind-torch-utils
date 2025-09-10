@@ -8,7 +8,7 @@ Generic, queue-based, multi-GPU PyTorch inference pipeline for large volumetric 
 - Block + patch based tiled volume processing with optional overlap / halo
 - Multi-threaded CPU stages (prep / writer) feeding multi-GPU inference workers
 - Seam handling via trimming or weighted blending
-- Optional per-patch percentile normalization
+- Optional global or per-block percentile normalization
 - Queue & system monitoring (JSON metrics export)
 - Model registry for plug‑and‑play custom architectures
 - Optional AMP, TF32, and `torch.compile` acceleration
