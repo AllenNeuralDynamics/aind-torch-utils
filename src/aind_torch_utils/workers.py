@@ -1,9 +1,9 @@
 import logging
 import queue
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
-from contextlib import nullcontext
 
 import numpy as np
 import tensorstore as ts
@@ -303,9 +303,6 @@ class PrepWorker:
                         break
                     except queue.Full:
                         continue
-
-
- 
 
 
 class GpuWorker:
