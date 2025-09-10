@@ -38,7 +38,7 @@ class Batch:
     valid_sizes : List[Tuple[int, int, int]]
         List of (dz, dy, dx) valid dimensions for each patch, handling
         boundary conditions.
-    per_patch_mnmx : List[Tuple[float, float]]
+    per_block_minmax : List[Tuple[float, float]]
         List of (min, max) percentile values for each patch used for normalization.
     total_patches_in_block : int
         The total number of patches in the entire block.
@@ -54,7 +54,7 @@ class Batch:
     starts_in_block: List[Tuple[int, int, int]]
     host_in: torch.Tensor
     valid_sizes: List[Tuple[int, int, int]]
-    per_patch_mnmx: List[Tuple[float, float]]  # per-patch (mn, mx)
+    per_block_minmax: List[Tuple[float, float]]  # per-patch (mn, mx)
     total_patches_in_block: int
     acc_shape: Tuple[int, int, int]  # shape of expanded (core+halo) accumulator
     halo_left: Tuple[int, int, int]  # halo size on the -Z/-Y/-X sides
@@ -80,7 +80,7 @@ class Preds:
         The output tensor of predictions, pinned to host memory.
     valid_sizes : List[Tuple[int, int, int]]
         List of (dz, dy, dx) valid dimensions for each patch.
-    per_patch_mnmx : List[Tuple[float, float]]
+    per_block_minmax : List[Tuple[float, float]]
         List of (min, max) percentile values for each patch for denormalization.
     total_patches_in_block : int
         The total number of patches in the entire block.
@@ -98,7 +98,7 @@ class Preds:
     starts_in_block: List[Tuple[int, int, int]]
     host_out: torch.Tensor
     valid_sizes: List[Tuple[int, int, int]]
-    per_patch_mnmx: List[Tuple[float, float]]
+    per_block_minmax: List[Tuple[float, float]]
     total_patches_in_block: int
     acc_shape: Tuple[int, int, int]
     halo_left: Tuple[int, int, int]
@@ -266,7 +266,7 @@ class PrepWorker:
                     dtype=torch.float16 if self.cfg.amp else torch.float32,
                     pin_memory=pin_memory,
                 )
-                valid_sizes, per_patch_mnmx = [], []
+                valid_sizes, per_block_minmax = [], []
 
                 for bi, (sz, sy, sx) in enumerate(batch_starts):
                     ez, ey, ex = (
@@ -283,7 +283,7 @@ class PrepWorker:
 
                     valid_sizes.append((dz, dy, dx))
                     # Every patch in the block uses the same (mn, mx)
-                    per_patch_mnmx.append((float(block_mn), float(block_mx)))
+                    per_block_minmax.append((float(block_mn), float(block_mx)))
 
                 batch = Batch(
                     block_idx=block_idx,
@@ -292,7 +292,7 @@ class PrepWorker:
                     starts_in_block=batch_starts,  # coords are in expanded space
                     host_in=host_in,
                     valid_sizes=valid_sizes,
-                    per_patch_mnmx=per_patch_mnmx,
+                    per_block_minmax=per_block_minmax,
                     total_patches_in_block=total_patches,
                     acc_shape=acc_shape,
                     halo_left=halo_left,
@@ -434,7 +434,7 @@ class GpuWorker:
                 starts_in_block=batch.starts_in_block,
                 host_out=host_out,
                 valid_sizes=batch.valid_sizes,
-                per_patch_mnmx=batch.per_patch_mnmx,  # pass-through
+                per_block_minmax=batch.per_block_minmax,  # pass-through
                 total_patches_in_block=batch.total_patches_in_block,
                 acc_shape=batch.acc_shape,
                 halo_left=batch.halo_left,
@@ -529,7 +529,7 @@ class WriterWorker:
             for bi, (sz, sy, sx) in enumerate(preds.starts_in_block):
                 dz, dy, dx = preds.valid_sizes[bi]
                 patch_pred = out_np[bi, 0]
-                mn, mx = preds.per_patch_mnmx[bi]
+                mn, mx = preds.per_block_minmax[bi]
                 scale = max(mx - mn, self.cfg.eps)
                 pp = patch_pred.astype(np.float32, copy=False)
                 denorm = (pp * np.float32(scale) + np.float32(mn)).astype(
