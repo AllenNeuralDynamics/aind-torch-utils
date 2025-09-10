@@ -76,6 +76,10 @@ def _write_metrics_json(
             "queue_monitor": monitor.get_data(),
             "system_monitor": sys_monitor.get_data(),
         }
+        # Ensure parent directory exists before writing
+        parent_dir = os.path.dirname(metrics_json)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
         with open(metrics_json, "w") as f:
             json.dump(metrics, f, indent=2)
         logger.info(f"Wrote metrics to {metrics_json}")
