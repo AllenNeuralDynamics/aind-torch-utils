@@ -496,7 +496,10 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "--halo",
         type=int,
         default=None,
-        help="Explicit halo size (defaults to trim_voxels if omitted)",
+        help=(
+            "Explicit halo size. If omitted: in trim mode defaults to trim_voxels; "
+            "in blend mode defaults to a small positive heuristic."
+        ),
     )
     ap.add_argument(
         "--min-blend-weight",

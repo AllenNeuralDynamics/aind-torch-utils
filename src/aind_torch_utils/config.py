@@ -48,8 +48,12 @@ class InferenceConfig(BaseModel):
         default=5, description="Voxels to trim for seam handling"
     )
     halo: Optional[int] = Field(
-        default=None, description="Halo size"
-    )  # if None, we’ll use trim_voxels
+        default=None,
+        description=(
+            "Halo size. If None: in trim mode defaults to trim_voxels; in blend "
+            "mode defaults to a small positive heuristic (min(8, max(1, min(patch)//8)))."
+        ),
+    )
     min_blend_weight: float = Field(
         default=0.05, description="Minimum blend weight"
     )  # floor to avoid near-zero weights
@@ -139,10 +143,37 @@ class InferenceConfig(BaseModel):
                     RuntimeWarning,
                 )
 
-        # Halo
-        if self.halo is not None:
-            if self.halo < 0:
-                raise ValueError(f"halo ({self.halo}) must be >= 0")
+        # Halo: infer a safe default and validate
+        min_patch = min(self.patch)
+        if self.halo is None:
+            if self.seam_mode == "trim":
+                # Ensure the core never touches untrimmed patch borders at block edges
+                self.halo = int(self.trim_voxels or 0)
+            else:  # blend mode
+                # Provide a small positive default to reduce block-edge artifacts
+                # Heuristic: cap at 8, scale with patch size, and ensure >=1
+                default_blend_halo = max(1, min(8, max(1, min_patch // 8)))
+                self.halo = int(default_blend_halo)
+        # Validate and enforce relationships
+        if self.halo < 0:
+            raise ValueError(f"halo ({self.halo}) must be >= 0")
+        if self.seam_mode == "trim":
+            # If a user-set halo is smaller than trim_voxels, bump to be safe.
+            required_halo = int(self.trim_voxels or 0)
+            if self.halo < required_halo:
+                warnings.warn(
+                    (
+                        "halo < trim_voxels; increasing halo to trim_voxels to avoid "
+                        "untrimmed edges at block boundaries"
+                    ),
+                    RuntimeWarning,
+                )
+                self.halo = required_halo
+        if self.halo == 0:
+            warnings.warn(
+                "halo=0 may cause block-edge artifacts for models with non-trivial receptive fields",
+                RuntimeWarning,
+            )
 
         # Normalization
         if self.normalize == "percentile":
