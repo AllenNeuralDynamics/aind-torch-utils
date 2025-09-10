@@ -3,6 +3,7 @@ import queue
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+from contextlib import nullcontext
 
 import numpy as np
 import tensorstore as ts
@@ -304,16 +305,7 @@ class PrepWorker:
                         continue
 
 
-class nullcontext:
-    """A context manager that does nothing."""
-
-    def __enter__(self) -> "nullcontext":
-        """Enter the context."""
-        return self
-
-    def __exit__(self, *args: Any) -> bool:
-        """Exit the context."""
-        return False
+ 
 
 
 class GpuWorker:
