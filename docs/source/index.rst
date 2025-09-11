@@ -1,17 +1,17 @@
-.. Doc Template documentation master file, created by
-   sphinx-quickstart on Wed Aug 17 15:36:32 2022.
-   You can adapt this file completely to your liking, but it should at least
-   contain the root `toctree` directive.
+.. documentation master file
 
+aind-torch-utils
+=================
 
-Welcome to this repository's documentation!
-===========================================
+Generic, queue-based, multi-GPU PyTorch inference pipeline for large volumetric data.
 
 .. toctree::
    :maxdepth: 2
-   :caption: Contents:
+   :caption: Contents
 
-   modules
+   getting-started
+   cli
+   api/modules
 
 
 Indices and tables
