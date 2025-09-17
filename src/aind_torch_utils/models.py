@@ -18,7 +18,12 @@ def load_unet(weights_path: Optional[str] = None) -> nn.Module:
     from aind_exaspim_image_compression.machine_learning.unet3d import UNet
 
     model = UNet()
-    if weights_path and os.path.exists(weights_path):
+    if weights_path:
+        if not os.path.exists(weights_path):
+            raise FileNotFoundError(
+                f"Weights file not found: '{weights_path}'. "
+                "Provide a valid path or omit 'weights_path' to load an uninitialized model."
+            )
         sd = torch.load(weights_path, map_location="cpu")
         model.load_state_dict(sd)
     return model
