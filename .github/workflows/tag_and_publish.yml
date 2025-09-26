@@ -3,9 +3,6 @@ on:
   push:
     branches:
       - main
-# Remove line 65 to enable automated semantic version bumps.
-# Change line 71 from "if: false" to "if: true" to enable PyPI publishing. 
-# Requires that svc-aindscicomp be added as an admin to repo.
 jobs:
   update_badges:
     runs-on: ubuntu-latest
@@ -62,13 +59,11 @@ jobs:
         add: '["README.md"]'
   tag:
     needs: update_badges
-    if: ${{github.event.repository.name == 'aind-torch-utils'}}
     uses: AllenNeuralDynamics/aind-github-actions/.github/workflows/tag.yml@main
     secrets:
       SERVICE_TOKEN: ${{ secrets.SERVICE_TOKEN }}
   publish:
     needs: tag
-    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
