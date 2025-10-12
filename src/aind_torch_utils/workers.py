@@ -12,6 +12,7 @@ from torch import nn
 
 from aind_torch_utils.accumulators import BlockAccumulator
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.sharding import ShardSpec
 from aind_torch_utils.utils import iter_blocks_zyx, iter_patch_starts
 
 logger = logging.getLogger(__name__)
@@ -138,8 +139,11 @@ class PrepWorker:
         reader: "ts.TensorStore",
         prep_q: "queue.Queue[Batch]",
         model_patch: Tuple[int, int, int],
+        shard_spec: ShardSpec,
         worker_id: int = 0,
         num_workers: int = 1,
+        global_worker_offset: int = 0,
+        global_worker_count: int = 1,
     ):
         """
         Initializes the PrepWorker.
@@ -154,10 +158,17 @@ class PrepWorker:
             The queue to which prepared batches will be added.
         model_patch : Tuple[int, int, int]
             The (z, y, x) size of the model's input patches.
+        shard_spec : ShardSpec
+            Description of the spatial shard assigned to this process.
         worker_id : int, optional
             The ID of this worker, by default 0.
         num_workers : int, optional
             The total number of preparation workers, by default 1.
+        global_worker_offset : int, optional
+            Offset applied to convert the local worker id into a global id when
+            using strided sharding, by default 0.
+        global_worker_count : int, optional
+            Total number of global prep workers across all shards, by default 1.
         """
         self.cfg = cfg
         self.reader = reader
@@ -166,6 +177,22 @@ class PrepWorker:
         self.full_zyx = self.reader.shape[-3:]
         self.worker_id = worker_id
         self.num_workers = max(1, num_workers)
+        self.shard_spec = shard_spec
+        self.shard_strategy = shard_spec.strategy
+        self.block_start = shard_spec.block_start
+        self.block_stop = shard_spec.block_stop
+        self.global_worker_count = max(1, global_worker_count)
+        self.global_worker_id = global_worker_offset + worker_id
+        self.global_worker_offset = global_worker_offset
+
+    def _block_in_shard(self, block_idx: Tuple[int, int, int]) -> bool:
+        """
+        Check whether a block index lies within the shard's block bounds.
+        """
+        (sz0, sy0, sx0) = self.block_start
+        (sz1, sy1, sx1) = self.block_stop
+        bz, by, bx = block_idx
+        return sz0 <= bz < sz1 and sy0 <= by < sy1 and sx0 <= bx < sx1
 
     def run(self, stop_event: threading.Event) -> None:
         """
@@ -187,12 +214,18 @@ class PrepWorker:
         )
         starts_cache: Dict[Tuple[int, int, int], List[Tuple[int, int, int]]] = {}
 
-        # Strided partition over blocks: worker i handles k where k % num_workers == i
+        # Iterate block grid in Z, Y, X order
         for k, (block_idx, core_bbox) in enumerate(
             iter_blocks_zyx(self.full_zyx, self.cfg.block)
         ):
-            if (k % self.num_workers) != self.worker_id:
-                continue
+            if self.shard_strategy == "stride":
+                if (k % self.global_worker_count) != self.global_worker_id:
+                    continue
+            else:
+                if not self._block_in_shard(block_idx):
+                    continue
+                if (k % self.num_workers) != self.worker_id:
+                    continue
 
             if stop_event.is_set():
                 break

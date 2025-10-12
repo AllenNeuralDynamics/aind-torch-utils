@@ -17,6 +17,7 @@ import aind_torch_utils.models  # This registers all models when imported
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.model_registry import ModelRegistry
 from aind_torch_utils.monitoring import QueueMonitor, SystemMonitor
+from aind_torch_utils.sharding import ShardSpec, make_shard_spec
 from aind_torch_utils.utils import open_ts_spec
 from aind_torch_utils.workers import GpuWorker, PrepWorker, WriterWorker
 
@@ -159,6 +160,7 @@ def _setup_workers(
     input_store: Any,
     output_store: Any,
     cfg: InferenceConfig,
+    shard_spec: ShardSpec,
     num_prep_workers: int,
     prep_q: queue.Queue,
     write_queues: List[queue.Queue],
@@ -187,16 +189,22 @@ def _setup_workers(
     Tuple[List[PrepWorker], List[GpuWorker], List[WriterWorker]]
         A tuple containing the prep workers, GPU workers, and writer workers.
     """
+    local_prep = max(1, num_prep_workers)
+    global_worker_count = max(1, local_prep * cfg.shard_count)
+    global_worker_offset = shard_spec.index * local_prep
     prep_workers = [
         PrepWorker(
             cfg,
             input_store,
             prep_q,
             cfg.patch,
+            shard_spec,
             worker_id=i,
-            num_workers=num_prep_workers,
+            num_workers=local_prep,
+            global_worker_offset=global_worker_offset,
+            global_worker_count=global_worker_count,
         )
-        for i in range(max(1, num_prep_workers))
+        for i in range(local_prep)
     ]
     gpu_workers = [
         GpuWorker(cfg, deepcopy(model), device, prep_q, write_queues)
@@ -214,6 +222,7 @@ def _setup_worker_threads(
     input_store: Any,
     output_store: Any,
     cfg: InferenceConfig,
+    shard_spec: ShardSpec,
     stop_event: threading.Event,
     num_prep_workers: int,
     prep_q: queue.Queue,
@@ -231,6 +240,8 @@ def _setup_worker_threads(
         The output data store.
     cfg : InferenceConfig
         The denoising configuration.
+    shard_spec : ShardSpec
+        Description of the spatial shard handled by this process.
     stop_event : threading.Event
         An event to signal the threads to stop.
     num_prep_workers : int
@@ -252,6 +263,7 @@ def _setup_worker_threads(
         input_store,
         output_store,
         cfg,
+        shard_spec,
         num_prep_workers,
         prep_q,
         write_queues,
@@ -309,6 +321,24 @@ def run(
     T, C, Z, Y, X = tuple(input_store.domain.shape)
     assert 0 <= cfg.t_idx < T and 0 <= cfg.c_idx < C, "Invalid t/c indices"
 
+    shard_spec = make_shard_spec(
+        (Z, Y, X),
+        cfg.block,
+        cfg.shard_count,
+        cfg.shard_index,
+        cfg.shard_strategy,
+    )
+    logger.info(
+        "Shard %d/%d strategy=%s blocks=%s->%s tiles=%s idx=%s",
+        shard_spec.index,
+        shard_spec.count,
+        shard_spec.strategy,
+        shard_spec.block_start,
+        shard_spec.block_stop,
+        shard_spec.tiles_per_axis,
+        shard_spec.tile_index,
+    )
+
     # Queues
     prep_q, write_queues = _setup_queues(
         num_writer_workers, maxsize=cfg.max_inflight_batches
@@ -327,6 +357,7 @@ def run(
         input_store,
         output_store,
         cfg,
+        shard_spec,
         stop_event,
         num_prep_workers,
         prep_q,
@@ -480,6 +511,25 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         help="Maximum prepared batches allowed in queues",
     )
     ap.add_argument(
+        "--shard-count",
+        type=int,
+        default=1,
+        help="Total number of spatial shards (processes or Ray actors).",
+    )
+    ap.add_argument(
+        "--shard-index",
+        type=int,
+        default=0,
+        help="Index of this shard in [0, shard-count).",
+    )
+    ap.add_argument(
+        "--shard-strategy",
+        type=str,
+        default="contiguous-z",
+        choices=["contiguous-z", "stride"],
+        help="Spatial sharding strategy across processes.",
+    )
+    ap.add_argument(
         "--seam-mode",
         type=str,
         default="trim",
@@ -613,6 +663,9 @@ def main(argv: Optional[List[str]] = None) -> None:
             if args.clip_norm is None
             else (True if len(args.clip_norm) == 0 else tuple(args.clip_norm))
         ),
+        shard_count=args.shard_count,
+        shard_index=args.shard_index,
+        shard_strategy=args.shard_strategy,
     )
     logger.info(f"Inference config:\n{cfg}")
 

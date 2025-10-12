@@ -40,6 +40,7 @@ dev = [
 [project.optional-dependencies]
 extras = ["matplotlib"]
 denoise-net = ["aind-exaspim-image-compression@git+https://github.com/AllenNeuralDynamics/aind-exaspim-image-compression.git@main"]
+ray = ["ray[default]"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

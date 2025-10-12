@@ -40,6 +40,20 @@ class InferenceConfig(BaseModel):
     # Concurrency / queues
     max_inflight_batches: int = Field(default=64, description="Max in-flight batches")
 
+    # Sharding
+    shard_count: int = Field(
+        default=1,
+        description="Total number of shards (processes or distributed workers).",
+    )
+    shard_index: int = Field(
+        default=0,
+        description="Index of this shard in [0, shard_count).",
+    )
+    shard_strategy: Literal["contiguous-z", "stride"] = Field(
+        default="contiguous-z",
+        description="Spatial partitioning strategy across shards.",
+    )
+
     # Seam handling
     # 'blend' = edge-aware Hann/Tukey blending inside blocks
     # 'trim'  = crop overlapped margins (keeps constant contribution)
@@ -210,5 +224,13 @@ class InferenceConfig(BaseModel):
         # Devices
         if not self.devices:
             raise ValueError("devices list must not be empty")
+
+        # Sharding
+        if self.shard_count <= 0:
+            raise ValueError("shard_count must be > 0")
+        if not (0 <= self.shard_index < self.shard_count):
+            raise ValueError(
+                f"shard_index ({self.shard_index}) must be in [0, shard_count ({self.shard_count}))"
+            )
 
         return self
