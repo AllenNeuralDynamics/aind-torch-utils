@@ -636,37 +636,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     in_arr = open_ts_spec(args.in_spec)
     out_arr = open_ts_spec(args.out_spec)
 
-    cfg = InferenceConfig(
-        patch=tuple(args.patch),
-        overlap=args.overlap,
-        block=tuple(args.block),
-        batch_size=args.batch,
-        t_idx=args.t,
-        c_idx=args.c,
-        devices=args.devices,
-        amp=not args.no_amp,
-        use_tf32=not args.no_tf32,
-        use_compile=args.compile,
-        compile_mode=args.compile_mode,
-        compile_dynamic=not args.no_compile_dynamic,
-        max_inflight_batches=args.max_inflight_batches,
-        seam_mode=args.seam_mode,
-        trim_voxels=args.trim_voxels,
-        halo=args.halo,
-        min_blend_weight=args.min_blend_weight,
-        eps=args.eps,
-        norm_lower=args.norm_lower,
-        norm_upper=args.norm_upper,
-        normalize=False if args.normalize == "false" else args.normalize,
-        clip_norm=(
-            False
-            if args.clip_norm is None
-            else (True if len(args.clip_norm) == 0 else tuple(args.clip_norm))
-        ),
-        shard_count=args.shard_count,
-        shard_index=args.shard_index,
-        shard_strategy=args.shard_strategy,
-    )
+    cfg = InferenceConfig.from_cli_args(args)
     logger.info(f"Inference config:\n{cfg}")
 
     run(

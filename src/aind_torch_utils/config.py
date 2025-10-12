@@ -1,5 +1,5 @@
 import warnings
-from typing import List, Literal, Optional, Tuple, Union
+from typing import Any, List, Literal, Optional, Tuple, Union
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -88,6 +88,105 @@ class InferenceConfig(BaseModel):
         default=False,
         description="If True, clip normalized values to [0,1]; if (lo,hi), clip to that range.",
     )
+
+    @classmethod
+    def from_cli_args(
+        cls,
+        args: Any,
+        *,
+        shard_count: Optional[int] = None,
+        shard_index: Optional[int] = None,
+    ) -> "InferenceConfig":
+        """
+        Build an InferenceConfig from an argparse.Namespace (or compatible object).
+
+        Parameters
+        ----------
+        args : Any
+            Parsed CLI arguments providing configuration values.
+        shard_count : Optional[int]
+            Override for shard_count, useful for launchers that manage sharding.
+        shard_index : Optional[int]
+            Override for shard_index, useful for launchers that manage sharding.
+        """
+
+        def _tuple_value(name: str) -> Tuple[int, int, int]:
+            value = getattr(args, name, None)
+            if value is None:
+                default = cls.model_fields[name].default
+                if default is None:
+                    raise ValueError(f"Missing required argument '{name}'.")
+                value = default
+            return tuple(value)
+
+        def _with_default(name: str) -> Any:
+            value = getattr(args, name, None)
+            if value is not None:
+                return value
+            field = cls.model_fields[name]
+            default_factory = getattr(field, "default_factory", None)
+            if default_factory is not None:
+                return default_factory()
+            return field.default
+
+        clip_norm_arg = getattr(args, "clip_norm", None)
+        if clip_norm_arg is None:
+            clip_norm: Union[bool, Tuple[float, float]] = False
+        elif len(clip_norm_arg) == 0:
+            clip_norm = True
+        else:
+            clip_norm = tuple(clip_norm_arg)  # type: ignore[arg-type]
+
+        normalize_arg = getattr(args, "normalize", "percentile")
+        normalize = False if normalize_arg == "false" else normalize_arg
+
+        return cls(
+            patch=_tuple_value("patch"),
+            overlap=getattr(args, "overlap", cls.model_fields["overlap"].default),
+            block=_tuple_value("block"),
+            batch_size=getattr(args, "batch", cls.model_fields["batch_size"].default),
+            t_idx=getattr(args, "t", cls.model_fields["t_idx"].default),
+            c_idx=getattr(args, "c", cls.model_fields["c_idx"].default),
+            devices=_with_default("devices"),
+            amp=not getattr(args, "no_amp", False),
+            use_tf32=not getattr(args, "no_tf32", False),
+            use_compile=getattr(args, "compile", cls.model_fields["use_compile"].default),
+            compile_mode=getattr(args, "compile_mode", cls.model_fields["compile_mode"].default),
+            compile_dynamic=not getattr(args, "no_compile_dynamic", False),
+            max_inflight_batches=getattr(
+                args,
+                "max_inflight_batches",
+                cls.model_fields["max_inflight_batches"].default,
+            ),
+            seam_mode=getattr(args, "seam_mode", cls.model_fields["seam_mode"].default),
+            trim_voxels=getattr(args, "trim_voxels", cls.model_fields["trim_voxels"].default),
+            halo=getattr(args, "halo", cls.model_fields["halo"].default),
+            min_blend_weight=getattr(
+                args,
+                "min_blend_weight",
+                cls.model_fields["min_blend_weight"].default,
+            ),
+            eps=getattr(args, "eps", cls.model_fields["eps"].default),
+            norm_lower=getattr(args, "norm_lower", cls.model_fields["norm_lower"].default),
+            norm_upper=getattr(args, "norm_upper", cls.model_fields["norm_upper"].default),
+            normalize=normalize,
+            clip_norm=clip_norm,
+            shard_count=(
+                shard_count
+                if shard_count is not None
+                else getattr(args, "shard_count", cls.model_fields["shard_count"].default)
+            ),
+            shard_index=(
+                shard_index
+                if shard_index is not None
+                else getattr(args, "shard_index", cls.model_fields["shard_index"].default)
+            ),
+            shard_strategy=getattr(
+                args,
+                "shard_strategy",
+                cls.model_fields["shard_strategy"].default,
+            ),
+        )
 
     @model_validator(mode="after")
     def _validate(self):
