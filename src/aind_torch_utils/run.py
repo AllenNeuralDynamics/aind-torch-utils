@@ -17,7 +17,7 @@ import aind_torch_utils.models  # This registers all models when imported
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.model_registry import ModelRegistry
 from aind_torch_utils.monitoring import QueueMonitor, SystemMonitor
-from aind_torch_utils.sharding import ShardSpec, make_shard_spec
+from aind_torch_utils.distributed.sharding import ShardSpec, make_shard_spec
 from aind_torch_utils.utils import open_ts_spec
 from aind_torch_utils.workers import GpuWorker, PrepWorker, WriterWorker
 

@@ -12,7 +12,7 @@ from torch import nn
 
 from aind_torch_utils.accumulators import BlockAccumulator
 from aind_torch_utils.config import InferenceConfig
-from aind_torch_utils.sharding import ShardSpec
+from aind_torch_utils.distributed.sharding import ShardSpec
 from aind_torch_utils.utils import iter_blocks_zyx, iter_patch_starts
 
 logger = logging.getLogger(__name__)
