@@ -50,7 +50,7 @@ class InferenceConfig(BaseModel):
         description="Index of this shard in [0, shard_count).",
     )
     shard_strategy: Literal["contiguous-z", "stride"] = Field(
-        default="contiguous-z",
+        default="stride",
         description="Spatial partitioning strategy across shards.",
     )
 

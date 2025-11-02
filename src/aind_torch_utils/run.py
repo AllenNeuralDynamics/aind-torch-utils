@@ -525,7 +525,7 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     ap.add_argument(
         "--shard-strategy",
         type=str,
-        default="contiguous-z",
+        default="stride",
         choices=["contiguous-z", "stride"],
         help="Spatial sharding strategy across processes.",
     )
