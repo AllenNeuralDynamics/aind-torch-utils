@@ -22,7 +22,7 @@ dependencies = [
   "pydantic",
   "psutil",
   "tensorstore",
-  "numpy",
+  "numpy>=2.0.0",
 ]
 
 [dependency-groups]
