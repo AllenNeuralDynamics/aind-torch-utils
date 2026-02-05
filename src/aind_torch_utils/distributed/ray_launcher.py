@@ -29,15 +29,24 @@ def _import_ray():
     return ray
 
 
-def _build_inference_config(args: argparse.Namespace, shard_count: int) -> InferenceConfig:
+def _build_inference_config(
+    args: argparse.Namespace,
+    shard_count: Optional[int] = None,
+) -> InferenceConfig:
     """
     Construct the base InferenceConfig shared by all shards.
     """
-    return InferenceConfig.from_cli_args(
-        args,
-        shard_count=shard_count,
-        shard_index=0,
-    )
+    if args.config:
+        return InferenceConfig.from_json_file(
+            args.config,
+            shard_count=shard_count,
+            shard_index=0,
+        )
+    data: Dict[str, Any] = {}
+    if shard_count is not None:
+        data["shard_count"] = shard_count
+    data["shard_index"] = 0
+    return InferenceConfig.model_validate(data)
 
 
 def _default_metrics_template(base: Optional[str]) -> Optional[str]:
@@ -171,8 +180,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     ray_args, run_args = _parse_ray_args(argv)
 
-    shards = ray_args.num_shards or max(1, run_args.shard_count)
-    base_cfg = _build_inference_config(run_args, shards)
+    base_cfg = _build_inference_config(run_args)
+    shards = ray_args.num_shards or max(1, base_cfg.shard_count)
+    if shards != base_cfg.shard_count:
+        base_cfg = _build_inference_config(run_args, shards)
     metrics_template = ray_args.metrics_json_template or _default_metrics_template(
         run_args.metrics_json
     )
@@ -184,7 +195,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         logger.info(
             "Dry run: would launch %d shard(s) with strategy=%s and metrics template=%s",
             shards,
-            run_args.shard_strategy,
+            base_cfg.shard_strategy,
             metrics_template,
         )
         return
@@ -218,7 +229,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         cpus = ray_args.cpus_per_shard or max(1.0, run_args.prep_workers + run_args.writer_workers)
         requested_gpus = ray_args.gpus_per_shard
         if requested_gpus is None:
-            requested_gpus = max(0.0, len(run_args.devices))
+            requested_gpus = max(0.0, len(base_cfg.devices))
 
         @ray.remote(num_cpus=cpus, num_gpus=requested_gpus)
         def shard_task(shard_idx: int, payload: Dict[str, Any]) -> None:

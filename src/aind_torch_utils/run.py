@@ -476,123 +476,11 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         help="Type of model to use (must be registered)",
     )
     ap.add_argument("--weights", type=str, help="Model weights path")
-    ap.add_argument("--t", type=int, default=0)
-    ap.add_argument("--c", type=int, default=0)
-    ap.add_argument("--patch", type=int, nargs=3, default=(64, 64, 64))
-    ap.add_argument("--overlap", type=int, default=10)
-    ap.add_argument("--block", type=int, nargs=3, default=(256, 256, 256))
-    ap.add_argument("--batch", type=int, default=64)
     ap.add_argument(
-        "--devices",
-        nargs="+",
-        default=["cuda:0"],
-    )
-    ap.add_argument("--no-amp", action="store_true")
-    ap.add_argument(
-        "--no-tf32", action="store_true", help="Disable TF32 (enabled by default)"
-    )
-    ap.add_argument("--compile", action="store_true", help="Enable torch.compile")
-    ap.add_argument(
-        "--compile-mode",
+        "--config",
         type=str,
-        default="reduce-overhead",
-        choices=["reduce-overhead", "max-autotune"],
-        help="torch.compile mode",
-    )
-    ap.add_argument(
-        "--no-compile-dynamic",
-        action="store_true",
-        help="Disable dynamic shape support for torch.compile",
-    )
-    ap.add_argument(
-        "--max-inflight-batches",
-        type=int,
-        default=64,
-        help="Maximum prepared batches allowed in queues",
-    )
-    ap.add_argument(
-        "--shard-count",
-        type=int,
-        default=1,
-        help="Total number of spatial shards (processes or Ray actors).",
-    )
-    ap.add_argument(
-        "--shard-index",
-        type=int,
-        default=0,
-        help="Index of this shard in [0, shard-count).",
-    )
-    ap.add_argument(
-        "--shard-strategy",
-        type=str,
-        default="stride",
-        choices=["contiguous-z", "stride"],
-        help="Spatial sharding strategy across processes.",
-    )
-    ap.add_argument(
-        "--seam-mode",
-        type=str,
-        default="trim",
-        choices=["trim", "blend"],
-        help="Seam handling strategy",
-    )
-    ap.add_argument(
-        "--trim-voxels",
-        type=int,
-        default=5,
-        help="Voxels to trim from each non-boundary patch edge in trim mode",
-    )
-    ap.add_argument(
-        "--halo",
-        type=int,
         default=None,
-        help=(
-            "Explicit halo size. If omitted: in trim mode defaults to trim_voxels; "
-            "in blend mode defaults to a small positive heuristic."
-        ),
-    )
-    ap.add_argument(
-        "--min-blend-weight",
-        type=float,
-        default=0.05,
-        help="Minimum blend weight floor (blend mode)",
-    )
-    ap.add_argument(
-        "--eps",
-        type=float,
-        default=1e-6,
-        help="Numerical epsilon for divisions",
-    )
-    ap.add_argument(
-        "--norm-lower",
-        type=float,
-        default=0.5,
-        help="Lower percentile for per-patch normalization or global min.",
-    )
-    ap.add_argument(
-        "--norm-upper",
-        type=float,
-        default=99.9,
-        help="Upper percentile for per-patch normalization or global max.",
-    )
-    ap.add_argument(
-        "--normalize",
-        type=str,
-        default="percentile",
-        choices=["percentile", "global", "false"],
-        help="Normalization strategy.",
-    )
-    ap.add_argument(
-        "--clip-norm",
-        nargs="*",
-        type=float,
-        default=None,
-        metavar=("LO", "HI"),
-        help=(
-            "Optional clipping after percentile normalization. Usage: "
-            "'--clip-norm' (no values) => clip to [0,1]; "
-            "'--clip-norm LO HI' => clip to [LO,HI]; omit flag => no clipping."
-        ),
+        help="Path to JSON file with InferenceConfig fields (defaults to built-in config)",
     )
     ap.add_argument(
         "--metrics-json",
@@ -636,7 +524,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     in_arr = open_ts_spec(args.in_spec)
     out_arr = open_ts_spec(args.out_spec)
 
-    cfg = InferenceConfig.from_cli_args(args)
+    if args.config:
+        cfg = InferenceConfig.from_json_file(args.config)
+    else:
+        cfg = InferenceConfig()
     logger.info(f"Inference config:\n{cfg}")
 
     run(

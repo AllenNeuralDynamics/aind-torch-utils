@@ -1,3 +1,4 @@
+import json
 import warnings
 from typing import Any, List, Literal, Optional, Tuple, Union
 
@@ -88,6 +89,34 @@ class InferenceConfig(BaseModel):
         default=False,
         description="If True, clip normalized values to [0,1]; if (lo,hi), clip to that range.",
     )
+
+    @classmethod
+    def from_json_file(
+        cls,
+        path: str,
+        *,
+        shard_count: Optional[int] = None,
+        shard_index: Optional[int] = None,
+    ) -> "InferenceConfig":
+        """
+        Build an InferenceConfig from a JSON file path.
+
+        Parameters
+        ----------
+        path : str
+            Path to a JSON file containing InferenceConfig fields.
+        shard_count : Optional[int]
+            Override for shard_count, useful for launchers that manage sharding.
+        shard_index : Optional[int]
+            Override for shard_index, useful for launchers that manage sharding.
+        """
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if shard_count is not None:
+            data["shard_count"] = shard_count
+        if shard_index is not None:
+            data["shard_index"] = shard_index
+        return cls.model_validate(data)
 
     @classmethod
     def from_cli_args(
