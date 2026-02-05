@@ -480,7 +480,10 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "--config",
         type=str,
         default=None,
-        help="Path to JSON file with InferenceConfig fields (defaults to built-in config)",
+        help=(
+            "Path to JSON file or inline JSON string with InferenceConfig fields "
+            "(defaults to built-in config)"
+        ),
     )
     ap.add_argument(
         "--metrics-json",
@@ -525,7 +528,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     out_arr = open_ts_spec(args.out_spec)
 
     if args.config:
-        cfg = InferenceConfig.from_json_file(args.config)
+        cfg = InferenceConfig.from_json(args.config)
     else:
         cfg = InferenceConfig()
     logger.info(f"Inference config:\n{cfg}")
