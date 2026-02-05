@@ -37,7 +37,7 @@ def _build_inference_config(
     Construct the base InferenceConfig shared by all shards.
     """
     if args.config:
-        return InferenceConfig.from_json_file(
+        return InferenceConfig.from_json(
             args.config,
             shard_count=shard_count,
             shard_index=0,

@@ -5,6 +5,14 @@ from typing import Any, List, Literal, Optional, Tuple, Union
 from pydantic import BaseModel, Field, model_validator
 
 
+def _load_json_source(source: str) -> Any:
+    stripped = source.lstrip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        return json.loads(stripped)
+    with open(source, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 class InferenceConfig(BaseModel):
     # Geometry
     patch: Tuple[int, int, int] = Field(
@@ -112,6 +120,40 @@ class InferenceConfig(BaseModel):
         """
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        if shard_count is not None:
+            data["shard_count"] = shard_count
+        if shard_index is not None:
+            data["shard_index"] = shard_index
+        return cls.model_validate(data)
+
+    @classmethod
+    def from_json(
+        cls,
+        source: Union[str, dict],
+        *,
+        shard_count: Optional[int] = None,
+        shard_index: Optional[int] = None,
+    ) -> "InferenceConfig":
+        """
+        Build an InferenceConfig from a JSON string or file path.
+
+        Parameters
+        ----------
+        source : Union[str, dict]
+            JSON string, file path, or dict containing InferenceConfig fields.
+        shard_count : Optional[int]
+            Override for shard_count, useful for launchers that manage sharding.
+        shard_index : Optional[int]
+            Override for shard_index, useful for launchers that manage sharding.
+        """
+        if isinstance(source, str):
+            data = _load_json_source(source)
+        elif isinstance(source, dict):
+            data = source
+        else:
+            raise TypeError("source must be a JSON string, file path, or dict")
+        if not isinstance(data, dict):
+            raise ValueError("Config JSON must be an object with InferenceConfig fields")
         if shard_count is not None:
             data["shard_count"] = shard_count
         if shard_index is not None:
