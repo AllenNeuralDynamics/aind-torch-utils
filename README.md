@@ -133,6 +133,25 @@ If `--metrics-json` provided:
 - System metrics (CPU %, RAM, GPU (if implemented))
 Use to diagnose stalls (e.g., GPU idle while prep queue empty => increase prep workers / decrease IO latency).
 
+## Resuming S3 Output
+Set `resume=true` in the JSON config to skip blocks that were already completed
+by an earlier run. The current backend writes small sidecar markers to S3 after
+each output block write succeeds:
+
+```json
+{
+  "resume": true,
+  "work_store": "s3-markers",
+  "resume_marker_prefix": "s3://my-bucket/out.zarr"
+}
+```
+
+Do not use `delete_existing: true` in the output TensorStore spec when resuming.
+The pipeline lists marker keys once at startup, keeps completed blocks in memory,
+and writes one `.done` marker after each successful block write. If a machine is
+terminated mid-block, no marker is written, so that block is recomputed on the
+next run.
+
 ## Custom Model Registration
 Add your model directly to `src/aind_torch_utils/models.py` so it is automatically available when the package is imported.
 

@@ -15,10 +15,16 @@ from torch import nn
 
 import aind_torch_utils.models  # This registers all models when imported
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.distributed.sharding import ShardSpec, make_shard_spec
 from aind_torch_utils.model_registry import ModelRegistry
 from aind_torch_utils.monitoring import QueueMonitor, SystemMonitor
-from aind_torch_utils.distributed.sharding import ShardSpec, make_shard_spec
-from aind_torch_utils.utils import open_ts_spec
+from aind_torch_utils.utils import load_ts_spec, open_ts_spec
+from aind_torch_utils.work_state import (
+    BlockWorkStore,
+    NoopBlockWorkStore,
+    build_block_work_store,
+    validate_resume_output_spec,
+)
 from aind_torch_utils.workers import GpuWorker, PrepWorker, WriterWorker
 
 logging.basicConfig(
@@ -161,6 +167,7 @@ def _setup_workers(
     output_store: Any,
     cfg: InferenceConfig,
     shard_spec: ShardSpec,
+    work_store: BlockWorkStore,
     num_prep_workers: int,
     prep_q: queue.Queue,
     write_queues: List[queue.Queue],
@@ -199,6 +206,7 @@ def _setup_workers(
             prep_q,
             cfg.patch,
             shard_spec,
+            work_store,
             worker_id=i,
             num_workers=local_prep,
             global_worker_offset=global_worker_offset,
@@ -211,7 +219,7 @@ def _setup_workers(
         for device in cfg.devices
     ]
     writer_workers = [
-        WriterWorker(cfg, output_store, write_queues[i])
+        WriterWorker(cfg, output_store, write_queues[i], work_store)
         for i in range(len(write_queues))
     ]
     return prep_workers, gpu_workers, writer_workers
@@ -223,6 +231,7 @@ def _setup_worker_threads(
     output_store: Any,
     cfg: InferenceConfig,
     shard_spec: ShardSpec,
+    work_store: BlockWorkStore,
     stop_event: threading.Event,
     num_prep_workers: int,
     prep_q: queue.Queue,
@@ -264,6 +273,7 @@ def _setup_worker_threads(
         output_store,
         cfg,
         shard_spec,
+        work_store,
         num_prep_workers,
         prep_q,
         write_queues,
@@ -295,6 +305,7 @@ def run(
     metrics_interval: float = 0.5,
     num_prep_workers: int = 1,
     num_writer_workers: int = 1,
+    work_store: Optional[BlockWorkStore] = None,
 ) -> None:
     """Runs the denoising pipeline.
 
@@ -316,6 +327,8 @@ def run(
         The number of prep workers to use, by default 1.
     num_writer_workers : int, optional
         The number of writer workers to use, by default 1.
+    work_store : Optional[BlockWorkStore], optional
+        Block completion backend used when cfg.resume=True, by default None.
     """
     # Validate shapes
     T, C, Z, Y, X = tuple(input_store.domain.shape)
@@ -338,6 +351,13 @@ def run(
         shard_spec.tiles_per_axis,
         shard_spec.tile_index,
     )
+    if cfg.resume:
+        if work_store is None:
+            raise ValueError("cfg.resume=True requires a BlockWorkStore")
+        active_work_store = work_store
+    else:
+        active_work_store = NoopBlockWorkStore()
+    active_work_store.prepare(shard_spec)
 
     # Queues
     prep_q, write_queues = _setup_queues(
@@ -358,6 +378,7 @@ def run(
         output_store,
         cfg,
         shard_spec,
+        active_work_store,
         stop_event,
         num_prep_workers,
         prep_q,
@@ -522,16 +543,28 @@ def main(argv: Optional[List[str]] = None) -> None:
     """
     args = _parse_args(sys.argv[1:] if argv is None else argv)
 
-    model = load_model(args.model_type, args.weights)
-
-    in_arr = open_ts_spec(args.in_spec)
-    out_arr = open_ts_spec(args.out_spec)
-
     if args.config:
         cfg = InferenceConfig.from_json(args.config)
     else:
         cfg = InferenceConfig()
     logger.info(f"Inference config:\n{cfg}")
+
+    model = load_model(args.model_type, args.weights)
+
+    in_spec = load_ts_spec(args.in_spec)
+    out_spec = load_ts_spec(args.out_spec)
+    validate_resume_output_spec(cfg, out_spec)
+    in_arr = open_ts_spec(in_spec)
+    out_arr = open_ts_spec(out_spec)
+
+    work_store = build_block_work_store(
+        cfg=cfg,
+        output_spec=out_spec,
+        input_store=in_arr,
+        output_store=out_arr,
+        model_type=args.model_type,
+        weights_path=args.weights,
+    )
 
     run(
         model,
@@ -542,6 +575,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         args.metrics_interval,
         num_prep_workers=max(1, args.prep_workers),
         num_writer_workers=max(1, args.writer_workers),
+        work_store=work_store,
     )
 
 

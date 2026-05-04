@@ -63,6 +63,30 @@ class InferenceConfig(BaseModel):
         description="Spatial partitioning strategy across shards.",
     )
 
+    # Resume / block completion state
+    resume: bool = Field(
+        default=False,
+        description="Skip blocks that the configured work store reports complete.",
+    )
+    work_store: Literal["none", "s3-markers"] = Field(
+        default="none",
+        description="Block completion backend used when resume=True.",
+    )
+    resume_marker_prefix: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional s3://bucket/prefix root for resume markers. If unset, "
+            "S3 marker resume derives a prefix from the output TensorStore spec."
+        ),
+    )
+    resume_run_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional stable resume namespace. If unset, the CLI derives one "
+            "from output-affecting config and IO/model metadata."
+        ),
+    )
+
     # Seam handling
     # 'blend' = edge-aware Hann/Tukey blending inside blocks
     # 'trim'  = crop overlapped margins (keeps constant contribution)
@@ -153,7 +177,9 @@ class InferenceConfig(BaseModel):
         else:
             raise TypeError("source must be a JSON string, file path, or dict")
         if not isinstance(data, dict):
-            raise ValueError("Config JSON must be an object with InferenceConfig fields")
+            raise ValueError(
+                "Config JSON must be an object with InferenceConfig fields"
+            )
         if shard_count is not None:
             data["shard_count"] = shard_count
         if shard_index is not None:
@@ -303,5 +329,13 @@ class InferenceConfig(BaseModel):
             raise ValueError(
                 f"shard_index ({self.shard_index}) must be in [0, shard_count ({self.shard_count}))"
             )
+
+        # Resume
+        if self.resume and self.work_store == "none":
+            self.work_store = "s3-markers"
+        if self.resume_marker_prefix is not None and not self.resume_marker_prefix:
+            raise ValueError("resume_marker_prefix must be non-empty when provided")
+        if self.resume_run_id is not None and not self.resume_run_id:
+            raise ValueError("resume_run_id must be non-empty when provided")
 
         return self

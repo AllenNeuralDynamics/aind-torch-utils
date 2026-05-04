@@ -14,6 +14,7 @@ from aind_torch_utils.accumulators import BlockAccumulator
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.distributed.sharding import ShardSpec
 from aind_torch_utils.utils import iter_blocks_zyx, iter_patch_starts
+from aind_torch_utils.work_state import BlockKey, BlockLease, BlockWorkStore
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,8 @@ class Batch:
         The shape of the expanded (core + halo) accumulator for this block.
     halo_left : Tuple[int, int, int]
         The size of the halo on the (-z, -y, -x) sides of the block.
+    lease : BlockLease
+        Work-store lease for the block.
     """
 
     block_idx: Tuple[int, int, int]
@@ -59,6 +62,7 @@ class Batch:
     total_patches_in_block: int
     acc_shape: Tuple[int, int, int]  # shape of expanded (core+halo) accumulator
     halo_left: Tuple[int, int, int]  # halo size on the -Z/-Y/-X sides
+    lease: BlockLease
 
 
 @dataclass(slots=True)
@@ -91,6 +95,8 @@ class Preds:
         The size of the halo on the (-z, -y, -x) sides of the block.
     ready_event : Optional[torch.cuda.Event]
         A CUDA event that signals when the D2H copy of `host_out` is complete.
+    lease : BlockLease
+        Work-store lease for the block.
     """
 
     block_idx: Tuple[int, int, int]
@@ -103,6 +109,7 @@ class Preds:
     total_patches_in_block: int
     acc_shape: Tuple[int, int, int]
     halo_left: Tuple[int, int, int]
+    lease: BlockLease
     # CUDA event to signal the D2H copy completed
     ready_event: Optional["torch.cuda.Event"] = field(
         default=None, repr=False, compare=False
@@ -140,6 +147,7 @@ class PrepWorker:
         prep_q: "queue.Queue[Batch]",
         model_patch: Tuple[int, int, int],
         shard_spec: ShardSpec,
+        work_store: BlockWorkStore,
         worker_id: int = 0,
         num_workers: int = 1,
         global_worker_offset: int = 0,
@@ -174,6 +182,7 @@ class PrepWorker:
         self.reader = reader
         self.prep_q = prep_q
         self.patch = model_patch
+        self.work_store = work_store
         self.full_zyx = self.reader.shape[-3:]
         self.worker_id = worker_id
         self.num_workers = max(1, num_workers)
@@ -229,6 +238,19 @@ class PrepWorker:
 
             if stop_event.is_set():
                 break
+
+            block_key = BlockKey(
+                t=self.cfg.t_idx,
+                c=self.cfg.c_idx,
+                z=block_idx[0],
+                y=block_idx[1],
+                x=block_idx[2],
+                linear_k=k,
+            )
+            lease = self.work_store.claim_block(block_key)
+            if lease is None:
+                logger.debug("Skipping completed block %s", block_key)
+                continue
 
             zsl, ysl, xsl = core_bbox
             z0, z1 = zsl.start, zsl.stop
@@ -329,6 +351,7 @@ class PrepWorker:
                     total_patches_in_block=total_patches,
                     acc_shape=acc_shape,
                     halo_left=halo_left,
+                    lease=lease,
                 )
                 while not stop_event.is_set():
                     try:
@@ -471,6 +494,7 @@ class GpuWorker:
                 total_patches_in_block=batch.total_patches_in_block,
                 acc_shape=batch.acc_shape,
                 halo_left=batch.halo_left,
+                lease=batch.lease,
                 ready_event=evt,  # <-- writer will synchronize this
             )
 
@@ -496,6 +520,7 @@ class WriterWorker:
         cfg: InferenceConfig,
         writer: "ts.TensorStore",
         write_q: "queue.Queue[Optional[Preds]]",
+        work_store: BlockWorkStore,
     ):
         """
         Initializes the WriterWorker.
@@ -512,6 +537,7 @@ class WriterWorker:
         self.cfg = cfg
         self.writer = writer
         self.write_q = write_q
+        self.work_store = work_store
         self.blocks: Dict[Tuple[int, int, int], BlockAccumulator] = {}
 
     def run(self, stop_event: threading.Event) -> None:
@@ -585,6 +611,11 @@ class WriterWorker:
                     )
                 else:
                     out_arr = core.astype(target_dtype, copy=False)
-                self.writer[self.cfg.t_idx, self.cfg.c_idx, zsl, ysl, xsl].write(
-                    out_arr
-                ).result()
+                try:
+                    self.writer[self.cfg.t_idx, self.cfg.c_idx, zsl, ysl, xsl].write(
+                        out_arr
+                    ).result()
+                except Exception as exc:
+                    self.work_store.fail_block(preds.lease, exc)
+                    raise
+                self.work_store.complete_block(preds.lease)

@@ -31,6 +31,33 @@ def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def load_ts_spec(path_or_json: Union[str, Dict[str, Any]]) -> Any:
+    """Load a TensorStore JSON spec from a path, inline JSON, or dictionary.
+
+    Parameters
+    ----------
+    path_or_json : str or dict
+        One of:
+        * Raw JSON string (``"{...}"`` or ``"[...]"``)
+        * Filesystem path to a JSON spec file
+        * In-memory dictionary spec
+
+    Returns
+    -------
+    Any
+        Parsed TensorStore spec.
+    """
+    if isinstance(path_or_json, str):
+        stripped = path_or_json.lstrip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            # Interpret as raw JSON literal provided directly.
+            return json.loads(stripped)
+        # Treat as path to JSON file.
+        with open(path_or_json, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return path_or_json
+
+
 def open_ts_spec(path_or_json: Union[str, Dict[str, Any]]) -> Any:
     """Open a TensorStore from a JSON spec.
 
@@ -47,17 +74,7 @@ def open_ts_spec(path_or_json: Union[str, Dict[str, Any]]) -> Any:
     Any
         An opened (read-ready) TensorStore object (future already resolved).
     """
-    if isinstance(path_or_json, str):
-        stripped = path_or_json.lstrip()
-        if stripped.startswith("{") or stripped.startswith("["):
-            # Interpret as raw JSON literal provided directly.
-            spec = json.loads(stripped)
-        else:
-            # Treat as path to JSON file.
-            with open(path_or_json, "r", encoding="utf-8") as f:
-                spec = json.load(f)
-    else:
-        spec = path_or_json
+    spec = load_ts_spec(path_or_json)
     return ts.open(spec).result()
 
 
