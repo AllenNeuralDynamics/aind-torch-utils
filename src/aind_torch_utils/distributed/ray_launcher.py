@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import json
 import logging
 import os
 import sys
-import copy
-import json
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.run import _parse_args as parse_inference_args
 from aind_torch_utils.run import (
-    _parse_args as parse_inference_args,
     load_model,
     run,
 )
 from aind_torch_utils.utils import open_ts_spec
+from aind_torch_utils.work_state import (
+    build_block_work_store,
+    validate_resume_output_spec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +62,9 @@ def _default_metrics_template(base: Optional[str]) -> Optional[str]:
     return f"{stem}_shard{{shard}}{ext}"
 
 
-def _resolve_metrics_path(base: Optional[str], template: Optional[str], shard: int) -> Optional[str]:
+def _resolve_metrics_path(
+    base: Optional[str], template: Optional[str], shard: int
+) -> Optional[str]:
     if template:
         return template.format(shard=shard)
     if base:
@@ -116,6 +122,14 @@ def _launch_locally(
         model = load_model(run_args.model_type, run_args.weights)
         input_store = open_ts_spec(copy.deepcopy(input_spec))
         output_store = open_ts_spec(copy.deepcopy(output_spec))
+        work_store = build_block_work_store(
+            cfg=cfg,
+            output_spec=output_spec,
+            input_store=input_store,
+            output_store=output_store,
+            model_type=run_args.model_type,
+            weights_path=run_args.weights,
+        )
         run(
             model,
             input_store,
@@ -125,10 +139,13 @@ def _launch_locally(
             metrics_interval=run_args.metrics_interval,
             num_prep_workers=max(1, run_args.prep_workers),
             num_writer_workers=max(1, run_args.writer_workers),
+            work_store=work_store,
         )
 
 
-def _parse_ray_args(argv: Optional[Sequence[str]] = None) -> Tuple[argparse.Namespace, argparse.Namespace]:
+def _parse_ray_args(
+    argv: Optional[Sequence[str]] = None,
+) -> Tuple[argparse.Namespace, argparse.Namespace]:
     ray_parser = argparse.ArgumentParser(add_help=False)
     ray_parser.add_argument("--ray-address", type=str, default=None)
     ray_parser.add_argument("--num-shards", type=int, default=None)
@@ -200,7 +217,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
         return
 
-    logger.info("Preparing output store (create/delete as specified) before sharded run.")
+    validate_resume_output_spec(base_cfg, output_spec_dict)
+    logger.info(
+        "Preparing output store (create/delete as specified) before sharded run."
+    )
     open_ts_spec(copy.deepcopy(output_spec_dict))
     output_spec_for_shards = _prepare_output_spec_for_shards(output_spec_dict)
 
@@ -226,7 +246,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     ray.init(**init_kwargs)
 
     try:
-        cpus = ray_args.cpus_per_shard or max(1.0, run_args.prep_workers + run_args.writer_workers)
+        cpus = ray_args.cpus_per_shard or max(
+            1.0, run_args.prep_workers + run_args.writer_workers
+        )
         requested_gpus = ray_args.gpus_per_shard
         if requested_gpus is None:
             requested_gpus = max(0.0, len(base_cfg.devices))
@@ -241,6 +263,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             model = load_model(run_args.model_type, run_args.weights)
             input_store = open_ts_spec(copy.deepcopy(input_spec_dict))
             output_store = open_ts_spec(copy.deepcopy(output_spec_for_shards))
+            work_store = build_block_work_store(
+                cfg=cfg,
+                output_spec=output_spec_for_shards,
+                input_store=input_store,
+                output_store=output_store,
+                model_type=run_args.model_type,
+                weights_path=run_args.weights,
+            )
             run(
                 model,
                 input_store,
@@ -250,6 +280,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 metrics_interval=run_args.metrics_interval,
                 num_prep_workers=max(1, run_args.prep_workers),
                 num_writer_workers=max(1, run_args.writer_workers),
+                work_store=work_store,
             )
 
         futures = []
