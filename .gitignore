@@ -93,3 +93,4 @@ data/
 environment/
 metadata/
 .codegraph/
+**.ckpt
