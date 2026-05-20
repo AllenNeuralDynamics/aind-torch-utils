@@ -229,6 +229,7 @@ class PrepWorker:
                 norm_block -= block_mn
                 norm_block /= block_scale
             elif self.cfg.normalize == "global":
+                # Same formula out = (input - plow) / (phigh - plow)
                 block_mn = self.cfg.norm_lower
                 block_mx = self.cfg.norm_upper
                 block_scale = max(block_mx - block_mn, self.cfg.eps)
@@ -551,15 +552,19 @@ class WriterWorker:
 
             for bi, (sz, sy, sx) in enumerate(preds.starts_in_block):
                 dz, dy, dx = preds.valid_sizes[bi]
-                mn, mx = preds.per_block_minmax[bi]
-                scale = max(mx - mn, self.cfg.eps)
                 for n, acc in enumerate(accs):
                     patch_pred = out_np[bi, n]
                     pp = patch_pred.astype(np.float32, copy=False)
-                    denorm = (pp * np.float32(scale) + np.float32(mn)).astype(
-                        np.float32, copy=False
-                    )
-                    acc.add(denorm, (sz, sy, sx), (dz, dy, dx))
+
+                    # This is useful for whenever the model does not need
+                    # to map to the original data range (e.g. a segmentation model)
+                    if self.cfg.output_denormalize:
+                        mn, mx = preds.per_block_minmax[bi]
+                        scale = max(mx - mn, self.cfg.eps)
+                        pp = (pp * np.float32(scale) + np.float32(mn)).astype(
+                            np.float32, copy=False
+                        )
+                    acc.add(pp, (sz, sy, sx), (dz, dy, dx))
 
             if accs[0].count >= accs[0].total:
                 lz, ly, lx = preds.halo_left
