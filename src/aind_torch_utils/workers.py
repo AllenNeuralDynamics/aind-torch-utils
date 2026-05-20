@@ -3,7 +3,7 @@ import queue
 import threading
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import tensorstore as ts
@@ -408,11 +408,14 @@ class GpuWorker:
             with torch.inference_mode():
                 with autocast_ctx:
                     out = self.model(dev_in)
-                if out.dtype != batch.host_in.dtype:
-                    out = out.to(batch.host_in.dtype)
 
-            # D2H into pinned buffer (async on a dedicated stream)
-            host_out = torch.empty_like(batch.host_in, pin_memory=True)
+            # D2H into pinned buffer sized to actual model output (async on a dedicated stream)
+            pin_memory = "cuda" in str(self.device)
+            host_out = torch.empty(
+                out.shape,
+                dtype=out.dtype,
+                pin_memory=pin_memory,
+            )
 
             # Ensure the copy stream waits for the default stream's compute to finish
             cur = torch.cuda.current_stream(self.device)
@@ -456,12 +459,16 @@ class GpuWorker:
 class WriterWorker:
     """
     Worker that accumulates predictions for a block and writes the result.
+
+    Supports single-output models (legacy: one writer) and multi-output models
+    (N writers, one per decoder). The model output tensor is expected to have
+    shape ``(B, N, Z, Y, X)`` where N equals ``len(writers)``.
     """
 
     def __init__(
         self,
         cfg: InferenceConfig,
-        writer: "ts.TensorStore",
+        writers: "Union[ts.TensorStore, List[ts.TensorStore]]",
         write_q: "queue.Queue[Optional[Preds]]",
     ):
         """
@@ -470,23 +477,40 @@ class WriterWorker:
         Parameters
         ----------
         cfg : InferenceConfig
-            The denoising configuration.
-        writer : ts.TensorStore
-            The TensorStore writer for the output data.
+            The inference configuration.
+        writers : ts.TensorStore or list of ts.TensorStore
+            One output store per model output channel. A bare TensorStore is
+            treated as a single-element list for backwards compatibility.
         write_q : queue.Queue[Optional[Preds]]
             The queue from which to get model predictions.
         """
         self.cfg = cfg
-        self.writer = writer
+        self.writers: List["ts.TensorStore"] = (
+            writers if isinstance(writers, list) else [writers]
+        )
         self.write_q = write_q
-        self.blocks: Dict[Tuple[int, int, int], BlockAccumulator] = {}
+        # maps block_idx → list of BlockAccumulator, one per output channel
+        self.blocks: Dict[Tuple[int, int, int], List[BlockAccumulator]] = {}
+
+    def _make_accumulators(self, acc_shape: Tuple[int, int, int]) -> List[BlockAccumulator]:
+        return [
+            BlockAccumulator(
+                acc_shape,
+                self.cfg.eps,
+                overlap=self.cfg.overlap,
+                seam_mode=self.cfg.seam_mode,
+                trim_voxels=self.cfg.trim_voxels,
+                min_blend_weight=self.cfg.min_blend_weight,
+            )
+            for _ in self.writers
+        ]
 
     def run(self, stop_event: threading.Event) -> None:
         """
         The main run loop for the worker.
 
         Gets predictions from the write queue, accumulates them until a block
-        is complete, finalizes the block, and writes it to the output.
+        is complete, finalizes the block, and writes it to each output store.
 
         Parameters
         ----------
@@ -512,46 +536,45 @@ class WriterWorker:
                 xsl.stop - xsl.start,
             )
 
-            acc = self.blocks.get(preds.block_idx)
-            if acc is None:
-                acc = BlockAccumulator(
-                    preds.acc_shape,
-                    self.cfg.eps,
-                    overlap=self.cfg.overlap,
-                    seam_mode=self.cfg.seam_mode,
-                    trim_voxels=self.cfg.trim_voxels,
-                    min_blend_weight=self.cfg.min_blend_weight,
-                )
-                acc.total = preds.total_patches_in_block
-                self.blocks[preds.block_idx] = acc
+            accs = self.blocks.get(preds.block_idx)
+            if accs is None:
+                accs = self._make_accumulators(preds.acc_shape)
+                for acc in accs:
+                    acc.total = preds.total_patches_in_block
+                self.blocks[preds.block_idx] = accs
 
-            out_np = preds.host_out.numpy()
+            out_np = preds.host_out.numpy()  # (B, N, pz, py, px) or (B, 1, pz, py, px)
+            # Ensure the tensor has a channel dimension that matches writers
+            if out_np.ndim == 4:
+                # legacy single-output (B, pz, py, px) — add channel dim
+                out_np = out_np[:, np.newaxis]
+
             for bi, (sz, sy, sx) in enumerate(preds.starts_in_block):
                 dz, dy, dx = preds.valid_sizes[bi]
-                patch_pred = out_np[bi, 0]
                 mn, mx = preds.per_block_minmax[bi]
                 scale = max(mx - mn, self.cfg.eps)
-                pp = patch_pred.astype(np.float32, copy=False)
-                denorm = (pp * np.float32(scale) + np.float32(mn)).astype(
-                    np.float32, copy=False
-                )
-                acc.add(denorm, (sz, sy, sx), (dz, dy, dx))
-
-            if acc.count >= acc.total:
-                ext = acc.finalize()
-                del self.blocks[preds.block_idx]
-
-                lz, ly, lx = preds.halo_left
-                core = ext[lz : lz + core_bz, ly : ly + core_by, lx : lx + core_bx]
-                # preserve target dtype from output store
-                target_dtype = self.writer.dtype.numpy_dtype
-                if np.issubdtype(target_dtype, np.integer):
-                    info = np.iinfo(target_dtype)
-                    out_arr = np.clip(core, info.min, info.max).astype(
-                        target_dtype, copy=False
+                for n, acc in enumerate(accs):
+                    patch_pred = out_np[bi, n]
+                    pp = patch_pred.astype(np.float32, copy=False)
+                    denorm = (pp * np.float32(scale) + np.float32(mn)).astype(
+                        np.float32, copy=False
                     )
-                else:
-                    out_arr = core.astype(target_dtype, copy=False)
-                self.writer[self.cfg.t_idx, self.cfg.c_idx, zsl, ysl, xsl].write(
-                    out_arr
-                ).result()
+                    acc.add(denorm, (sz, sy, sx), (dz, dy, dx))
+
+            if accs[0].count >= accs[0].total:
+                lz, ly, lx = preds.halo_left
+                for acc, writer in zip(accs, self.writers):
+                    ext = acc.finalize()
+                    core = ext[lz : lz + core_bz, ly : ly + core_by, lx : lx + core_bx]
+                    target_dtype = writer.dtype.numpy_dtype
+                    if np.issubdtype(target_dtype, np.integer):
+                        info = np.iinfo(target_dtype)
+                        out_arr = np.clip(core, info.min, info.max).astype(
+                            target_dtype, copy=False
+                        )
+                    else:
+                        out_arr = core.astype(target_dtype, copy=False)
+                    writer[self.cfg.t_idx, self.cfg.c_idx, zsl, ysl, xsl].write(
+                        out_arr
+                    ).result()
+                del self.blocks[preds.block_idx]

@@ -92,3 +92,4 @@ secrets.py
 data/
 environment/
 metadata/
+.codegraph/
