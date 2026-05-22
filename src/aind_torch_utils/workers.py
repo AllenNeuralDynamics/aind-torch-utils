@@ -229,13 +229,13 @@ class PrepWorker:
                 norm_block -= block_mn
                 norm_block /= block_scale
             elif self.cfg.normalize == "global":
-                # Same formula out = (input - plow) / (phigh - plow)
                 block_mn = self.cfg.norm_lower
                 block_mx = self.cfg.norm_upper
                 block_scale = max(block_mx - block_mn, self.cfg.eps)
-                # normalize the block in-place
-                norm_block -= block_mn
-                norm_block /= block_scale
+                # Clip to [p_low, p_high] first, then normalize — matches
+                # PercentileNormalizationd._normalize_channel step order.
+                norm_block = np.clip(norm_block, block_mn, block_mx)
+                norm_block = (norm_block - block_mn) / block_scale
             else:  # False
                 # Bypass normalization entirely (identity). We pretend (mn,mx)=(0,1)
                 # so the writer performs a no-op inverse transform.

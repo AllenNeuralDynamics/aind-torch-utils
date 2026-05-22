@@ -44,6 +44,7 @@ import tensorstore as ts
 import torch
 import torch.nn as nn
 
+import boto3
 from aind_proteomics_image_translator.models.protein_head import (
     DecoderPath,
     ProteinPredictionModel,
@@ -51,6 +52,8 @@ from aind_proteomics_image_translator.models.protein_head import (
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.run import run
 from aind_torch_utils.utils import open_ts_spec
+from upscale_masks.omezarr_metadata import _get_pyramid_metadata, write_ome_ngff_metadata
+from upscale_masks.utils import load_json
 
 
 def load_sample_percentiles(percentiles_dir: str) -> Dict[str, List[List[float]]]:
@@ -255,19 +258,164 @@ def load_proteomics_model(
 def _open_or_create_s3_zarr(
     bucket: str, path: str, shape: Tuple, chunks: Tuple
 ) -> ts.TensorStore:
-    """Open (or create) a float32 zarr2 output array on S3."""
+    """Open (or create) float32 zarr2 level-0 array inside an OME-zarr group on S3."""
+    level0_path = path.rstrip("/") + "/0/"
     spec = {
         "driver": "zarr",
-        "kvstore": {"driver": "s3", "bucket": bucket, "path": path},
+        "kvstore": {"driver": "s3", "bucket": bucket, "path": level0_path},
         "metadata": {
             "shape": list(shape),
             "chunks": list(chunks),
             "dtype": "<f4",
+            "dimension_separator": "/",
         },
         "open": True,
         "create": True,
     }
     return ts.open(spec).result()
+
+
+def _read_pyramid_spec_from_zarr3(
+    in_spec_path: str,
+) -> Optional[Tuple[Tuple[float, float, float], List[List[int]], int]]:
+    """Read pyramid spec from the input volume's zarr.json.
+
+    Returns (voxel_size_zyx, scale_factors_per_level, n_extra_levels) or None
+    if the input has no multiscales metadata.
+
+    voxel_size_zyx      — physical ZYX voxel size at level 0 (micrometers)
+    scale_factors_per_level — [[sz,sy,sx], ...] for transitions 0→1, 1→2, ...
+    n_extra_levels      — number of pyramid levels beyond level 0
+    """
+    with open(in_spec_path) as fh:
+        spec_dict = json.load(fh)
+    kv = spec_dict.get("kvstore", spec_dict)
+    bucket = kv.get("bucket", "")
+    path = kv.get("path", "").rstrip("/")
+
+    # Strip trailing level digit (e.g. ".../0" → "...") to reach the group root
+    group_path = re.sub(r"/\d+$", "", path)
+    s3_group_uri = f"s3://{bucket}/{group_path}"
+
+    try:
+        zarr_json = load_json(s3_group_uri, "zarr.json")
+    except Exception as exc:
+        logger.warning(f"Could not read zarr.json from {s3_group_uri}: {exc}")
+        return None
+
+    # Support {"attributes": {"ome": {"multiscales": [...]}}} and
+    # {"attributes": {"multiscales": [...]}} layouts
+    attrs = zarr_json.get("attributes", zarr_json)
+    multiscales = attrs.get("ome", attrs).get("multiscales", [])
+    if not multiscales:
+        return None
+
+    datasets = multiscales[0].get("datasets", [])
+    if len(datasets) < 2:
+        return None
+
+    def _get_scale(ds):
+        for ct in ds.get("coordinateTransformations", []):
+            if ct["type"] == "scale":
+                return ct["scale"]
+        return None
+
+    scales = [_get_scale(ds) for ds in datasets]
+    if any(s is None for s in scales):
+        return None
+
+    # Voxel size at level 0 — last 3 values are Z, Y, X
+    voxel_size_zyx = tuple(scales[0][-3:])
+
+    # Scale factors between consecutive levels (ZYX only)
+    scale_factors_per_level = [
+        [max(1, round(scales[i + 1][j] / scales[i][j])) for j in range(-3, 0)]
+        for i in range(len(scales) - 1)
+    ]
+
+    return voxel_size_zyx, scale_factors_per_level, len(datasets) - 1
+
+
+def _write_pyramid_ts(
+    bucket: str,
+    zarr_s3_path: str,
+    vol_shape: Tuple,
+    voxel_size_zyx: Tuple[float, float, float],
+    scale_factors_per_level: List[List[int]],
+    n_lvls: int,
+    image_name: str = "prediction",
+    chunk_size: Tuple[int, int, int] = (128, 128, 128),
+) -> None:
+    """Generate pyramid levels 1..n_lvls using TensorStore's downsample driver.
+
+    All levels are zarr v2, consistent with the inference output at level 0.
+    OME-NGFF .zattrs is uploaded via boto3 at the group root.
+    """
+    import asyncio
+
+    base_path = zarr_s3_path.rstrip("/") + "/"
+    chunk_5d = (1, 1) + chunk_size
+
+    zattrs = write_ome_ngff_metadata(
+        arr_shape=list(vol_shape),
+        chunk_size=list(chunk_5d),
+        image_name=image_name,
+        n_lvls=n_lvls + 1,
+        scale_factors=scale_factors_per_level,
+        voxel_size=(1.0, 1.0) + tuple(voxel_size_zyx),
+        origin=[0, 0, 0],
+        metadata=_get_pyramid_metadata(),
+    )
+    s3_client = boto3.client("s3")
+    zattrs_key = f"{base_path}.zattrs"
+    s3_client.put_object(Bucket=bucket, Key=zattrs_key, Body=json.dumps(zattrs).encode())
+    logger.info(f"Wrote OME-NGFF metadata to s3://{bucket}/{zattrs_key}")
+
+    async def _build_levels():
+        for lvl in range(1, n_lvls + 1):
+            sf = scale_factors_per_level[min(lvl - 1, len(scale_factors_per_level) - 1)]
+            sf_padded = [1, 1] + list(sf)
+
+            base_spec = {
+                "driver": "zarr",
+                "kvstore": {
+                    "driver": "s3",
+                    "bucket": bucket,
+                    "path": f"{base_path}{lvl - 1}/",
+                },
+            }
+
+            downsampled = await ts.open({
+                "driver": "downsample",
+                "downsample_factors": sf_padded,
+                "downsample_method": "mean",
+                "base": base_spec,
+            })
+            new_shape = list(downsampled.shape)
+
+            output_spec = {
+                "driver": "zarr",
+                "kvstore": {
+                    "driver": "s3",
+                    "bucket": bucket,
+                    "path": f"{base_path}{lvl}/",
+                },
+                "metadata": {
+                    "shape": new_shape,
+                    "chunks": list(chunk_5d),
+                    "dtype": "<f4",
+                    "dimension_separator": "/",
+                },
+                "create": True,
+                "delete_existing": True,
+            }
+
+            output = await ts.open(output_spec)
+            data = await downsampled.read()
+            await output.write(data)
+            logger.info(f"[pyramid] level {lvl} written — shape {new_shape}")
+
+    asyncio.run(_build_levels())
 
 
 def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
@@ -305,8 +453,16 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
                     help="Block size for volume tiling (default: 512 512 512).")
     ap.add_argument("--batch", type=int, default=4,
                     help="Inference batch size (default: 4).")
-    ap.add_argument("--device", default="cuda:0",
-                    help="CUDA device (default: cuda:0).")
+    ap.add_argument(
+        "--devices",
+        nargs="*",
+        default=None,
+        metavar="DEVICE",
+        help=(
+            "CUDA devices to use, e.g. --devices cuda:0 cuda:1. "
+            "Defaults to all available GPUs (torch.cuda.device_count())."
+        ),
+    )
     ap.add_argument("--t", type=int, default=0, help="Time index (default: 0).")
     ap.add_argument("--c", type=int, default=0, help="Channel index (default: 0).")
     ap.add_argument("--prep-workers", type=int, default=4)
@@ -339,6 +495,13 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
+
+    if args.devices:
+        devices = args.devices
+    else:
+        n = torch.cuda.device_count()
+        devices = [f"cuda:{i}" for i in range(n)] if n > 0 else ["cpu"]
+        logger.info(f"Auto-detected {len(devices)} device(s): {devices}")
 
     if len(args.decoder_weights) != len(args.output_names):
         raise ValueError(
@@ -422,7 +585,6 @@ def main(argv: Optional[List[str]] = None) -> None:
             normalize="global",
             norm_lower=norm_lower,
             norm_upper=norm_upper,
-            clip_norm=True,
             output_denormalize=False,
         )
     else:
@@ -435,7 +597,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         batch_size=args.batch,
         t_idx=args.t,
         c_idx=args.c,
-        devices=[args.device],
+        devices=devices,
         amp=True,
         use_tf32=True,
         max_inflight_batches=args.max_inflight_batches,
@@ -456,6 +618,36 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     logger.info("Inference complete.")
 
+    pyramid_spec = _read_pyramid_spec_from_zarr3(args.in_spec)
+    if pyramid_spec is None:
+        logger.info("Input has no multiscales metadata — skipping pyramid generation.")
+    else:
+        voxel_size_zyx, scale_factors_per_level, n_extra_levels = pyramid_spec
+        logger.info(
+            f"Pyramid spec from input: {n_extra_levels} extra level(s), "
+            f"voxel_size_zyx={voxel_size_zyx}, scale_factors={scale_factors_per_level}"
+        )
+        for name in args.output_names:
+            s3_path = f"{args.out_prefix.rstrip('/')}/{name}.zarr/"
+            logger.info(f"Generating pyramid for {name}...")
+            _write_pyramid_ts(
+                bucket=args.out_bucket,
+                zarr_s3_path=s3_path,
+                vol_shape=vol_shape,
+                voxel_size_zyx=voxel_size_zyx,
+                scale_factors_per_level=scale_factors_per_level,
+                n_lvls=n_extra_levels,
+                image_name=name,
+            )
+
 
 if __name__ == "__main__":
+    profile_name = os.environ["AWS_PROFILE"]
+    print("Using profile:", profile_name)
+    session = boto3.Session(profile_name=profile_name)
+    creds = session.get_credentials().get_frozen_credentials()
+
+    os.environ["AWS_ACCESS_KEY_ID"] = creds.access_key
+    os.environ["AWS_SECRET_ACCESS_KEY"] = creds.secret_key
+    os.environ["AWS_SESSION_TOKEN"] = creds.token
     main()
