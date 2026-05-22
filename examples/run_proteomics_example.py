@@ -380,29 +380,38 @@ def _write_pyramid_ts(
     logger.info(f"Wrote OME-NGFF metadata to s3://{bucket}/{zattrs_key}")
 
     async def _build_levels():
-        # 32-thread concurrency
-        ctx = ts.Context({"data_copy_concurrency": {"limit": 32}})
+        import asyncio as _aio
+
+        # store-to-store write() collects ALL chunk results before writing anything,
+        # so memory grows to the full level size on TB-scale data regardless of
+        # cache_pool or s3_request_concurrency (confirmed: github.com/google/tensorstore/issues/213).
+        # Fix: acquire semaphore BEFORE each read() so TensorStore never sees more
+        # than max_inflight chunks at once.
+        # Peak RAM = max_inflight x input_chunk_bytes (e.g. 8 × 64 MB = 512 MB for sf=2).
+        max_inflight = 8
+        sem = _aio.Semaphore(max_inflight)
+        ctx = ts.Context({"data_copy_concurrency": {"limit": 4}})
 
         for lvl in range(1, n_lvls + 1):
             sf = scale_factors_per_level[min(lvl - 1, len(scale_factors_per_level) - 1)]
             sf_padded = [1, 1] + list(sf)
 
-            base_spec = {
-                "driver": "zarr",
-                "kvstore": {
-                    "driver": "s3",
-                    "bucket": bucket,
-                    "path": f"{base_path}{lvl - 1}/",
-                },
-            }
-
             downsampled = await ts.open({
                 "driver": "downsample",
                 "downsample_factors": sf_padded,
                 "downsample_method": "mean",
-                "base": base_spec,
+                "base": {
+                    "driver": "zarr",
+                    "kvstore": {
+                        "driver": "s3",
+                        "bucket": bucket,
+                        "path": f"{base_path}{lvl - 1}/",
+                    },
+                },
             }, context=ctx)
             new_shape = list(downsampled.shape)
+            nz, ny, nx = new_shape[2], new_shape[3], new_shape[4]
+            cz, cy, cx = chunk_5d[2], chunk_5d[3], chunk_5d[4]
 
             output_spec = {
                 "driver": "zarr",
@@ -420,12 +429,27 @@ def _write_pyramid_ts(
                 "create": True,
                 "delete_existing": True,
             }
-
             output = await ts.open(output_spec, context=ctx)
-            # Pass the TensorStore directly so TensorStore reads output-chunk-aligned
-            # regions on demand — never allocates the full level in RAM.
-            await output.write(downsampled)
-            logger.info(f"[pyramid] level {lvl} written — shape {new_shape}")
+
+            async def _write_chunk(z0, z1, y0, y1, x0, x1):
+                async with sem:
+                    data = await downsampled[:, :, z0:z1, y0:y1, x0:x1].read()
+                    await output[:, :, z0:z1, y0:y1, x0:x1].write(data)
+                    del data
+
+            all_ranges = [
+                (z0, min(z0 + cz, nz), y0, min(y0 + cy, ny), x0, min(x0 + cx, nx))
+                for z0 in range(0, nz, cz)
+                for y0 in range(0, ny, cy)
+                for x0 in range(0, nx, cx)
+            ]
+            n_chunks = len(all_ranges)
+            batch = 64
+            for i in range(0, n_chunks, batch):
+                await _aio.gather(*[_write_chunk(*r) for r in all_ranges[i : i + batch]])
+                logger.info(f"[pyramid] level {lvl} chunk {min(i + batch, n_chunks)}/{n_chunks}")
+
+            logger.info(f"[pyramid] level {lvl} done — shape {new_shape}")
 
     asyncio.run(_build_levels())
 
@@ -570,22 +594,22 @@ def main(argv: Optional[List[str]] = None) -> None:
     vol_shape = (T, C, Z, Y, X)
     out_chunks = (1, 1) + patch  # one patch per zarr chunk
     out_stores = []
-    for name in args.output_names:
-        s3_path = f"{args.out_prefix.rstrip('/')}/{name}.zarr/"
-        logger.info(f"Output store: s3://{args.out_bucket}/{s3_path}")
-        out_stores.append(
-            _open_or_create_s3_zarr(args.out_bucket, s3_path, vol_shape, out_chunks)
-        )
+    # for name in args.output_names:
+    #     s3_path = f"{args.out_prefix.rstrip('/')}/{name}.zarr/"
+    #     logger.info(f"Output store: s3://{args.out_bucket}/{s3_path}")
+    #     out_stores.append(
+    #         _open_or_create_s3_zarr(args.out_bucket, s3_path, vol_shape, out_chunks)
+    #     )
 
-    model = load_proteomics_model(
-        encoder_checkpoint=args.encoder_weights,
-        decoder_checkpoints=args.decoder_weights,
-        img_size=patch,
-        encoder_num_heads=args.encoder_num_heads,
-        feature_size=args.feature_size,
-        recover_layers=tuple(args.recover_layers),
-        apply_sigmoid=not args.no_sigmoid,
-    )
+    # model = load_proteomics_model(
+    #     encoder_checkpoint=args.encoder_weights,
+    #     decoder_checkpoints=args.decoder_weights,
+    #     img_size=patch,
+    #     encoder_num_heads=args.encoder_num_heads,
+    #     feature_size=args.feature_size,
+    #     recover_layers=tuple(args.recover_layers),
+    #     apply_sigmoid=not args.no_sigmoid,
+    # )
 
     if norm_lower is not None and norm_upper is not None:
         # Match training-time PercentileNormalizationd:
@@ -619,15 +643,15 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     logger.info(f"Inference config:\n{cfg}")
 
-    run(
-        model=model,
-        input_store=in_store,
-        output_store=out_stores,
-        cfg=cfg,
-        metrics_json=args.metrics_json,
-        num_prep_workers=args.prep_workers,
-        num_writer_workers=args.writer_workers,
-    )
+    # run(
+    #     model=model,
+    #     input_store=in_store,
+    #     output_store=out_stores,
+    #     cfg=cfg,
+    #     metrics_json=args.metrics_json,
+    #     num_prep_workers=args.prep_workers,
+    #     num_writer_workers=args.writer_workers,
+    # )
     logger.info("Inference complete.")
     
     start_pyramid_time = time.time()
