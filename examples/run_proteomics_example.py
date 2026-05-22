@@ -54,6 +54,7 @@ from aind_torch_utils.run import run
 from aind_torch_utils.utils import open_ts_spec
 from upscale_masks.omezarr_metadata import _get_pyramid_metadata, write_ome_ngff_metadata
 from upscale_masks.utils import load_json
+import time
 
 
 def load_sample_percentiles(percentiles_dir: str) -> Dict[str, List[List[float]]]:
@@ -275,7 +276,7 @@ def _open_or_create_s3_zarr(
     return ts.open(spec).result()
 
 
-def _read_pyramid_spec_from_zarr3(
+def _read_pyramid_spec_from_zarr(
     in_spec_path: str,
 ) -> Optional[Tuple[Tuple[float, float, float], List[List[int]], int]]:
     """Read pyramid spec from the input volume's zarr.json.
@@ -297,14 +298,21 @@ def _read_pyramid_spec_from_zarr3(
     group_path = re.sub(r"/\d+$", "", path)
     s3_group_uri = f"s3://{bucket}/{group_path}"
 
-    try:
-        zarr_json = load_json(s3_group_uri, "zarr.json")
-    except Exception as exc:
-        logger.warning(f"Could not read zarr.json from {s3_group_uri}: {exc}")
+    # Try zarr v3 (zarr.json) first, fall back to zarr v2 (.zattrs)
+    zarr_json = None
+    for fname in ("zarr.json", ".zattrs"):
+        try:
+            zarr_json = load_json(s3_group_uri, fname)
+            logger.info(f"Read multiscales metadata from {s3_group_uri}/{fname}")
+            break
+        except Exception:
+            pass
+    if zarr_json is None:
+        logger.warning(f"Could not read zarr.json or .zattrs from {s3_group_uri}")
         return None
 
-    # Support {"attributes": {"ome": {"multiscales": [...]}}} and
-    # {"attributes": {"multiscales": [...]}} layouts
+    # zarr v3: {"attributes": {"ome": {"multiscales": [...]}}}
+    # zarr v2: {"multiscales": [...]}  or  {"ome": {"multiscales": [...]}}
     attrs = zarr_json.get("attributes", zarr_json)
     multiscales = attrs.get("ome", attrs).get("multiscales", [])
     if not multiscales:
@@ -372,6 +380,9 @@ def _write_pyramid_ts(
     logger.info(f"Wrote OME-NGFF metadata to s3://{bucket}/{zattrs_key}")
 
     async def _build_levels():
+        # 32-thread concurrency
+        ctx = ts.Context({"data_copy_concurrency": {"limit": 32}})
+
         for lvl in range(1, n_lvls + 1):
             sf = scale_factors_per_level[min(lvl - 1, len(scale_factors_per_level) - 1)]
             sf_padded = [1, 1] + list(sf)
@@ -390,7 +401,7 @@ def _write_pyramid_ts(
                 "downsample_factors": sf_padded,
                 "downsample_method": "mean",
                 "base": base_spec,
-            })
+            }, context=ctx)
             new_shape = list(downsampled.shape)
 
             output_spec = {
@@ -410,9 +421,10 @@ def _write_pyramid_ts(
                 "delete_existing": True,
             }
 
-            output = await ts.open(output_spec)
-            data = await downsampled.read()
-            await output.write(data)
+            output = await ts.open(output_spec, context=ctx)
+            # Pass the TensorStore directly so TensorStore reads output-chunk-aligned
+            # regions on demand — never allocates the full level in RAM.
+            await output.write(downsampled)
             logger.info(f"[pyramid] level {lvl} written — shape {new_shape}")
 
     asyncio.run(_build_levels())
@@ -558,22 +570,22 @@ def main(argv: Optional[List[str]] = None) -> None:
     vol_shape = (T, C, Z, Y, X)
     out_chunks = (1, 1) + patch  # one patch per zarr chunk
     out_stores = []
-    for name in args.output_names:
-        s3_path = f"{args.out_prefix.rstrip('/')}/{name}.zarr/"
-        logger.info(f"Output store: s3://{args.out_bucket}/{s3_path}")
-        out_stores.append(
-            _open_or_create_s3_zarr(args.out_bucket, s3_path, vol_shape, out_chunks)
-        )
+    # for name in args.output_names:
+    #     s3_path = f"{args.out_prefix.rstrip('/')}/{name}.zarr/"
+    #     logger.info(f"Output store: s3://{args.out_bucket}/{s3_path}")
+    #     out_stores.append(
+    #         _open_or_create_s3_zarr(args.out_bucket, s3_path, vol_shape, out_chunks)
+    #     )
 
-    model = load_proteomics_model(
-        encoder_checkpoint=args.encoder_weights,
-        decoder_checkpoints=args.decoder_weights,
-        img_size=patch,
-        encoder_num_heads=args.encoder_num_heads,
-        feature_size=args.feature_size,
-        recover_layers=tuple(args.recover_layers),
-        apply_sigmoid=not args.no_sigmoid,
-    )
+    # model = load_proteomics_model(
+    #     encoder_checkpoint=args.encoder_weights,
+    #     decoder_checkpoints=args.decoder_weights,
+    #     img_size=patch,
+    #     encoder_num_heads=args.encoder_num_heads,
+    #     feature_size=args.feature_size,
+    #     recover_layers=tuple(args.recover_layers),
+    #     apply_sigmoid=not args.no_sigmoid,
+    # )
 
     if norm_lower is not None and norm_upper is not None:
         # Match training-time PercentileNormalizationd:
@@ -607,18 +619,19 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     logger.info(f"Inference config:\n{cfg}")
 
-    run(
-        model=model,
-        input_store=in_store,
-        output_store=out_stores,
-        cfg=cfg,
-        metrics_json=args.metrics_json,
-        num_prep_workers=args.prep_workers,
-        num_writer_workers=args.writer_workers,
-    )
+    # run(
+    #     model=model,
+    #     input_store=in_store,
+    #     output_store=out_stores,
+    #     cfg=cfg,
+    #     metrics_json=args.metrics_json,
+    #     num_prep_workers=args.prep_workers,
+    #     num_writer_workers=args.writer_workers,
+    # )
     logger.info("Inference complete.")
-
-    pyramid_spec = _read_pyramid_spec_from_zarr3(args.in_spec)
+    
+    start_pyramid_time = time.time()
+    pyramid_spec = _read_pyramid_spec_from_zarr(args.in_spec)
     if pyramid_spec is None:
         logger.info("Input has no multiscales metadata — skipping pyramid generation.")
     else:
@@ -639,6 +652,9 @@ def main(argv: Optional[List[str]] = None) -> None:
                 n_lvls=n_extra_levels,
                 image_name=name,
             )
+
+    end_pyramid_time = time.time()
+    logger.info(f"Pyramid generation time: {end_pyramid_time - start_pyramid_time:.2f} seconds")
 
 
 if __name__ == "__main__":
