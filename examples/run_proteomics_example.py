@@ -570,22 +570,22 @@ def main(argv: Optional[List[str]] = None) -> None:
     vol_shape = (T, C, Z, Y, X)
     out_chunks = (1, 1) + patch  # one patch per zarr chunk
     out_stores = []
-    # for name in args.output_names:
-    #     s3_path = f"{args.out_prefix.rstrip('/')}/{name}.zarr/"
-    #     logger.info(f"Output store: s3://{args.out_bucket}/{s3_path}")
-    #     out_stores.append(
-    #         _open_or_create_s3_zarr(args.out_bucket, s3_path, vol_shape, out_chunks)
-    #     )
+    for name in args.output_names:
+        s3_path = f"{args.out_prefix.rstrip('/')}/{name}.zarr/"
+        logger.info(f"Output store: s3://{args.out_bucket}/{s3_path}")
+        out_stores.append(
+            _open_or_create_s3_zarr(args.out_bucket, s3_path, vol_shape, out_chunks)
+        )
 
-    # model = load_proteomics_model(
-    #     encoder_checkpoint=args.encoder_weights,
-    #     decoder_checkpoints=args.decoder_weights,
-    #     img_size=patch,
-    #     encoder_num_heads=args.encoder_num_heads,
-    #     feature_size=args.feature_size,
-    #     recover_layers=tuple(args.recover_layers),
-    #     apply_sigmoid=not args.no_sigmoid,
-    # )
+    model = load_proteomics_model(
+        encoder_checkpoint=args.encoder_weights,
+        decoder_checkpoints=args.decoder_weights,
+        img_size=patch,
+        encoder_num_heads=args.encoder_num_heads,
+        feature_size=args.feature_size,
+        recover_layers=tuple(args.recover_layers),
+        apply_sigmoid=not args.no_sigmoid,
+    )
 
     if norm_lower is not None and norm_upper is not None:
         # Match training-time PercentileNormalizationd:
@@ -619,15 +619,15 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     logger.info(f"Inference config:\n{cfg}")
 
-    # run(
-    #     model=model,
-    #     input_store=in_store,
-    #     output_store=out_stores,
-    #     cfg=cfg,
-    #     metrics_json=args.metrics_json,
-    #     num_prep_workers=args.prep_workers,
-    #     num_writer_workers=args.writer_workers,
-    # )
+    run(
+        model=model,
+        input_store=in_store,
+        output_store=out_stores,
+        cfg=cfg,
+        metrics_json=args.metrics_json,
+        num_prep_workers=args.prep_workers,
+        num_writer_workers=args.writer_workers,
+    )
     logger.info("Inference complete.")
     
     start_pyramid_time = time.time()
