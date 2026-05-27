@@ -54,7 +54,9 @@ Options Overview
   ``--min-blend-weight``
 - Normalization: ``--normalize {percentile,global,false}``, ``--norm-lower``,
   ``--norm-upper``, ``--clip-norm [LO HI]``
-- Monitoring: ``--metrics-json``, ``--metrics-interval``
+- Monitoring: ``--metrics-json``, ``--metrics-interval`` write queue depths,
+  system metrics, block progress, and summary timings for preparation,
+  inference, write, and total block processing.
 
 See ``src/aind_torch_utils/run.py`` for authoritative CLI definitions and
 ``src/aind_torch_utils/config.py`` for detailed field descriptions.

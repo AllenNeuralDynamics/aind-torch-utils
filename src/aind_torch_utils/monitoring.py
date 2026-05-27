@@ -2,11 +2,304 @@ import threading
 import time
 from dataclasses import dataclass
 from queue import Queue
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 import psutil
 
 BYTES_PER_MB = 1024 * 1024
+BlockIndex = Tuple[int, int, int]
+
+
+@dataclass
+class _BlockTiming:
+    start_s: Optional[float] = None
+    preparation_s: float = 0.0
+    inference_s: float = 0.0
+    write_s: float = 0.0
+    preparation_recorded: bool = False
+    inference_recorded: bool = False
+    write_recorded: bool = False
+
+
+class BlockProgressMonitor:
+    """
+    Tracks block-level progress and summary timing statistics.
+
+    The monitor is thread-safe and stores only active block state plus aggregate
+    duration samples for completed blocks. Exported data is JSON-serializable
+    and intentionally summary-only.
+    """
+
+    def __init__(
+        self,
+        total_blocks: int,
+        t0: Optional[float] = None,
+    ) -> None:
+        """
+        Initializes the BlockProgressMonitor.
+
+        Parameters
+        ----------
+        total_blocks : int
+            The total number of blocks expected for the run.
+        t0 : Optional[float], optional
+            The reference start time (from time.perf_counter()). If None, the
+            current time is used, by default None.
+        """
+        self.total_blocks = max(0, int(total_blocks))
+        self.t0 = time.perf_counter() if t0 is None else t0
+        self._lock = threading.Lock()
+        self._active_blocks: Dict[BlockIndex, _BlockTiming] = {}
+        self._completed_blocks: Set[BlockIndex] = set()
+        self._preparation_s: List[float] = []
+        self._inference_s: List[float] = []
+        self._write_s: List[float] = []
+        self._total_block_processing_s: List[float] = []
+
+    @staticmethod
+    def _key(block_idx: BlockIndex) -> BlockIndex:
+        return tuple(block_idx)
+
+    @staticmethod
+    def _now(now_s: Optional[float] = None) -> float:
+        return time.perf_counter() if now_s is None else now_s
+
+    @staticmethod
+    def _percentile(sorted_values: List[float], q: float) -> Optional[float]:
+        if not sorted_values:
+            return None
+        if len(sorted_values) == 1:
+            return sorted_values[0]
+
+        pos = (len(sorted_values) - 1) * (q / 100.0)
+        lo = int(pos)
+        hi = min(lo + 1, len(sorted_values) - 1)
+        frac = pos - lo
+        return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac
+
+    @classmethod
+    def _summary(cls, values: List[float]) -> Dict[str, Optional[float]]:
+        if not values:
+            return {
+                "count": 0,
+                "min": None,
+                "mean": None,
+                "max": None,
+                "p50": None,
+                "p95": None,
+            }
+
+        ordered = sorted(values)
+        return {
+            "count": len(values),
+            "min": ordered[0],
+            "mean": sum(values) / len(values),
+            "max": ordered[-1],
+            "p50": cls._percentile(ordered, 50.0),
+            "p95": cls._percentile(ordered, 95.0),
+        }
+
+    def start_block(
+        self, block_idx: BlockIndex, now_s: Optional[float] = None
+    ) -> None:
+        """
+        Records the wall-clock start for a block if it has not started.
+
+        Parameters
+        ----------
+        block_idx : BlockIndex
+            The (z, y, x) index of the block.
+        now_s : Optional[float], optional
+            Explicit timestamp for testing. Defaults to time.perf_counter().
+        """
+        key = self._key(block_idx)
+        now = self._now(now_s)
+        with self._lock:
+            if key in self._completed_blocks:
+                return
+            rec = self._active_blocks.get(key)
+            if rec is None:
+                self._active_blocks[key] = _BlockTiming(start_s=now)
+            elif rec.start_s is None:
+                rec.start_s = now
+
+    def record_preparation_time(
+        self, block_idx: BlockIndex, duration_s: float
+    ) -> None:
+        """
+        Adds active preparation time for a block.
+
+        Parameters
+        ----------
+        block_idx : BlockIndex
+            The (z, y, x) index of the block.
+        duration_s : float
+            Active preparation duration in seconds.
+        """
+        if duration_s < 0:
+            return
+        key = self._key(block_idx)
+        with self._lock:
+            if key in self._completed_blocks:
+                return
+            rec = self._active_blocks.setdefault(key, _BlockTiming())
+            rec.preparation_s += float(duration_s)
+            rec.preparation_recorded = True
+
+    def add_inference_time(self, block_idx: BlockIndex, duration_s: float) -> None:
+        """
+        Adds GPU inference time for one batch in a block.
+
+        Parameters
+        ----------
+        block_idx : BlockIndex
+            The (z, y, x) index of the block.
+        duration_s : float
+            Inference duration in seconds.
+        """
+        if duration_s < 0:
+            return
+        key = self._key(block_idx)
+        with self._lock:
+            if key in self._completed_blocks:
+                return
+            rec = self._active_blocks.setdefault(key, _BlockTiming())
+            rec.inference_s += float(duration_s)
+            rec.inference_recorded = True
+
+    def add_write_time(self, block_idx: BlockIndex, duration_s: float) -> None:
+        """
+        Adds active writer-stage time for a block.
+
+        Parameters
+        ----------
+        block_idx : BlockIndex
+            The (z, y, x) index of the block.
+        duration_s : float
+            Active writer-stage duration in seconds.
+        """
+        if duration_s < 0:
+            return
+        key = self._key(block_idx)
+        with self._lock:
+            if key in self._completed_blocks:
+                return
+            rec = self._active_blocks.setdefault(key, _BlockTiming())
+            rec.write_s += float(duration_s)
+            rec.write_recorded = True
+
+    def complete_block(
+        self, block_idx: BlockIndex, now_s: Optional[float] = None
+    ) -> None:
+        """
+        Marks a block complete and commits its stage timings to summaries.
+
+        Parameters
+        ----------
+        block_idx : BlockIndex
+            The (z, y, x) index of the block.
+        now_s : Optional[float], optional
+            Explicit timestamp for testing. Defaults to time.perf_counter().
+        """
+        key = self._key(block_idx)
+        now = self._now(now_s)
+        with self._lock:
+            if key in self._completed_blocks:
+                return
+
+            rec = self._active_blocks.pop(key, _BlockTiming(start_s=now))
+            self._completed_blocks.add(key)
+
+            if rec.preparation_recorded:
+                self._preparation_s.append(rec.preparation_s)
+            if rec.inference_recorded:
+                self._inference_s.append(rec.inference_s)
+            if rec.write_recorded:
+                self._write_s.append(rec.write_s)
+            if rec.start_s is not None:
+                self._total_block_processing_s.append(max(0.0, now - rec.start_s))
+
+    def get_data(self, now_s: Optional[float] = None) -> Dict:
+        """
+        Return a JSON-serializable snapshot of block progress and timing stats.
+
+        Parameters
+        ----------
+        now_s : Optional[float], optional
+            Explicit timestamp for testing. Defaults to time.perf_counter().
+
+        Returns
+        -------
+        Dict
+            A dictionary containing progress counts, rates, ETA, and summary
+            timing statistics.
+        """
+        now = self._now(now_s)
+        with self._lock:
+            completed_blocks = len(self._completed_blocks)
+            active_blocks = len(self._active_blocks)
+            preparation_s = list(self._preparation_s)
+            inference_s = list(self._inference_s)
+            write_s = list(self._write_s)
+            total_block_processing_s = list(self._total_block_processing_s)
+
+        incomplete_blocks = max(self.total_blocks - completed_blocks, 0)
+        percent_complete = (
+            100.0
+            if self.total_blocks == 0
+            else min(100.0, completed_blocks / self.total_blocks * 100.0)
+        )
+        elapsed_s = max(0.0, now - self.t0)
+        blocks_per_sec = completed_blocks / elapsed_s if elapsed_s > 0 else 0.0
+        if incomplete_blocks == 0:
+            eta_s = 0.0
+        elif blocks_per_sec > 0:
+            eta_s = incomplete_blocks / blocks_per_sec
+        else:
+            eta_s = None
+
+        return {
+            "total_blocks": self.total_blocks,
+            "completed_blocks": completed_blocks,
+            "incomplete_blocks": incomplete_blocks,
+            "active_blocks": active_blocks,
+            "percent_complete": percent_complete,
+            "elapsed_s": elapsed_s,
+            "blocks_per_sec": blocks_per_sec,
+            "eta_s": eta_s,
+            "timing_summary": {
+                "preparation_s": self._summary(preparation_s),
+                "inference_s": self._summary(inference_s),
+                "write_s": self._summary(write_s),
+                "total_block_processing_s": self._summary(
+                    total_block_processing_s
+                ),
+            },
+        }
+
+    def format_progress(self, now_s: Optional[float] = None) -> str:
+        """
+        Return a concise human-readable progress line.
+
+        Parameters
+        ----------
+        now_s : Optional[float], optional
+            Explicit timestamp for testing. Defaults to time.perf_counter().
+
+        Returns
+        -------
+        str
+            A formatted progress message.
+        """
+        data = self.get_data(now_s)
+        eta_s = data["eta_s"]
+        eta_text = "unknown" if eta_s is None else f"{eta_s:.1f}s"
+        return (
+            "Block progress: "
+            f"{data['completed_blocks']}/{data['total_blocks']} "
+            f"({data['percent_complete']:.1f}%), "
+            f"{data['blocks_per_sec']:.3f} blocks/s, ETA {eta_text}"
+        )
 
 
 @dataclass

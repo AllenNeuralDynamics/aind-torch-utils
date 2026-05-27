@@ -1,3 +1,4 @@
+import json
 import unittest.mock
 
 import numpy as np
@@ -85,12 +86,26 @@ def test_run_pipeline(temp_dir, dummy_data):
 
     # Assertions
     assert metrics_json.exists()
+    with open(metrics_json, encoding="utf-8") as f:
+        metrics = json.load(f)
+    assert "block_monitor" in metrics
+    block_monitor = metrics["block_monitor"]
+    assert block_monitor["total_blocks"] == 1
+    assert "completed_blocks" in block_monitor
+    assert "timing_summary" in block_monitor
+    for key in [
+        "preparation_s",
+        "inference_s",
+        "write_s",
+        "total_block_processing_s",
+    ]:
+        assert key in block_monitor["timing_summary"]
 
     # Verify output data is same as input for DummyModel
     input_data = input_store.read().result()
     output_data = output_store.read().result()
 
-    # The mock GpuWorker does not process data, so we only check for equality if cuda is available
+    # The mock GpuWorker does not process data, so only check equality on CUDA.
     if torch.cuda.is_available():
         np.testing.assert_array_equal(input_data, output_data)
         # assert all values are > 0 to check for gaps during stitching

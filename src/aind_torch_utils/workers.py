@@ -1,6 +1,7 @@
 import logging
 import queue
 import threading
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -12,6 +13,7 @@ from torch import nn
 
 from aind_torch_utils.accumulators import BlockAccumulator
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.monitoring import BlockProgressMonitor
 from aind_torch_utils.utils import iter_blocks_zyx, iter_patch_starts
 
 logger = logging.getLogger(__name__)
@@ -90,6 +92,10 @@ class Preds:
         The size of the halo on the (-z, -y, -x) sides of the block.
     ready_event : Optional[torch.cuda.Event]
         A CUDA event that signals when the D2H copy of `host_out` is complete.
+    inference_start_event : Optional[torch.cuda.Event]
+        CUDA event recorded immediately before model inference.
+    inference_end_event : Optional[torch.cuda.Event]
+        CUDA event recorded after model inference and output dtype conversion.
     """
 
     block_idx: Tuple[int, int, int]
@@ -104,6 +110,12 @@ class Preds:
     halo_left: Tuple[int, int, int]
     # CUDA event to signal the D2H copy completed
     ready_event: Optional["torch.cuda.Event"] = field(
+        default=None, repr=False, compare=False
+    )
+    inference_start_event: Optional["torch.cuda.Event"] = field(
+        default=None, repr=False, compare=False
+    )
+    inference_end_event: Optional["torch.cuda.Event"] = field(
         default=None, repr=False, compare=False
     )
 
@@ -140,6 +152,7 @@ class PrepWorker:
         model_patch: Tuple[int, int, int],
         worker_id: int = 0,
         num_workers: int = 1,
+        block_monitor: Optional[BlockProgressMonitor] = None,
     ):
         """
         Initializes the PrepWorker.
@@ -158,6 +171,8 @@ class PrepWorker:
             The ID of this worker, by default 0.
         num_workers : int, optional
             The total number of preparation workers, by default 1.
+        block_monitor : Optional[BlockProgressMonitor], optional
+            Monitor for block progress and timing, by default None.
         """
         self.cfg = cfg
         self.reader = reader
@@ -166,6 +181,7 @@ class PrepWorker:
         self.full_zyx = self.reader.shape[-3:]
         self.worker_id = worker_id
         self.num_workers = max(1, num_workers)
+        self.block_monitor = block_monitor
 
     def run(self, stop_event: threading.Event) -> None:
         """
@@ -196,6 +212,11 @@ class PrepWorker:
 
             if stop_event.is_set():
                 break
+
+            if self.block_monitor is not None:
+                self.block_monitor.start_block(block_idx)
+            prep_active_s = 0.0
+            prep_active_start = time.perf_counter()
 
             zsl, ysl, xsl = core_bbox
             z0, z1 = zsl.start, zsl.stop
@@ -297,12 +318,25 @@ class PrepWorker:
                     acc_shape=acc_shape,
                     halo_left=halo_left,
                 )
+
+                prep_active_s += time.perf_counter() - prep_active_start
+                is_final_batch = i + self.cfg.batch_size >= total_patches
+                if self.block_monitor is not None and is_final_batch:
+                    self.block_monitor.record_preparation_time(
+                        block_idx, prep_active_s
+                    )
+
+                put_done = False
                 while not stop_event.is_set():
                     try:
                         self.prep_q.put(batch, timeout=0.1)
+                        put_done = True
                         break
                     except queue.Full:
                         continue
+                if not put_done:
+                    break
+                prep_active_start = time.perf_counter()
 
 
 class GpuWorker:
@@ -317,6 +351,7 @@ class GpuWorker:
         device: str,
         prep_q: "queue.Queue[Optional[Batch]]",
         write_queues: "List[queue.Queue[Optional[Preds]]]",
+        block_monitor: Optional[BlockProgressMonitor] = None,
     ):
         """
         Initializes the GpuWorker.
@@ -333,6 +368,8 @@ class GpuWorker:
             The queue from which to get prepared batches.
         write_queues : List[queue.Queue[Optional[Preds]]]
             A list of queues to send predictions to, one for each writer worker.
+        block_monitor : Optional[BlockProgressMonitor], optional
+            Monitor for block progress and timing, by default None.
         """
         self.cfg = cfg
         self.model = model
@@ -340,6 +377,7 @@ class GpuWorker:
         self.prep_q = prep_q
         self.write_queues = write_queues
         self.num_writers = len(write_queues)
+        self.block_monitor = block_monitor
 
         if self.cfg.use_tf32:
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -405,11 +443,26 @@ class GpuWorker:
             dev_in.copy_(batch.host_in, non_blocking=True)
 
             # Inference
+            inference_start_event = None
+            inference_end_event = None
+            if self.block_monitor is not None and self.device.type == "cuda":
+                with torch.cuda.device(self.device):
+                    inference_start_event = torch.cuda.Event(
+                        blocking=False, enable_timing=True
+                    )
+                    inference_end_event = torch.cuda.Event(
+                        blocking=False, enable_timing=True
+                    )
+                inference_start_event.record(torch.cuda.current_stream(self.device))
+
             with torch.inference_mode():
                 with autocast_ctx:
                     out = self.model(dev_in)
                 if out.dtype != batch.host_in.dtype:
                     out = out.to(batch.host_in.dtype)
+
+            if inference_end_event is not None:
+                inference_end_event.record(torch.cuda.current_stream(self.device))
 
             # D2H into pinned buffer (async on a dedicated stream)
             host_out = torch.empty_like(batch.host_in, pin_memory=True)
@@ -439,6 +492,8 @@ class GpuWorker:
                 acc_shape=batch.acc_shape,
                 halo_left=batch.halo_left,
                 ready_event=evt,  # <-- writer will synchronize this
+                inference_start_event=inference_start_event,
+                inference_end_event=inference_end_event,
             )
 
             # route to shard
@@ -463,6 +518,7 @@ class WriterWorker:
         cfg: InferenceConfig,
         writer: "ts.TensorStore",
         write_q: "queue.Queue[Optional[Preds]]",
+        block_monitor: Optional[BlockProgressMonitor] = None,
     ):
         """
         Initializes the WriterWorker.
@@ -475,11 +531,14 @@ class WriterWorker:
             The TensorStore writer for the output data.
         write_q : queue.Queue[Optional[Preds]]
             The queue from which to get model predictions.
+        block_monitor : Optional[BlockProgressMonitor], optional
+            Monitor for block progress and timing, by default None.
         """
         self.cfg = cfg
         self.writer = writer
         self.write_q = write_q
         self.blocks: Dict[Tuple[int, int, int], BlockAccumulator] = {}
+        self.block_monitor = block_monitor
 
     def run(self, stop_event: threading.Event) -> None:
         """
@@ -504,6 +563,31 @@ class WriterWorker:
 
             if getattr(preds, "ready_event", None) is not None:
                 preds.ready_event.synchronize()
+
+            if (
+                self.block_monitor is not None
+                and preds.inference_start_event is not None
+                and preds.inference_end_event is not None
+            ):
+                try:
+                    inference_s = (
+                        preds.inference_start_event.elapsed_time(
+                            preds.inference_end_event
+                        )
+                        / 1000.0
+                    )
+                    self.block_monitor.add_inference_time(
+                        preds.block_idx, inference_s
+                    )
+                except RuntimeError:
+                    logger.debug(
+                        "Failed to record CUDA inference timing for block %s",
+                        preds.block_idx,
+                        exc_info=True,
+                    )
+
+            write_start = time.perf_counter()
+            block_completed = False
 
             zsl, ysl, xsl = preds.block_bbox
             core_bz, core_by, core_bx = (
@@ -555,3 +639,11 @@ class WriterWorker:
                 self.writer[self.cfg.t_idx, self.cfg.c_idx, zsl, ysl, xsl].write(
                     out_arr
                 ).result()
+                block_completed = True
+
+            if self.block_monitor is not None:
+                self.block_monitor.add_write_time(
+                    preds.block_idx, time.perf_counter() - write_start
+                )
+                if block_completed:
+                    self.block_monitor.complete_block(preds.block_idx)

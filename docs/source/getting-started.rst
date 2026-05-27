@@ -80,3 +80,7 @@ Minimal Programmatic Usage
 Configuration note: for the complete list of parameters, see
 ``src/aind_torch_utils/config.py`` (``InferenceConfig`` field metadata).
 
+When ``metrics_json`` is set, the output includes queue depths, system metrics,
+block progress, and summary timings for preparation, inference, write, and
+total block processing.
+

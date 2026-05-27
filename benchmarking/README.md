@@ -136,6 +136,9 @@ Total time: 28864.12 s
 Throughput: 214.28 MB/s
 ```
 
+The metrics JSON also includes block progress plus summary timings for
+preparation, inference, write, and total block processing.
+
 ## GPU Performance
 
 | GPU Utilization | VRAM Usage |

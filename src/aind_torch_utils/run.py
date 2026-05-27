@@ -16,8 +16,12 @@ from torch import nn
 import aind_torch_utils.models  # This registers all models when imported
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.model_registry import ModelRegistry
-from aind_torch_utils.monitoring import QueueMonitor, SystemMonitor
-from aind_torch_utils.utils import open_ts_spec
+from aind_torch_utils.monitoring import (
+    BlockProgressMonitor,
+    QueueMonitor,
+    SystemMonitor,
+)
+from aind_torch_utils.utils import iter_blocks_zyx, open_ts_spec
 from aind_torch_utils.workers import GpuWorker, PrepWorker, WriterWorker
 
 logging.basicConfig(
@@ -58,9 +62,12 @@ def _put_until_stop(
 
 
 def _write_metrics_json(
-    metrics_json: str, monitor: QueueMonitor, sys_monitor: SystemMonitor
+    metrics_json: str,
+    monitor: QueueMonitor,
+    sys_monitor: SystemMonitor,
+    block_monitor: BlockProgressMonitor,
 ) -> None:
-    """Write queue and system metrics to a JSON file.
+    """Write queue, system, and block metrics to a JSON file.
 
     Parameters
     ----------
@@ -70,11 +77,14 @@ def _write_metrics_json(
         The queue monitor instance.
     sys_monitor : SystemMonitor
         The system monitor instance.
+    block_monitor : BlockProgressMonitor
+        The block progress and timing monitor instance.
     """
     try:
         metrics = {
             "queue_monitor": monitor.get_data(),
             "system_monitor": sys_monitor.get_data(),
+            "block_monitor": block_monitor.get_data(),
         }
         # Ensure parent directory exists before writing
         parent_dir = os.path.dirname(metrics_json)
@@ -114,8 +124,9 @@ def _setup_monitors(
     write_queues: List[queue.Queue],
     metrics_interval: float,
     stop_event: threading.Event,
-) -> Tuple[QueueMonitor, SystemMonitor]:
-    """Sets up the queue and system monitors.
+    total_blocks: int,
+) -> Tuple[QueueMonitor, SystemMonitor, BlockProgressMonitor]:
+    """Sets up the queue, system, and block monitors.
 
     Parameters
     ----------
@@ -127,11 +138,13 @@ def _setup_monitors(
         The interval at which to sample the queues and system.
     stop_event : threading.Event
         An event to signal the monitors to stop.
+    total_blocks : int
+        The total number of blocks expected for the run.
 
     Returns
     -------
-    Tuple[QueueMonitor, SystemMonitor]
-        A tuple containing the queue monitor and system monitor.
+    Tuple[QueueMonitor, SystemMonitor, BlockProgressMonitor]
+        A tuple containing the queue, system, and block monitors.
     """
     # start queue monitor
     q_monitor = QueueMonitor(
@@ -151,7 +164,9 @@ def _setup_monitors(
     )
     sys_monitor.start()
 
-    return q_monitor, sys_monitor
+    block_monitor = BlockProgressMonitor(total_blocks=total_blocks)
+
+    return q_monitor, sys_monitor, block_monitor
 
 
 def _setup_workers(
@@ -162,6 +177,7 @@ def _setup_workers(
     num_prep_workers: int,
     prep_q: queue.Queue,
     write_queues: List[queue.Queue],
+    block_monitor: BlockProgressMonitor,
 ) -> Tuple[List[PrepWorker], List[GpuWorker], List[WriterWorker]]:
     """Sets up the workers for the pipeline.
 
@@ -181,6 +197,8 @@ def _setup_workers(
         The prep queue.
     write_queues : List[queue.Queue]
         A list of writer queues.
+    block_monitor : BlockProgressMonitor
+        The block progress and timing monitor instance.
 
     Returns
     -------
@@ -195,15 +213,23 @@ def _setup_workers(
             cfg.patch,
             worker_id=i,
             num_workers=num_prep_workers,
+            block_monitor=block_monitor,
         )
         for i in range(max(1, num_prep_workers))
     ]
     gpu_workers = [
-        GpuWorker(cfg, deepcopy(model), device, prep_q, write_queues)
+        GpuWorker(
+            cfg,
+            deepcopy(model),
+            device,
+            prep_q,
+            write_queues,
+            block_monitor=block_monitor,
+        )
         for device in cfg.devices
     ]
     writer_workers = [
-        WriterWorker(cfg, output_store, write_queues[i])
+        WriterWorker(cfg, output_store, write_queues[i], block_monitor=block_monitor)
         for i in range(len(write_queues))
     ]
     return prep_workers, gpu_workers, writer_workers
@@ -218,6 +244,7 @@ def _setup_worker_threads(
     num_prep_workers: int,
     prep_q: queue.Queue,
     write_queues: List[queue.Queue],
+    block_monitor: BlockProgressMonitor,
 ) -> Tuple[List[threading.Thread], List[threading.Thread], List[threading.Thread]]:
     """Sets up the worker threads for the pipeline.
 
@@ -239,6 +266,8 @@ def _setup_worker_threads(
         The prep queue.
     write_queues : List[queue.Queue]
         A list of writer queues.
+    block_monitor : BlockProgressMonitor
+        The block progress and timing monitor instance.
 
     Returns
     -------
@@ -255,6 +284,7 @@ def _setup_worker_threads(
         num_prep_workers,
         prep_q,
         write_queues,
+        block_monitor,
     )
 
     # Threads
@@ -308,6 +338,8 @@ def run(
     # Validate shapes
     T, C, Z, Y, X = tuple(input_store.domain.shape)
     assert 0 <= cfg.t_idx < T and 0 <= cfg.c_idx < C, "Invalid t/c indices"
+    full_zyx = (Z, Y, X)
+    total_blocks = sum(1 for _ in iter_blocks_zyx(full_zyx, cfg.block))
 
     # Queues
     prep_q, write_queues = _setup_queues(
@@ -317,8 +349,8 @@ def run(
     stop_event = threading.Event()
 
     # Monitors
-    q_monitor, sys_monitor = _setup_monitors(
-        prep_q, write_queues, metrics_interval, stop_event
+    q_monitor, sys_monitor, block_monitor = _setup_monitors(
+        prep_q, write_queues, metrics_interval, stop_event, total_blocks
     )
 
     # Threads
@@ -331,11 +363,14 @@ def run(
         num_prep_workers,
         prep_q,
         write_queues,
+        block_monitor,
     )
     all_threads = prep_threads + gpu_threads + writer_threads
 
     prep_sentinels_sent = False
     writer_sentinels_sent = False
+    progress_interval_s = max(metrics_interval, 5.0)
+    last_progress_log_s = time.perf_counter()
 
     t0 = time.perf_counter()
     try:
@@ -363,6 +398,11 @@ def run(
             # cooperative wait
             stop_event.wait(0.05)
 
+            now_s = time.perf_counter()
+            if now_s - last_progress_log_s >= progress_interval_s:
+                logger.info(block_monitor.format_progress(now_s=now_s))
+                last_progress_log_s = now_s
+
     except (KeyboardInterrupt, Exception) as e:
         logger.exception(f"Caught {type(e).__name__}, initiating shutdown.")
     finally:
@@ -384,9 +424,10 @@ def run(
         # Stop monitors
         q_monitor.join()
         sys_monitor.join()
+        logger.info(block_monitor.format_progress())
 
         if metrics_json:
-            _write_metrics_json(metrics_json, q_monitor, sys_monitor)
+            _write_metrics_json(metrics_json, q_monitor, sys_monitor, block_monitor)
 
     t1 = time.perf_counter()
     throughput = (Z * Y * X * input_store.dtype.numpy_dtype.itemsize) / 1e6 / (t1 - t0)
