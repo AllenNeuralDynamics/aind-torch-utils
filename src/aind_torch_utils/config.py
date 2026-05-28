@@ -27,7 +27,10 @@ class InferenceConfig(BaseModel):
         description="List of torch devices to use",
     )
     amp: bool = Field(default=True, description="Use AMP")
-    use_tf32: bool = Field(default=True, description="Use TF32")
+    use_tf32: bool = Field(default=False, description="Use TF32")
+    cudnn_benchmark: bool = Field(
+        default=False, description="Enable cuDNN benchmarking"
+    )
     use_compile: bool = Field(default=False, description="Use torch.compile")
     compile_mode: str = Field(
         default="reduce-overhead",
