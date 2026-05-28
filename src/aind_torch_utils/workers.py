@@ -17,6 +17,7 @@ from aind_torch_utils.monitoring import BlockProgressMonitor
 from aind_torch_utils.utils import iter_blocks_zyx, iter_patch_starts
 
 logger = logging.getLogger(__name__)
+QUEUE_PUT_RETRY_S = 0.005
 
 
 @dataclass(slots=True)
@@ -48,6 +49,9 @@ class Batch:
         The shape of the expanded (core + halo) accumulator for this block.
     halo_left : Tuple[int, int, int]
         The size of the halo on the (-z, -y, -x) sides of the block.
+    prep_q_put_s : Optional[float]
+        Wall-clock timestamp recorded immediately before the batch is put on
+        the preparation queue.
     """
 
     block_idx: Tuple[int, int, int]
@@ -60,6 +64,7 @@ class Batch:
     total_patches_in_block: int
     acc_shape: Tuple[int, int, int]  # shape of expanded (core+halo) accumulator
     halo_left: Tuple[int, int, int]  # halo size on the -Z/-Y/-X sides
+    prep_q_put_s: Optional[float] = field(default=None, repr=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -96,6 +101,11 @@ class Preds:
         CUDA event recorded immediately before model inference.
     inference_end_event : Optional[torch.cuda.Event]
         CUDA event recorded after model inference and output dtype conversion.
+    gpu_stage_start_event : Optional[torch.cuda.Event]
+        CUDA event recorded before the H2D copy starts.
+    write_q_put_s : Optional[float]
+        Wall-clock timestamp recorded immediately before the predictions are put
+        on the writer queue.
     """
 
     block_idx: Tuple[int, int, int]
@@ -118,6 +128,10 @@ class Preds:
     inference_end_event: Optional["torch.cuda.Event"] = field(
         default=None, repr=False, compare=False
     )
+    gpu_stage_start_event: Optional["torch.cuda.Event"] = field(
+        default=None, repr=False, compare=False
+    )
+    write_q_put_s: Optional[float] = field(default=None, repr=False, compare=False)
 
 
 def shard_for_block_linear(linear_k: int, num_writers: int) -> int:
@@ -327,13 +341,24 @@ class PrepWorker:
                     )
 
                 put_done = False
+                prep_queue_put_wait_s = 0.0
                 while not stop_event.is_set():
+                    batch.prep_q_put_s = time.perf_counter()
                     try:
-                        self.prep_q.put(batch, timeout=0.1)
+                        self.prep_q.put_nowait(batch)
                         put_done = True
                         break
                     except queue.Full:
+                        wait_start = time.perf_counter()
+                        stop_requested = stop_event.wait(QUEUE_PUT_RETRY_S)
+                        prep_queue_put_wait_s += time.perf_counter() - wait_start
+                        if stop_requested:
+                            break
                         continue
+                if self.block_monitor is not None:
+                    self.block_monitor.add_prep_queue_put_wait_time(
+                        block_idx, prep_queue_put_wait_s
+                    )
                 if not put_done:
                     break
                 prep_active_start = time.perf_counter()
@@ -432,12 +457,27 @@ class GpuWorker:
             if batch is None:
                 break
 
+            batch_received_s = time.perf_counter()
+            if self.block_monitor is not None and batch.prep_q_put_s is not None:
+                self.block_monitor.add_prep_queue_residence_time(
+                    batch.block_idx,
+                    max(0.0, batch_received_s - batch.prep_q_put_s),
+                )
+
             # Allocate device input per batch (simple path)
             dev_in = torch.empty_like(
                 batch.host_in,
                 device=self.device,
                 memory_format=torch.contiguous_format,
             )
+
+            gpu_stage_start_event = None
+            if self.block_monitor is not None and self.device.type == "cuda":
+                with torch.cuda.device(self.device):
+                    gpu_stage_start_event = torch.cuda.Event(
+                        blocking=False, enable_timing=True
+                    )
+                gpu_stage_start_event.record(torch.cuda.current_stream(self.device))
 
             # H2D
             dev_in.copy_(batch.host_in, non_blocking=True)
@@ -473,7 +513,12 @@ class GpuWorker:
 
             # Create the event on the correct device
             with torch.cuda.device(self.device):
-                evt = torch.cuda.Event(blocking=False, enable_timing=False)
+                evt = torch.cuda.Event(
+                    blocking=False,
+                    enable_timing=(
+                        self.block_monitor is not None and self.device.type == "cuda"
+                    ),
+                )
 
             # Enqueue the async D2H copy and record an event on the copy stream
             with torch.cuda.stream(self.copy_stream):
@@ -494,18 +539,34 @@ class GpuWorker:
                 ready_event=evt,  # <-- writer will synchronize this
                 inference_start_event=inference_start_event,
                 inference_end_event=inference_end_event,
+                gpu_stage_start_event=gpu_stage_start_event,
             )
 
             # route to shard
             wid = shard_for_block_linear(preds.linear_k, self.num_writers)
             target_q = self.write_queues[wid]
 
+            put_done = False
+            write_queue_put_wait_s = 0.0
             while not stop_event.is_set():
+                preds.write_q_put_s = time.perf_counter()
                 try:
-                    target_q.put(preds, timeout=0.1)
+                    target_q.put_nowait(preds)
+                    put_done = True
                     break
                 except queue.Full:
+                    wait_start = time.perf_counter()
+                    stop_requested = stop_event.wait(QUEUE_PUT_RETRY_S)
+                    write_queue_put_wait_s += time.perf_counter() - wait_start
+                    if stop_requested:
+                        break
                     continue
+            if self.block_monitor is not None:
+                self.block_monitor.add_write_queue_put_wait_time(
+                    preds.block_idx, write_queue_put_wait_s
+                )
+            if not put_done:
+                break
 
 
 class WriterWorker:
@@ -561,9 +622,23 @@ class WriterWorker:
             if preds is None:
                 break  # single sentinel closes the writer
 
-            if getattr(preds, "ready_event", None) is not None:
-                preds.ready_event.synchronize()
+            preds_received_s = time.perf_counter()
+            if self.block_monitor is not None and preds.write_q_put_s is not None:
+                self.block_monitor.add_write_queue_residence_time(
+                    preds.block_idx,
+                    max(0.0, preds_received_s - preds.write_q_put_s),
+                )
 
+            if getattr(preds, "ready_event", None) is not None:
+                ready_wait_start = time.perf_counter()
+                preds.ready_event.synchronize()
+                if self.block_monitor is not None:
+                    self.block_monitor.add_output_ready_wait_time(
+                        preds.block_idx,
+                        time.perf_counter() - ready_wait_start,
+                    )
+
+            inference_s = None
             if (
                 self.block_monitor is not None
                 and preds.inference_start_event is not None
@@ -582,6 +657,27 @@ class WriterWorker:
                 except RuntimeError:
                     logger.debug(
                         "Failed to record CUDA inference timing for block %s",
+                        preds.block_idx,
+                        exc_info=True,
+                    )
+
+            if (
+                self.block_monitor is not None
+                and inference_s is not None
+                and preds.gpu_stage_start_event is not None
+                and preds.ready_event is not None
+            ):
+                try:
+                    gpu_stage_s = (
+                        preds.gpu_stage_start_event.elapsed_time(preds.ready_event)
+                        / 1000.0
+                    )
+                    self.block_monitor.add_gpu_transfer_overhead_time(
+                        preds.block_idx, max(0.0, gpu_stage_s - inference_s)
+                    )
+                except RuntimeError:
+                    logger.debug(
+                        "Failed to record CUDA transfer overhead for block %s",
                         preds.block_idx,
                         exc_info=True,
                     )

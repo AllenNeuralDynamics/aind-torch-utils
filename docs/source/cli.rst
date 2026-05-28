@@ -56,7 +56,8 @@ Options Overview
   ``--norm-upper``, ``--clip-norm [LO HI]``
 - Monitoring: ``--metrics-json``, ``--metrics-interval`` write queue depths,
   system metrics, block progress, and summary timings for preparation,
-  inference, write, and total block processing.
+  inference, write, total block processing, queue backpressure, GPU transfer
+  overhead, and output readiness waits.
 
 See ``src/aind_torch_utils/run.py`` for authoritative CLI definitions and
 ``src/aind_torch_utils/config.py`` for detailed field descriptions.

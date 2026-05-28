@@ -82,5 +82,6 @@ Configuration note: for the complete list of parameters, see
 
 When ``metrics_json`` is set, the output includes queue depths, system metrics,
 block progress, and summary timings for preparation, inference, write, and
-total block processing.
+total block processing, plus queue backpressure, GPU transfer overhead, and
+output readiness wait diagnostics.
 

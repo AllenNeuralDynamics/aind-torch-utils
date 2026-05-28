@@ -97,6 +97,12 @@ def test_run_pipeline(temp_dir, dummy_data):
         "preparation_s",
         "inference_s",
         "write_s",
+        "prep_queue_put_wait_s",
+        "prep_queue_residence_s",
+        "gpu_transfer_overhead_s",
+        "write_queue_put_wait_s",
+        "write_queue_residence_s",
+        "output_ready_wait_s",
         "total_block_processing_s",
     ]:
         assert key in block_monitor["timing_summary"]

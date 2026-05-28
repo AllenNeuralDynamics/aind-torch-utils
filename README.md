@@ -16,7 +16,7 @@ Generic, queue-based, multi-GPU PyTorch inference pipeline for large volumetric 
 - Multi-threaded CPU stages (prep / writer) feeding multi-GPU inference workers
 - Seam handling via trimming or weighted blending
 - Optional global or per-block percentile normalization
-- Queue, system, and block progress/timing monitoring (JSON metrics export)
+- Queue, system, block progress, and pipeline backpressure diagnostics (JSON metrics export)
 - Model registry for plug‑and‑play custom architectures
 - Optional AMP, TF32, and `torch.compile` acceleration
 - Backed by `tensorstore` for flexible IO backends
@@ -132,6 +132,7 @@ If `--metrics-json` provided:
 - Queue depths over time (prep & writer queues)
 - System metrics (CPU %, RAM, GPU (if implemented))
 - Block progress and summary timings for preparation, inference, write, and total processing
+- Queue wait/residence, GPU transfer overhead, and output readiness wait summaries
 Use to diagnose stalls (e.g., GPU idle while prep queue empty => increase prep workers / decrease IO latency).
 
 ## Custom Model Registration

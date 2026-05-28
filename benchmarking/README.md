@@ -137,7 +137,8 @@ Throughput: 214.28 MB/s
 ```
 
 The metrics JSON also includes block progress plus summary timings for
-preparation, inference, write, and total block processing.
+preparation, inference, write, total block processing, queue backpressure,
+GPU transfer overhead, and output readiness waits.
 
 ## GPU Performance
 

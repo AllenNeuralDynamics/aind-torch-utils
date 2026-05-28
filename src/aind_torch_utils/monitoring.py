@@ -1,6 +1,6 @@
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from queue import Queue
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -8,17 +8,24 @@ import psutil
 
 BYTES_PER_MB = 1024 * 1024
 BlockIndex = Tuple[int, int, int]
+TIMING_SUMMARY_KEYS = (
+    "preparation_s",
+    "inference_s",
+    "write_s",
+    "prep_queue_put_wait_s",
+    "prep_queue_residence_s",
+    "gpu_transfer_overhead_s",
+    "write_queue_put_wait_s",
+    "write_queue_residence_s",
+    "output_ready_wait_s",
+    "total_block_processing_s",
+)
 
 
 @dataclass
 class _BlockTiming:
     start_s: Optional[float] = None
-    preparation_s: float = 0.0
-    inference_s: float = 0.0
-    write_s: float = 0.0
-    preparation_recorded: bool = False
-    inference_recorded: bool = False
-    write_recorded: bool = False
+    timings: Dict[str, float] = field(default_factory=dict)
 
 
 class BlockProgressMonitor:
@@ -51,10 +58,9 @@ class BlockProgressMonitor:
         self._lock = threading.Lock()
         self._active_blocks: Dict[BlockIndex, _BlockTiming] = {}
         self._completed_blocks: Set[BlockIndex] = set()
-        self._preparation_s: List[float] = []
-        self._inference_s: List[float] = []
-        self._write_s: List[float] = []
-        self._total_block_processing_s: List[float] = []
+        self._timing_values: Dict[str, List[float]] = {
+            key: [] for key in TIMING_SUMMARY_KEYS
+        }
 
     @staticmethod
     def _key(block_idx: BlockIndex) -> BlockIndex:
@@ -99,6 +105,20 @@ class BlockProgressMonitor:
             "p95": cls._percentile(ordered, 95.0),
         }
 
+    def _add_timing(
+        self, block_idx: BlockIndex, timing_key: str, duration_s: float
+    ) -> None:
+        if duration_s < 0:
+            return
+        key = self._key(block_idx)
+        with self._lock:
+            if key in self._completed_blocks:
+                return
+            rec = self._active_blocks.setdefault(key, _BlockTiming())
+            rec.timings[timing_key] = rec.timings.get(timing_key, 0.0) + float(
+                duration_s
+            )
+
     def start_block(
         self, block_idx: BlockIndex, now_s: Optional[float] = None
     ) -> None:
@@ -136,15 +156,7 @@ class BlockProgressMonitor:
         duration_s : float
             Active preparation duration in seconds.
         """
-        if duration_s < 0:
-            return
-        key = self._key(block_idx)
-        with self._lock:
-            if key in self._completed_blocks:
-                return
-            rec = self._active_blocks.setdefault(key, _BlockTiming())
-            rec.preparation_s += float(duration_s)
-            rec.preparation_recorded = True
+        self._add_timing(block_idx, "preparation_s", duration_s)
 
     def add_inference_time(self, block_idx: BlockIndex, duration_s: float) -> None:
         """
@@ -157,15 +169,7 @@ class BlockProgressMonitor:
         duration_s : float
             Inference duration in seconds.
         """
-        if duration_s < 0:
-            return
-        key = self._key(block_idx)
-        with self._lock:
-            if key in self._completed_blocks:
-                return
-            rec = self._active_blocks.setdefault(key, _BlockTiming())
-            rec.inference_s += float(duration_s)
-            rec.inference_recorded = True
+        self._add_timing(block_idx, "inference_s", duration_s)
 
     def add_write_time(self, block_idx: BlockIndex, duration_s: float) -> None:
         """
@@ -178,15 +182,43 @@ class BlockProgressMonitor:
         duration_s : float
             Active writer-stage duration in seconds.
         """
-        if duration_s < 0:
-            return
-        key = self._key(block_idx)
-        with self._lock:
-            if key in self._completed_blocks:
-                return
-            rec = self._active_blocks.setdefault(key, _BlockTiming())
-            rec.write_s += float(duration_s)
-            rec.write_recorded = True
+        self._add_timing(block_idx, "write_s", duration_s)
+
+    def add_prep_queue_put_wait_time(
+        self, block_idx: BlockIndex, duration_s: float
+    ) -> None:
+        """Adds time spent blocked on a full preparation queue."""
+        self._add_timing(block_idx, "prep_queue_put_wait_s", duration_s)
+
+    def add_prep_queue_residence_time(
+        self, block_idx: BlockIndex, duration_s: float
+    ) -> None:
+        """Adds time a batch spent resident in the preparation queue."""
+        self._add_timing(block_idx, "prep_queue_residence_s", duration_s)
+
+    def add_gpu_transfer_overhead_time(
+        self, block_idx: BlockIndex, duration_s: float
+    ) -> None:
+        """Adds GPU stage time outside model inference."""
+        self._add_timing(block_idx, "gpu_transfer_overhead_s", duration_s)
+
+    def add_write_queue_put_wait_time(
+        self, block_idx: BlockIndex, duration_s: float
+    ) -> None:
+        """Adds time spent blocked on a full writer queue."""
+        self._add_timing(block_idx, "write_queue_put_wait_s", duration_s)
+
+    def add_write_queue_residence_time(
+        self, block_idx: BlockIndex, duration_s: float
+    ) -> None:
+        """Adds time a prediction batch spent resident in a writer queue."""
+        self._add_timing(block_idx, "write_queue_residence_s", duration_s)
+
+    def add_output_ready_wait_time(
+        self, block_idx: BlockIndex, duration_s: float
+    ) -> None:
+        """Adds writer time spent waiting for GPU output readiness."""
+        self._add_timing(block_idx, "output_ready_wait_s", duration_s)
 
     def complete_block(
         self, block_idx: BlockIndex, now_s: Optional[float] = None
@@ -210,14 +242,13 @@ class BlockProgressMonitor:
             rec = self._active_blocks.pop(key, _BlockTiming(start_s=now))
             self._completed_blocks.add(key)
 
-            if rec.preparation_recorded:
-                self._preparation_s.append(rec.preparation_s)
-            if rec.inference_recorded:
-                self._inference_s.append(rec.inference_s)
-            if rec.write_recorded:
-                self._write_s.append(rec.write_s)
+            for timing_key, duration_s in rec.timings.items():
+                if timing_key in self._timing_values:
+                    self._timing_values[timing_key].append(duration_s)
             if rec.start_s is not None:
-                self._total_block_processing_s.append(max(0.0, now - rec.start_s))
+                self._timing_values["total_block_processing_s"].append(
+                    max(0.0, now - rec.start_s)
+                )
 
     def get_data(self, now_s: Optional[float] = None) -> Dict:
         """
@@ -238,10 +269,9 @@ class BlockProgressMonitor:
         with self._lock:
             completed_blocks = len(self._completed_blocks)
             active_blocks = len(self._active_blocks)
-            preparation_s = list(self._preparation_s)
-            inference_s = list(self._inference_s)
-            write_s = list(self._write_s)
-            total_block_processing_s = list(self._total_block_processing_s)
+            timing_values = {
+                key: list(values) for key, values in self._timing_values.items()
+            }
 
         incomplete_blocks = max(self.total_blocks - completed_blocks, 0)
         percent_complete = (
@@ -268,12 +298,8 @@ class BlockProgressMonitor:
             "blocks_per_sec": blocks_per_sec,
             "eta_s": eta_s,
             "timing_summary": {
-                "preparation_s": self._summary(preparation_s),
-                "inference_s": self._summary(inference_s),
-                "write_s": self._summary(write_s),
-                "total_block_processing_s": self._summary(
-                    total_block_processing_s
-                ),
+                key: self._summary(timing_values.get(key, []))
+                for key in TIMING_SUMMARY_KEYS
             },
         }
 
