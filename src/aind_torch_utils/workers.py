@@ -127,6 +127,16 @@ def shard_for_block_linear(linear_k: int, num_writers: int) -> int:
     return linear_k % num_writers
 
 
+def _configure_cuda_tf32(use_tf32: bool) -> None:
+    """
+    Configures CUDA float32 precision using the PyTorch 2.9 backend APIs.
+    """
+    precision = "tf32" if use_tf32 else "ieee"
+    torch.backends.fp32_precision = "ieee"
+    torch.backends.cuda.matmul.fp32_precision = precision
+    torch.backends.cudnn.fp32_precision = precision
+
+
 class PrepWorker:
     """
     Worker that reads data blocks, prepares patches, and puts them in a queue.
@@ -341,27 +351,27 @@ class GpuWorker:
         self.write_queues = write_queues
         self.num_writers = len(write_queues)
 
-        torch.backends.cuda.matmul.allow_tf32 = self.cfg.use_tf32
+        _configure_cuda_tf32(self.cfg.use_tf32)
         torch.backends.cudnn.benchmark = self.cfg.cudnn_benchmark
 
-        self.model.to(self.device)
-        self.model.eval()
+        with torch.cuda.device(self.device):
+            self.model.to(self.device)
+            self.model.eval()
 
-        self.copy_stream = torch.cuda.Stream(device=self.device)
+            self.copy_stream = torch.cuda.Stream(device=self.device)
 
-        if getattr(torch, "compile", None) and self.cfg.use_compile:
-            try:
-                # dynamic=True avoids recompiles when the final batch is smaller
-                self.model = torch.compile(
-                    self.model,
-                    mode=self.cfg.compile_mode,
-                    dynamic=self.cfg.compile_dynamic,
-                )
-                logger.info("Successfully compiled model.")
-            except TypeError:
-                # older PyTorch without `dynamic` kwarg
-                self.model = torch.compile(self.model, mode=self.cfg.compile_mode)
-                logger.info("Successfully compiled model (older pytorch).")
+            if getattr(torch, "compile", None) and self.cfg.use_compile:
+                try:
+                    # dynamic=True avoids recompiles when the final batch is smaller
+                    self.model = torch.compile(
+                        self.model,
+                        mode=self.cfg.compile_mode,
+                        dynamic=self.cfg.compile_dynamic,
+                    )
+                    logger.info("Successfully compiled model.")
+                except TypeError:
+                    self.model = torch.compile(self.model, mode=self.cfg.compile_mode)
+                    logger.info("Successfully compiled model.")
 
     def run(self, stop_event: threading.Event) -> None:
         """
@@ -381,9 +391,6 @@ class GpuWorker:
             else nullcontext()
         )
 
-        # Ensure the current device matches self.device for streams/events
-        torch.cuda.set_device(self.device)
-
         while not stop_event.is_set():
             try:
                 batch = self.prep_q.get(timeout=0.1)
@@ -392,38 +399,37 @@ class GpuWorker:
             if batch is None:
                 break
 
-            # Allocate device input per batch (simple path)
-            dev_in = torch.empty_like(
-                batch.host_in,
-                device=self.device,
-                memory_format=torch.contiguous_format,
-            )
-
-            # H2D
-            dev_in.copy_(batch.host_in, non_blocking=True)
-
-            # Inference
-            with torch.inference_mode():
-                with autocast_ctx:
-                    out = self.model(dev_in)
-                if out.dtype != batch.host_in.dtype:
-                    out = out.to(batch.host_in.dtype)
-
-            # D2H into pinned buffer (async on a dedicated stream)
-            host_out = torch.empty_like(batch.host_in, pin_memory=True)
-
-            # Ensure the copy stream waits for the default stream's compute to finish
-            cur = torch.cuda.current_stream(self.device)
-            self.copy_stream.wait_stream(cur)
-
-            # Create the event on the correct device
             with torch.cuda.device(self.device):
+                # Allocate device input per batch (simple path)
+                dev_in = torch.empty_like(
+                    batch.host_in,
+                    device=self.device,
+                    memory_format=torch.contiguous_format,
+                )
+
+                # H2D
+                dev_in.copy_(batch.host_in, non_blocking=True)
+
+                # Inference
+                with torch.inference_mode():
+                    with autocast_ctx:
+                        out = self.model(dev_in)
+                    if out.dtype != batch.host_in.dtype:
+                        out = out.to(batch.host_in.dtype)
+
+                # D2H into pinned buffer (async on a dedicated stream)
+                host_out = torch.empty_like(batch.host_in, pin_memory=True)
+
+                # Ensure the copy stream waits for the default stream's compute to finish
+                cur = torch.cuda.current_stream(self.device)
+                self.copy_stream.wait_stream(cur)
+
                 evt = torch.cuda.Event(blocking=False, enable_timing=False)
 
-            # Enqueue the async D2H copy and record an event on the copy stream
-            with torch.cuda.stream(self.copy_stream):
-                host_out.copy_(out, non_blocking=True)
-                evt.record()  # marks completion of the D2H on copy_stream
+                # Enqueue the async D2H copy and record an event on the copy stream
+                with torch.cuda.stream(self.copy_stream):
+                    host_out.copy_(out, non_blocking=True)
+                    evt.record()  # marks completion of the D2H on copy_stream
 
             preds = Preds(
                 block_idx=batch.block_idx,
