@@ -47,8 +47,9 @@ Options Overview
 - Input/Output: ``--in-spec``, ``--out-spec`` (TensorStore JSON specs)
 - Model: ``--model-type`` (registry key), ``--weights`` (optional path)
 - Geometry: ``--t``, ``--c``, ``--patch``, ``--overlap``, ``--block``, ``--batch``
-- Devices/Precision: ``--devices``, ``--no-amp``, ``--no-tf32``, ``--compile``,
-  ``--compile-mode``, ``--no-compile-dynamic``
+- Devices/Precision: ``--devices``, ``--no-amp``, ``--tf32``,
+  ``--cudnn-benchmark``, ``--compile``, ``--compile-mode``,
+  ``--no-compile-dynamic``
 - Queues: ``--max-inflight-batches``, ``--prep-workers``, ``--writer-workers``
 - Seam handling: ``--seam-mode {trim,blend}``, ``--trim-voxels``, ``--halo``,
   ``--min-blend-weight``
@@ -58,4 +59,3 @@ Options Overview
 
 See ``src/aind_torch_utils/run.py`` for authoritative CLI definitions and
 ``src/aind_torch_utils/config.py`` for detailed field descriptions.
-
