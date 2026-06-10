@@ -342,10 +342,8 @@ class GpuWorker:
         self.write_queues = write_queues
         self.num_writers = len(write_queues)
 
-        if self.cfg.use_tf32:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = self.cfg.use_tf32
+        torch.backends.cudnn.benchmark = self.cfg.cudnn_benchmark
 
         self.model.to(self.device)
         self.model.eval()

@@ -474,8 +474,11 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         default=["cuda:0"],
     )
     ap.add_argument("--no-amp", action="store_true")
+    ap.add_argument("--tf32", action="store_true", help="Enable TF32")
     ap.add_argument(
-        "--no-tf32", action="store_true", help="Disable TF32 (enabled by default)"
+        "--cudnn-benchmark",
+        action="store_true",
+        help="Enable cuDNN benchmarking",
     )
     ap.add_argument("--compile", action="store_true", help="Enable torch.compile")
     ap.add_argument(
@@ -612,7 +615,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         c_idx=args.c,
         devices=args.devices,
         amp=not args.no_amp,
-        use_tf32=not args.no_tf32,
+        use_tf32=args.tf32,
+        cudnn_benchmark=args.cudnn_benchmark,
         use_compile=args.compile,
         compile_mode=args.compile_mode,
         compile_dynamic=not args.no_compile_dynamic,
