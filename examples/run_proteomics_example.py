@@ -281,12 +281,17 @@ def _read_pyramid_spec_from_zarr(
 ) -> Optional[Tuple[Tuple[float, float, float], List[List[int]], int]]:
     """Read pyramid spec from the input volume's zarr.json.
 
-    Returns (voxel_size_zyx, scale_factors_per_level, n_extra_levels) or None
-    if the input has no multiscales metadata.
-
-    voxel_size_zyx      — physical ZYX voxel size at level 0 (micrometers)
-    scale_factors_per_level — [[sz,sy,sx], ...] for transitions 0→1, 1→2, ...
-    n_extra_levels      — number of pyramid levels beyond level 0
+    Parameters
+    ----------
+    in_spec_path : str
+        Path to the input TensorStore JSON spec file. The S3 URI in this spec is
+        used to locate the zarr group and read its multiscales metadata.
+    
+    Returns
+    -------
+    Optional[Tuple[Tuple[float, float, float], List[List[int]], int]]
+        Returns (voxel_size_zyx, scale_factors_per_level, n_extra_levels) or None
+        if the input has no multiscales metadata.
     """
     with open(in_spec_path) as fh:
         spec_dict = json.load(fh)
@@ -358,6 +363,25 @@ def _write_pyramid_ts(
 
     All levels are zarr v2, consistent with the inference output at level 0.
     OME-NGFF .zattrs is uploaded via boto3 at the group root.
+
+    Parameters
+    ----------
+    bucket : str
+        S3 bucket name for output.
+    zarr_s3_path : str
+        S3 key prefix for the zarr group, e.g. "predictions/sample_001/protein_a.zarr/". The function will write to "<prefix>/0/", "<prefix>/1/", etc.
+    vol_shape : tuple
+        Shape of the level-0 volume (T, C, Z, Y, X).
+    voxel_size_zyx : tuple
+        Voxel size in Z, Y, X order.
+    scale_factors_per_level : list of list
+        List of [sf_z, sf_y, sf_x] scale factors between consecutive levels.
+    n_lvls : int
+        Number of pyramid levels to generate (excluding level 0).
+    image_name : str, optional
+        Name of the image. Default is "prediction".
+    chunk_size : tuple, optional
+        Chunk size for the volume. Default is (128, 128, 128).
     """
     import asyncio
 
@@ -382,12 +406,12 @@ def _write_pyramid_ts(
     async def _build_levels():
         import asyncio as _aio
 
-        # store-to-store write() collects ALL chunk results before writing anything,
+        # write() collects all lazy chunk results before writing anything,
         # so memory grows to the full level size on TB-scale data regardless of
-        # cache_pool or s3_request_concurrency (confirmed: github.com/google/tensorstore/issues/213).
-        # Fix: acquire semaphore BEFORE each read() so TensorStore never sees more
+        # cache_pool or s3_request_concurrency (github.com/google/tensorstore/issues/213).
+        # Fix: acquire semaphore before each read() so TensorStore never sees more
         # than max_inflight chunks at once.
-        # Peak RAM = max_inflight x input_chunk_bytes (e.g. 8 × 64 MB = 512 MB for sf=2).
+        # Peak RAM = max_inflight x input_chunk_bytes (e.g. 8 x 64 MB = 512 MB for sf=2).
         max_inflight = 8
         sem = _aio.Semaphore(max_inflight)
         ctx = ts.Context({"data_copy_concurrency": {"limit": 4}})
@@ -594,29 +618,25 @@ def main(argv: Optional[List[str]] = None) -> None:
     vol_shape = (T, C, Z, Y, X)
     out_chunks = (1, 1) + patch  # one patch per zarr chunk
     out_stores = []
-    # for name in args.output_names:
-    #     s3_path = f"{args.out_prefix.rstrip('/')}/{name}.zarr/"
-    #     logger.info(f"Output store: s3://{args.out_bucket}/{s3_path}")
-    #     out_stores.append(
-    #         _open_or_create_s3_zarr(args.out_bucket, s3_path, vol_shape, out_chunks)
-    #     )
+    for name in args.output_names:
+        s3_path = f"{args.out_prefix.rstrip('/')}/{name}.zarr/"
+        logger.info(f"Output store: s3://{args.out_bucket}/{s3_path}")
+        out_stores.append(
+            _open_or_create_s3_zarr(args.out_bucket, s3_path, vol_shape, out_chunks)
+        )
 
-    # model = load_proteomics_model(
-    #     encoder_checkpoint=args.encoder_weights,
-    #     decoder_checkpoints=args.decoder_weights,
-    #     img_size=patch,
-    #     encoder_num_heads=args.encoder_num_heads,
-    #     feature_size=args.feature_size,
-    #     recover_layers=tuple(args.recover_layers),
-    #     apply_sigmoid=not args.no_sigmoid,
-    # )
+    model = load_proteomics_model(
+        encoder_checkpoint=args.encoder_weights,
+        decoder_checkpoints=args.decoder_weights,
+        img_size=patch,
+        encoder_num_heads=args.encoder_num_heads,
+        feature_size=args.feature_size,
+        recover_layers=tuple(args.recover_layers),
+        apply_sigmoid=not args.no_sigmoid,
+    )
 
     if norm_lower is not None and norm_upper is not None:
-        # Match training-time PercentileNormalizationd:
-        #   clip(x, p_low, p_high) → (x - p_low) / (p_high - p_low) → [0, 1]
-        # normalize="global" with clip_norm=True is mathematically identical.
-        # output_denormalize=False because the model outputs probabilities, not
-        # a rescaled version of the input.
+        # Match preprocessing during training
         norm_kwargs = dict(
             normalize="global",
             norm_lower=norm_lower,
@@ -643,15 +663,15 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     logger.info(f"Inference config:\n{cfg}")
 
-    # run(
-    #     model=model,
-    #     input_store=in_store,
-    #     output_store=out_stores,
-    #     cfg=cfg,
-    #     metrics_json=args.metrics_json,
-    #     num_prep_workers=args.prep_workers,
-    #     num_writer_workers=args.writer_workers,
-    # )
+    run(
+        model=model,
+        input_store=in_store,
+        output_store=out_stores,
+        cfg=cfg,
+        metrics_json=args.metrics_json,
+        num_prep_workers=args.prep_workers,
+        num_writer_workers=args.writer_workers,
+    )
     logger.info("Inference complete.")
     
     start_pyramid_time = time.time()
