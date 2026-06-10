@@ -52,8 +52,8 @@ from aind_proteomics_image_translator.models.protein_head import (
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.run import run
 from aind_torch_utils.utils import open_ts_spec
-from upscale_masks.omezarr_metadata import _get_pyramid_metadata, write_ome_ngff_metadata
-from upscale_masks.utils import load_json
+from example_utils.omezarr_metadata import _get_pyramid_metadata, write_ome_ngff_metadata
+from example_utils.utils import load_json
 import time
 
 
