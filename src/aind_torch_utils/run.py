@@ -467,14 +467,25 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     ap.add_argument(
         "--compile-mode",
         type=str,
-        default="reduce-overhead",
-        choices=["reduce-overhead", "max-autotune"],
+        default="default",
+        choices=[
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        ],
         help="torch.compile mode",
     )
     ap.add_argument(
-        "--no-compile-dynamic",
-        action="store_true",
-        help="Disable dynamic shape support for torch.compile",
+        "--compile-dynamic",
+        type=str,
+        default="auto",
+        choices=["auto", "true", "false"],
+        help=(
+            "torch.compile dynamic shapes: 'auto' compiles static and "
+            "promotes to dynamic if a shape changes; 'true' forces dynamic; "
+            "'false' recompiles per shape"
+        ),
     )
     ap.add_argument(
         "--max-inflight-batches",
@@ -602,7 +613,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         cudnn_benchmark=args.cudnn_benchmark,
         use_compile=args.compile,
         compile_mode=args.compile_mode,
-        compile_dynamic=not args.no_compile_dynamic,
+        compile_dynamic={"auto": None, "true": True, "false": False}[
+            args.compile_dynamic
+        ],
         max_inflight_batches=args.max_inflight_batches,
         seam_mode=args.seam_mode,
         trim_voxels=args.trim_voxels,

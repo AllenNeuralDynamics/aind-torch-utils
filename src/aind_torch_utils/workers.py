@@ -34,7 +34,9 @@ class Batch:
         List of (z, y, x) start coordinates for each patch in the batch,
         relative to the expanded block.
     host_in : torch.Tensor
-        The input tensor of patches, pinned to host memory.
+        The input tensor of patches, pinned to host memory. Always has
+        batch_size rows; rows beyond len(starts_in_block) are zero padding
+        so the model always sees a constant input shape.
     valid_sizes : List[Tuple[int, int, int]]
         List of (dz, dy, dx) valid dimensions for each patch, handling
         boundary conditions.
@@ -259,10 +261,14 @@ class PrepWorker:
             # batch over those starts
             for i in range(0, total_patches, self.cfg.batch_size):
                 batch_starts = starts[i : i + self.cfg.batch_size]
-                B = len(batch_starts)
                 pin_memory = any("cuda" in d for d in self.cfg.devices)
+                # Always allocate batch_size rows: the tail batch is
+                # zero-padded so input shapes stay constant. Writers ignore
+                # padded rows (they only index rows in starts_in_block), and
+                # constant shapes prevent torch.compile recompiles at
+                # runtime, which are not thread-safe across GPU workers.
                 host_in = torch.zeros(
-                    (B, 1, pz, py, px),
+                    (self.cfg.batch_size, 1, pz, py, px),
                     dtype=torch.float16 if self.cfg.amp else torch.float32,
                     pin_memory=pin_memory,
                 )
@@ -350,18 +356,48 @@ class GpuWorker:
         self.copy_stream = torch.cuda.Stream(device=self.device)
 
         if getattr(torch, "compile", None) and self.cfg.use_compile:
-            try:
-                # dynamic=True avoids recompiles when the final batch is smaller
-                self.model = torch.compile(
-                    self.model,
-                    mode=self.cfg.compile_mode,
-                    dynamic=self.cfg.compile_dynamic,
-                )
-                logger.info("Successfully compiled model.")
-            except TypeError:
-                # older PyTorch without `dynamic` kwarg
-                self.model = torch.compile(self.model, mode=self.cfg.compile_mode)
-                logger.info("Successfully compiled model (older pytorch).")
+            self._compile_model()
+
+    def _autocast_context(self):
+        return (
+            torch.autocast(device_type="cuda", dtype=torch.float16)
+            if self.cfg.amp
+            else nullcontext()
+        )
+
+    def _compile_model(self) -> None:
+        try:
+            # PrepWorker pads tail batches to batch_size, so input shapes are
+            # constant and no runtime recompiles are expected regardless of
+            # the `dynamic` setting.
+            self.model = torch.compile(
+                self.model,
+                mode=self.cfg.compile_mode,
+                dynamic=self.cfg.compile_dynamic,
+            )
+            logger.info("Compiled model on %s.", self.device)
+        except TypeError:
+            # older PyTorch without `dynamic` kwarg
+            self.model = torch.compile(self.model, mode=self.cfg.compile_mode)
+            logger.info("Compiled model on %s (older pytorch).", self.device)
+
+        self._warmup_compiled_model()
+
+    def _warmup_compiled_model(self) -> None:
+        torch.cuda.set_device(self.device)
+        dtype = torch.float16 if self.cfg.amp else torch.float32
+        shape = (self.cfg.batch_size, 1, *self.cfg.patch)
+        warmup_in = torch.zeros(shape, dtype=dtype, device=self.device)
+
+        logger.info(
+            "Warming compiled model on %s with shape %s.", self.device, shape
+        )
+        with torch.inference_mode():
+            with self._autocast_context():
+                warmup_out = self.model(warmup_in)
+        torch.cuda.synchronize(self.device)
+        del warmup_in, warmup_out
+        logger.info("Finished compiled model warmup on %s.", self.device)
 
     def run(self, stop_event: threading.Event) -> None:
         """
@@ -375,11 +411,7 @@ class GpuWorker:
         stop_event : threading.Event
             An event that signals the worker to stop.
         """
-        autocast_ctx = (
-            torch.autocast(device_type="cuda", dtype=torch.float16)
-            if self.cfg.amp
-            else nullcontext()
-        )
+        autocast_ctx = self._autocast_context()
 
         # Ensure the current device matches self.device for streams/events
         torch.cuda.set_device(self.device)
