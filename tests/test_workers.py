@@ -8,7 +8,7 @@ import tensorstore as ts
 import torch
 
 from aind_torch_utils.config import InferenceConfig
-from aind_torch_utils.workers import Preds, PrepWorker, WriterWorker
+from aind_torch_utils.workers import GpuWorker, Preds, PrepWorker, WriterWorker
 
 
 def _make_input_store(shape):
@@ -94,3 +94,57 @@ def test_writer_raises_on_mismatched_output_channels_and_writers():
 
     with pytest.raises(ValueError, match="Mismatch between model output channels"):
         worker.run(stop_event=threading.Event())
+
+
+def _make_compile_worker():
+    """Build a GpuWorker shell without running __init__ (which needs CUDA),
+    wired with just the attributes _compile_model touches."""
+    worker = object.__new__(GpuWorker)
+    worker.cfg = InferenceConfig(devices=["cpu"], use_compile=True)
+    worker.device = torch.device("cpu")
+    worker.model = torch.nn.Identity()
+    return worker
+
+
+def test_compile_model_falls_back_to_eager_when_compile_call_raises(monkeypatch):
+    worker = _make_compile_worker()
+    eager = worker.model
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("backend unavailable")
+
+    monkeypatch.setattr(torch, "compile", boom)
+
+    worker._compile_model()
+
+    assert worker.model is eager
+
+
+def test_compile_model_falls_back_to_eager_when_warmup_raises(monkeypatch):
+    """The real failure mode: torch.compile returns lazily, then tracing
+    blows up on the first forward inside warmup."""
+    worker = _make_compile_worker()
+    eager = worker.model
+
+    monkeypatch.setattr(torch, "compile", lambda model, **kwargs: torch.nn.Identity())
+
+    def warmup_boom(self):
+        raise RuntimeError("Guard failed on the same frame it was created")
+
+    monkeypatch.setattr(GpuWorker, "_warmup_compiled_model", warmup_boom)
+
+    worker._compile_model()
+
+    assert worker.model is eager
+
+
+def test_compile_model_keeps_compiled_module_on_success(monkeypatch):
+    worker = _make_compile_worker()
+    compiled = torch.nn.Identity()
+
+    monkeypatch.setattr(torch, "compile", lambda model, **kwargs: compiled)
+    monkeypatch.setattr(GpuWorker, "_warmup_compiled_model", lambda self: None)
+
+    worker._compile_model()
+
+    assert worker.model is compiled

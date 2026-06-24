@@ -367,22 +367,42 @@ class GpuWorker:
         )
 
     def _compile_model(self) -> None:
+        # Keep a handle to the original module so we can fall back to eager
+        # execution if compilation fails. torch.compile returns a new wrapper
+        # and does not mutate the original, so this reference stays valid.
+        eager_model = self.model
         try:
-            # PrepWorker pads tail batches to batch_size, so input shapes are
-            # constant and no runtime recompiles are expected regardless of
-            # the `dynamic` setting.
-            self.model = torch.compile(
-                self.model,
-                mode=self.cfg.compile_mode,
-                dynamic=self.cfg.compile_dynamic,
-            )
-            logger.info("Compiled model on %s.", self.device)
-        except TypeError:
-            # older PyTorch without `dynamic` kwarg
-            self.model = torch.compile(self.model, mode=self.cfg.compile_mode)
-            logger.info("Compiled model on %s (older pytorch).", self.device)
+            try:
+                # PrepWorker pads tail batches to batch_size, so input shapes
+                # are constant and no runtime recompiles are expected
+                # regardless of the `dynamic` setting.
+                self.model = torch.compile(
+                    self.model,
+                    mode=self.cfg.compile_mode,
+                    dynamic=self.cfg.compile_dynamic,
+                )
+                logger.info("Compiled model on %s.", self.device)
+            except TypeError:
+                # older PyTorch without `dynamic` kwarg
+                self.model = torch.compile(self.model, mode=self.cfg.compile_mode)
+                logger.info("Compiled model on %s (older pytorch).", self.device)
 
-        self._warmup_compiled_model()
+            # Compilation is lazy: the graph is traced on the first forward,
+            # so tracing/guard errors surface here in warmup, not above.
+            self._warmup_compiled_model()
+        except Exception as exc:
+            # Some models do host-side numpy/Python work in forward that
+            # dynamo cannot trace. Fall back to eager so the run proceeds
+            # instead of aborting. Warmup runs on the main thread, so this
+            # also keeps the failure off the worker threads.
+            logger.warning(
+                "torch.compile failed on %s (%s); falling back to eager "
+                "execution.",
+                self.device,
+                type(exc).__name__,
+                exc_info=True,
+            )
+            self.model = eager_model
 
     def _warmup_compiled_model(self) -> None:
         torch.cuda.set_device(self.device)
