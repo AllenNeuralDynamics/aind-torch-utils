@@ -558,10 +558,22 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     if args.devices:
         devices = args.devices
+        invalid = [d for d in devices if not str(d).startswith("cuda:")]
+        if invalid:
+            raise ValueError(
+                "This proteomics pipeline requires CUDA devices. "
+                f"Invalid device(s): {invalid}. "
+                "Provide only CUDA devices, e.g. --devices cuda:0 cuda:1."
+            )
     else:
         n = torch.cuda.device_count()
-        devices = [f"cuda:{i}" for i in range(n)] if n > 0 else ["cpu"]
-        logger.info(f"Auto-detected {len(devices)} device(s): {devices}")
+        if n <= 0 or not torch.cuda.is_available():
+            raise RuntimeError(
+                "No CUDA devices detected. This proteomics pipeline is GPU-only "
+                "(GpuWorker uses CUDA streams/events) and cannot run on CPU."
+            )
+        devices = [f"cuda:{i}" for i in range(n)]
+        logger.info(f"Auto-detected {len(devices)} CUDA device(s): {devices}")
 
     if len(args.decoder_weights) != len(args.output_names):
         raise ValueError(
