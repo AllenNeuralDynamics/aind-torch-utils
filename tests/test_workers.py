@@ -27,11 +27,8 @@ def _make_input_store(shape):
     return store
 
 
-def test_prep_worker_pads_tail_batch_to_constant_shape():
-    """Every batch must have exactly batch_size rows so compiled models
-    never see a varying input shape; padded rows must be zero."""
-    store = _make_input_store((1, 1, 32, 32, 32))
-    cfg = InferenceConfig(
+def _prep_cfg(use_compile):
+    return InferenceConfig(
         patch=(16, 16, 16),
         overlap=4,
         trim_voxels=2,
@@ -41,14 +38,27 @@ def test_prep_worker_pads_tail_batch_to_constant_shape():
         devices=["cpu"],
         amp=False,
         normalize=False,
+        use_compile=use_compile,
     )
-    prep_q = queue.Queue()
-    worker = PrepWorker(cfg, store, prep_q, cfg.patch)
-    worker.run(threading.Event())
 
+
+def _drain(prep_q):
     batches = []
     while not prep_q.empty():
         batches.append(prep_q.get_nowait())
+    return batches
+
+
+def test_prep_worker_pads_tail_batch_to_constant_shape_when_compiling():
+    """With torch.compile, every batch must have exactly batch_size rows so
+    the compiled model never sees a varying input shape; padded rows must be
+    zero."""
+    store = _make_input_store((1, 1, 32, 32, 32))
+    cfg = _prep_cfg(use_compile=True)
+    prep_q = queue.Queue()
+    PrepWorker(cfg, store, prep_q, cfg.patch).run(threading.Event())
+
+    batches = _drain(prep_q)
     assert batches
 
     saw_partial = False
@@ -66,6 +76,28 @@ def test_prep_worker_pads_tail_batch_to_constant_shape():
 
     # 32^3 block, patch 16, overlap 4 -> 3 starts per axis -> 27 patches
     assert total_real == batches[0].total_patches_in_block == 27
+    assert saw_partial, "geometry should produce a partial tail batch"
+
+
+def test_prep_worker_does_not_pad_in_eager_mode():
+    """Without torch.compile there is no constant-shape requirement, so the
+    tail batch keeps its true row count instead of wasting compute and copy
+    bandwidth on zero padding (matching the pre-compile behavior)."""
+    store = _make_input_store((1, 1, 32, 32, 32))
+    cfg = _prep_cfg(use_compile=False)
+    prep_q = queue.Queue()
+    PrepWorker(cfg, store, prep_q, cfg.patch).run(threading.Event())
+
+    batches = _drain(prep_q)
+    assert batches
+
+    saw_partial = False
+    for b in batches:
+        n_real = len(b.starts_in_block)
+        # No padding: the allocation matches the real number of patches.
+        assert b.host_in.shape == (n_real, 1, *cfg.patch)
+        if n_real < cfg.batch_size:
+            saw_partial = True
     assert saw_partial, "geometry should produce a partial tail batch"
 
 

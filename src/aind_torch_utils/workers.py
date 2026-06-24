@@ -34,9 +34,11 @@ class Batch:
         List of (z, y, x) start coordinates for each patch in the batch,
         relative to the expanded block.
     host_in : torch.Tensor
-        The input tensor of patches, pinned to host memory. Always has
-        batch_size rows; rows beyond len(starts_in_block) are zero padding
-        so the model always sees a constant input shape.
+        The input tensor of patches, pinned to host memory. When compiling
+        (cfg.use_compile), tail batches are zero-padded up to batch_size so
+        the model sees a constant input shape, and rows beyond
+        len(starts_in_block) are padding. In eager mode it has exactly
+        len(starts_in_block) rows.
     valid_sizes : List[Tuple[int, int, int]]
         List of (dz, dy, dx) valid dimensions for each patch, handling
         boundary conditions.
@@ -262,14 +264,18 @@ class PrepWorker:
             # batch over those starts
             for i in range(0, total_patches, self.cfg.batch_size):
                 batch_starts = starts[i : i + self.cfg.batch_size]
+                n_real = len(batch_starts)
                 pin_memory = any("cuda" in d for d in self.cfg.devices)
-                # Always allocate batch_size rows: the tail batch is
-                # zero-padded so input shapes stay constant. Writers ignore
-                # padded rows (they only index rows in starts_in_block), and
-                # constant shapes prevent torch.compile recompiles at
-                # runtime, which are not thread-safe across GPU workers.
+                # When compiling, pad the tail batch up to batch_size so the
+                # model always sees a constant input shape; this prevents
+                # torch.compile from recompiling at runtime (not thread-safe
+                # across GPU workers). Writers ignore padded rows since they
+                # only index rows in starts_in_block. In eager mode there is
+                # no shape constraint, so allocate exactly n_real rows and
+                # avoid wasting compute and copy bandwidth on padding.
+                n_rows = self.cfg.batch_size if self.cfg.use_compile else n_real
                 host_in = torch.zeros(
-                    (self.cfg.batch_size, 1, pz, py, px),
+                    (n_rows, 1, pz, py, px),
                     dtype=torch.float16 if self.cfg.amp else torch.float32,
                     pin_memory=pin_memory,
                 )
