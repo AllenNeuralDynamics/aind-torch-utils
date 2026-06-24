@@ -548,6 +548,19 @@ class WriterWorker:
                 # legacy single-output (B, pz, py, px) — add channel dim
                 out_np = out_np[:, np.newaxis]
 
+            if out_np.ndim != 5:
+                raise ValueError(
+                    "Expected model output with shape (B, N, Z, Y, X) "
+                    f"(or legacy (B, Z, Y, X)); got shape {out_np.shape}"
+                )
+
+            if out_np.shape[1] != len(self.writers):
+                raise ValueError(
+                    "Mismatch between model output channels and output stores: "
+                    f"got N={out_np.shape[1]} channels but {len(self.writers)} "
+                    f"writer(s) for block {preds.block_idx}."
+                )
+
             for bi, (sz, sy, sx) in enumerate(preds.starts_in_block):
                 dz, dy, dx = preds.valid_sizes[bi]
                 for n, acc in enumerate(accs):
