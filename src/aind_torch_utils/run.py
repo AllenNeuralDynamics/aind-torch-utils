@@ -565,6 +565,14 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         ),
     )
     ap.add_argument(
+        "--no-output-denormalize",
+        action="store_true",
+        help=(
+            "Disable inverse normalization before writing outputs. "
+            "Use for probability/segmentation models whose outputs are not in input intensity space."
+        ),
+    )
+    ap.add_argument(
         "--metrics-json",
         type=str,
         default="metrics.json",
@@ -634,6 +642,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             if args.clip_norm is None
             else (True if len(args.clip_norm) == 0 else tuple(args.clip_norm))
         ),
+        output_denormalize=not args.no_output_denormalize,
     )
     logger.info(f"Inference config:\n{cfg}")
 
