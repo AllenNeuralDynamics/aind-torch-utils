@@ -76,6 +76,17 @@ class InferenceConfig(BaseModel):
         default=0.05, description="Minimum blend weight"
     )  # floor to avoid near-zero weights
 
+    # Output
+    output_denormalize: bool = Field(
+        default=True,
+        description=(
+            "Apply inverse normalization to model outputs before writing. "
+            "Set False for models that output values in a different space than "
+            "the input (e.g. probability maps from a segmentation model), so "
+            "the writer stores outputs as-is without rescaling."
+        ),
+    )
+
     # Misc
     eps: float = Field(default=1e-6, description="Epsilon for division")
     norm_lower: float = Field(
