@@ -3,7 +3,7 @@ Large-scale proteomics inference with a shared MAE encoder and N decoder heads.
 
 Architecture
 ------------
-ProteinSharedModel holds one MAE3DEncoderRope (frozen) and N DecoderPath heads.
+SharedEncoderModel holds one MAE3DEncoderRope (frozen) and N DecoderPath heads.
 The encoder runs once per forward pass; all heads receive the same latent and
 skip features. Outputs are N probability maps [0,1], one per protein marker.
 
@@ -42,7 +42,6 @@ from urllib.parse import urlparse
 import numpy as np
 import tensorstore as ts
 import torch
-import torch.nn as nn
 
 import boto3
 from aind_proteomics_image_translator.models.protein_head import (
@@ -50,6 +49,7 @@ from aind_proteomics_image_translator.models.protein_head import (
     ProteinPredictionModel,
 )
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.models import SharedEncoderModel
 from aind_torch_utils.run import run
 from aind_torch_utils.utils import open_ts_spec
 from example_utils.omezarr_metadata import _get_pyramid_metadata, write_ome_ngff_metadata
@@ -90,61 +90,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class ProteinSharedModel(nn.Module):
-    """MAE3DEncoderRope (frozen) shared across N independent DecoderPath heads.
-
-    Parameters
-    ----------
-    encoder : MAE3DEncoderRope
-        Frozen pretrained encoder.
-    decoders : list of DecoderPath
-        N independently trained decoder heads, one per protein marker.
-    recover_layers : tuple of int
-        Two encoder layer indices for skip connections, e.g. (2, 5).
-        Shallow index first, deep index second.
-    apply_sigmoid : bool
-        If True, apply sigmoid (clamped to [0.01, 0.99]) to all outputs.
-    """
-
-    def __init__(
-        self,
-        encoder: nn.Module,
-        decoders: List[DecoderPath],
-        recover_layers: Tuple[int, int] = (2, 5),
-        apply_sigmoid: bool = True,
-    ):
-        super().__init__()
-        self.encoder = encoder
-        self.decoders = nn.ModuleList(decoders)
-        self.recover_layers = recover_layers
-        self.apply_sigmoid = apply_sigmoid
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run encoder once, fan out to all decoder heads.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input patch batch of shape (B, 1, Z, Y, X).
-
-        Returns
-        -------
-        torch.Tensor
-            Shape (B, N, Z, Y, X) where N = len(decoders).
-        """
-        latent, _, _, _, feature_maps, _ = self.encoder(
-            x=x, mask_ratio=0.0, recover_layers=self.recover_layers
-        )
-        outputs = [
-            dec(x=x, latent=latent, hidden_states_out=feature_maps)
-            for dec in self.decoders
-        ]
-        out = torch.stack(outputs, dim=1).squeeze(2)  # (B, N, Z, Y, X)
-        if self.apply_sigmoid:
-            out = torch.clamp(torch.sigmoid(out), min=0.01, max=0.99)
-        return out
-
-
 def _strip_decoder_prefix(state_dict: dict) -> dict:
     """Normalize a decoder checkpoint to bare DecoderPath keys.
 
@@ -178,8 +123,8 @@ def load_proteomics_model(
     feature_size: int = 10,
     recover_layers: Tuple[int, int] = (2, 5),
     apply_sigmoid: bool = True,
-) -> ProteinSharedModel:
-    """Load a ProteinSharedModel from checkpoint files.
+) -> SharedEncoderModel:
+    """Load a SharedEncoderModel from checkpoint files.
 
     Uses ProteinPredictionModel to load and configure the encoder (handles
     both .pth raw state dicts and .ckpt Lightning checkpoints, and infers
@@ -207,7 +152,7 @@ def load_proteomics_model(
 
     Returns
     -------
-    ProteinSharedModel
+    SharedEncoderModel
         In eval mode, encoder frozen, ready for run().
     """
     logger.info(f"Loading MAE encoder from: {encoder_checkpoint}")
@@ -246,7 +191,7 @@ def load_proteomics_model(
             logger.warning(f"Decoder {i}: {len(unexpected)} unexpected keys ignored.")
         decoders.append(dec)
 
-    model = ProteinSharedModel(
+    model = SharedEncoderModel(
         encoder=encoder,
         decoders=decoders,
         recover_layers=recover_layers,
