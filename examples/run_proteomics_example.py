@@ -626,8 +626,18 @@ def main(argv: Optional[List[str]] = None) -> None:
     T, C, Z, Y, X = tuple(in_store.domain.shape)
     logger.info(f"Volume shape: T={T} C={C} Z={Z} Y={Y} X={X}")
 
+    # This script writes compact outputs with a single (t, c) plane only.
+    # Current pipeline uses the same cfg.t_idx/c_idx for both read and write,
+    # so compact output requires writing at index (0, 0).
+    if args.t != 0 or args.c != 0:
+        raise ValueError(
+            "This example writes compact output stores with shape (1,1,Z,Y,X), "
+            "so --t and --c must both be 0. "
+            f"Got --t {args.t}, --c {args.c}."
+        )
+
     patch = tuple(args.patch)
-    vol_shape = (T, C, Z, Y, X)
+    vol_shape = (1, 1, Z, Y, X)
     out_chunks = (1, 1) + patch  # one patch per zarr chunk
     out_stores = []
     for name in args.output_names:
