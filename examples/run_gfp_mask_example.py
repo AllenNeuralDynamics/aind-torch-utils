@@ -39,6 +39,21 @@ default pointing at::
 
 (level 5). Mask parameters can be customized via ``--params-json`` (see
 ``GfpMaskModel.from_json``); omit it to use defaults.
+
+Performance
+-----------
+The gfp-mask "model" is a classical cupy/cuCIM routine, not a deep net. Its
+labeling/morphology steps stall the GPU on host syncs, so GPU *utilization* reads low
+even when the GPU stage is the bottleneck — judge by wall-clock and the bottleneck
+verdict logged from ``--metrics-json``, not by ``nvidia-smi`` utilization.
+
+Tips:
+- Don't over-enlarge ``--patch``: huge patches take longer for the prep workers to
+  build and leave fewer in flight, which *starves* the GPU between patches and lowers
+  throughput. Keep patch moderate (e.g. 64-128 per axis).
+- Biggest win: run several GPU workers per device to overlap one worker's host-sync
+  stalls with another's compute, via ``--workers-per-device 3`` (try this first). Costs
+  ~N x GPU memory.
 """
 
 import argparse
@@ -318,8 +333,8 @@ def _bottleneck_verdict(prep_fill: Optional[float], write_fill: Optional[float])
         return "Writer/S3-write-bound (output writes back-pressure the pipeline)."
     if prep_fill > 0.75:
         return (
-            "GPU/function-bound -> the masking function is the limiter "
-            "(per-item loop + host syncs)."
+            "GPU/function-bound -> the masking function is the limiter (host syncs). "
+            "Run more GPU workers per device, e.g. --workers-per-device 3."
         )
     return "Balanced / no single saturated stage."
 
@@ -400,6 +415,16 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     )
     ap.add_argument("--aws-region", default="us-west-2")
     ap.add_argument("--devices", nargs="+", default=["cuda:0"])
+    ap.add_argument(
+        "--workers-per-device",
+        type=int,
+        default=1,
+        help=(
+            "GPU workers per device. >1 overlaps the masking function's host-sync "
+            "stalls with other workers' compute (raises throughput on this sync-bound "
+            "model). Costs ~N x GPU memory."
+        ),
+    )
     ap.add_argument("--patch", type=int, nargs=3, default=(64, 64, 64))
     ap.add_argument("--block", type=int, nargs=3, default=(256, 256, 256))
     ap.add_argument("--overlap", type=int, default=10)
@@ -411,6 +436,12 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     )
     ap.add_argument("--prep-workers", type=int, default=2)
     ap.add_argument("--writer-workers", type=int, default=2)
+    ap.add_argument(
+        "--max-inflight-batches",
+        type=int,
+        default=64,
+        help="Max batches queued between stages (queue depth).",
+    )
     ap.add_argument(
         "--metrics-json",
         default="gfp_mask_metrics.json",
@@ -491,12 +522,17 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     # --- Model + config ---
     model = load_model("gfp-mask", args.params_json)
+    # One GpuWorker is created per device entry, so repeating each device runs
+    # multiple workers on it (hides the masking function's host-sync stalls).
+    devices = args.devices * max(1, args.workers_per_device)
+    logger.info("GPU workers: %s", devices)
     cfg = InferenceConfig(
         patch=patch,
         block=block,
         overlap=args.overlap,
         batch_size=args.batch,
-        devices=args.devices,
+        devices=devices,
+        max_inflight_batches=args.max_inflight_batches,
         amp=False,  # no torch math in the model; avoid a pointless float16 copy
         use_compile=False,  # torch.compile cannot trace the cupy/cuCIM region
         normalize="percentile",  # feed ~[0,1]; matches intensity_percentiles=(0,1)

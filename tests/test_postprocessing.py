@@ -73,6 +73,24 @@ def test_gfp_mask_model_batched():
     assert torch.equal(out[0], out[1]) and torch.equal(out[1], out[2])
 
 
+def test_forward_matches_per_volume_function():
+    # Distinct volumes per batch item (shifted blobs) so batching can't hide a bug.
+    vols = [_synthetic_volume((24, 48, 48)) for _ in range(3)]
+    for i, v in enumerate(vols):
+        vols[i] = cp.roll(v, shift=i * 3, axis=0)
+    x = torch.stack([torch.as_tensor(v, device="cuda") for v in vols])[:, None]
+
+    model = GfpMaskModel(intensity_percentiles=(0.0, 1.0))
+    batched = model(x)
+
+    # Batched forward must equal stacking the single-volume function per volume.
+    for b in range(len(vols)):
+        ref = create_gfp_mask_gpu(vols[b], intensity_percentiles=(0.0, 1.0))
+        assert torch.equal(
+            batched[b, 0].cpu(), torch.as_tensor(ref, device="cuda").cpu()
+        )
+
+
 def test_gfp_mask_model_from_json(tmp_path):
     params = {
         "intensity_percentiles": [0.0, 1.0],
