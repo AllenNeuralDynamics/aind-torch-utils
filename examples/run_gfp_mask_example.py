@@ -46,6 +46,7 @@ import asyncio
 import json
 import logging
 import re
+import statistics
 import sys
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse
@@ -288,6 +289,79 @@ def _write_output_zattrs(
     logger.info("Wrote OME-NGFF metadata to s3://%s/%s", bucket, key)
 
 
+def _bottleneck_verdict(prep_fill: Optional[float], write_fill: Optional[float]) -> str:
+    """Map queue fill ratios to a heuristic bottleneck verdict."""
+    if prep_fill is None:
+        return "No queue samples collected; cannot diagnose."
+    if prep_fill < 0.25:
+        return (
+            "GPU starved -> prep/S3-bound. Try more --prep-workers, larger "
+            "--block/--batch, or faster input reads."
+        )
+    if write_fill is not None and write_fill > 0.75:
+        return "Writer/S3-write-bound (output writes back-pressure the pipeline)."
+    if prep_fill > 0.75:
+        return (
+            "GPU/function-bound -> the masking function is the limiter "
+            "(per-item loop + host syncs)."
+        )
+    return "Balanced / no single saturated stage."
+
+
+def _summarize_metrics(path: str) -> None:
+    """Read the pipeline metrics JSON and log a bottleneck verdict.
+
+    Uses queue occupancy (a near-empty prep queue means the GPU is starved by
+    prep/S3; a near-full prep or write queue points at the GPU/function or the
+    writer). Thresholds are approximate guidance, not hard rules.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            metrics = json.load(f)
+    except (OSError, ValueError) as exc:
+        logger.warning("Could not read metrics from %s: %s", path, exc)
+        return
+
+    queues = metrics.get("queue_monitor", {}).get("queues", {})
+
+    def _fill(name_prefix: str) -> Optional[float]:
+        ratios = []
+        for name, q in queues.items():
+            if not name.startswith(name_prefix):
+                continue
+            max_size = q.get("max_size") or 0
+            sizes = [
+                s["size"] for s in q.get("samples", []) if s.get("size") is not None
+            ]
+            if max_size > 0 and sizes:
+                ratios.append(statistics.mean(sizes) / max_size)
+        return statistics.mean(ratios) if ratios else None
+
+    def _mean(values) -> Optional[float]:
+        return statistics.mean(values) if values else None
+
+    prep_fill = _fill("prep")
+    write_fill = _fill("write")
+    sysm = metrics.get("system_monitor", {})
+    cpu_mean = _mean(sysm.get("cpu_percent") or [])
+    recv_mean = _mean((sysm.get("net_io_mbytes_sec", {}) or {}).get("recv") or [])
+
+    def _r(value, ndigits):
+        return None if value is None else round(value, ndigits)
+
+    logger.info(
+        "Metrics: prep_fill=%s write_fill=%s cpu%%=%s net_recv_MBps=%s",
+        _r(prep_fill, 2),
+        _r(write_fill, 2),
+        _r(cpu_mean, 1),
+        _r(recv_mean, 1),
+    )
+    logger.info(
+        "Bottleneck verdict (heuristic): %s",
+        _bottleneck_verdict(prep_fill, write_fill),
+    )
+
+
 def _parse_args(argv: List[str]) -> argparse.Namespace:
     """Parse command-line arguments."""
     ap = argparse.ArgumentParser(
@@ -321,6 +395,12 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     )
     ap.add_argument("--prep-workers", type=int, default=2)
     ap.add_argument("--writer-workers", type=int, default=2)
+    ap.add_argument(
+        "--metrics-json",
+        default="gfp_mask_metrics.json",
+        help="Where to write pipeline queue/system metrics for bottleneck analysis.",
+    )
+    ap.add_argument("--metrics-interval", type=float, default=0.5)
     ap.add_argument(
         "--no-pyramid",
         action="store_true",
@@ -414,9 +494,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         input_store,
         output_store,
         cfg,
+        metrics_json=args.metrics_json,
+        metrics_interval=args.metrics_interval,
         num_prep_workers=max(1, args.prep_workers),
         num_writer_workers=max(1, args.writer_workers),
     )
+    _summarize_metrics(args.metrics_json)
 
     if args.no_pyramid:
         logger.info(
