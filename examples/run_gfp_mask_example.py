@@ -305,8 +305,20 @@ def _write_output_group_metadata(
 
     ms = dict(source_ms)
     ms["datasets"] = datasets_from_l
+    # OME-NGFF readers (neuroglancer) require multiscales[].version to parse the
+    # metadata; some source zarrs omit it (they carry "type"/"metadata" instead), so
+    # ensure it is present.
+    ms["version"] = ms.get("version") or "0.4"
+    # We downsample the mask with "max", not the source's reducer.
+    ms["type"] = DOWNSAMPLE_METHOD
+
     zattrs = {"multiscales": [ms]}
     if omero is not None:
+        # Source omero describes intensities (e.g. window 0-65535), which makes a
+        # binary {0,1} mask invisible; rescale the render window to the mask range.
+        omero = json.loads(json.dumps(omero))  # deep copy before mutating
+        for ch in omero.get("channels", []):
+            ch["window"] = {"min": 0.0, "max": 1.0, "start": 0.0, "end": 1.0}
         zattrs["omero"] = omero
     s3.put_object(
         Bucket=bucket,
