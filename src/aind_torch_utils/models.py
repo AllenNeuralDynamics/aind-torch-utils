@@ -129,9 +129,9 @@ def load_unet(weights_path: Optional[str] = None) -> nn.Module:
 def load_gfp_mask(weights_path: Optional[str] = None) -> nn.Module:
     """Load the GPU GFP-masking model.
 
-    The import is done inside the function so the GPU stack (``cupy`` + ``cucim``)
-    is only required when this model is actually selected, keeping the package
-    importable on hosts without a GPU. The model has no learnable weights, so
+    The import is done inside the function so the GPU stack (``cupy``) is only
+    required when this model is actually selected, keeping the package importable
+    on hosts without a GPU. The model has no learnable weights, so
     ``weights_path`` is instead treated as a path to a JSON file of masking
     parameters (see :meth:`GfpMaskModel.from_json`); if omitted, defaults are used.
     """
@@ -139,4 +139,4 @@ def load_gfp_mask(weights_path: Optional[str] = None) -> nn.Module:
 
     if weights_path:
         return GfpMaskModel.from_json(weights_path)
-    return GfpMaskModel(intensity_percentiles=(0.0, 1.0))
+    return GfpMaskModel()

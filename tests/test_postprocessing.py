@@ -1,6 +1,6 @@
 """Tests for the GPU GFP-masking post-processing model.
 
-These require a CUDA GPU with cupy + cuCIM installed and are skipped otherwise
+These require a CUDA GPU with cupy installed and are skipped otherwise
 (e.g. on CPU-only CI or macOS dev machines).
 """
 import json
@@ -8,7 +8,6 @@ import json
 import pytest
 
 cp = pytest.importorskip("cupy")
-pytest.importorskip("cucim")
 
 import torch  # noqa: E402
 
@@ -23,7 +22,7 @@ if not torch.cuda.is_available():
 
 
 def _synthetic_volume(shape=(32, 64, 64)):
-    """Build a noisy background with a couple of bright blobs."""
+    """Build a background with a couple of bright blobs (values in [0, 1])."""
     zz, yy, xx = cp.meshgrid(
         cp.arange(shape[0]),
         cp.arange(shape[1]),
@@ -40,22 +39,30 @@ def _synthetic_volume(shape=(32, 64, 64)):
 
 def test_create_gfp_mask_gpu_basic():
     vol = _synthetic_volume()
-    mask = create_gfp_mask_gpu(vol, intensity_percentiles=(0.0, 1.0))
+    mask = create_gfp_mask_gpu(vol, threshold=0.1)
 
     assert mask.dtype == cp.uint8
     assert mask.shape == vol.shape
     assert int(cp.unique(mask).max()) <= 1
     # Blob centers should be masked; far corner background should be empty.
     assert int(mask[8, 16, 16]) == 1
+    assert int(mask[0, 0, 0]) == 0
     assert float(mask.mean()) < 0.5  # mostly background
+
+
+def test_threshold_monotonicity():
+    # A lower threshold oversegments more (mask grows).
+    vol = _synthetic_volume()
+    low = create_gfp_mask_gpu(vol, threshold=0.05)
+    high = create_gfp_mask_gpu(vol, threshold=0.5)
+    assert int(low.sum()) >= int(high.sum())
 
 
 def test_gfp_mask_model_roundtrip():
     vol = _synthetic_volume()
     x = torch.as_tensor(vol, device="cuda")[None, None]  # (1, 1, Z, Y, X)
 
-    model = GfpMaskModel(intensity_percentiles=(0.0, 1.0))
-    out = model(x)
+    out = GfpMaskModel(threshold=0.1)(x)
 
     assert out.shape == x.shape
     assert out.dtype == torch.uint8
@@ -67,7 +74,7 @@ def test_gfp_mask_model_batched():
     vol = _synthetic_volume()
     x = torch.as_tensor(vol, device="cuda")[None, None].repeat(3, 1, 1, 1, 1)
 
-    out = GfpMaskModel(intensity_percentiles=(0.0, 1.0))(x)
+    out = GfpMaskModel(threshold=0.1)(x)
 
     assert out.shape == x.shape
     # All batch items are identical inputs -> identical masks.
@@ -81,12 +88,12 @@ def test_forward_matches_per_volume_function():
         vols[i] = cp.roll(v, shift=i * 3, axis=0)
     x = torch.stack([torch.as_tensor(v, device="cuda") for v in vols])[:, None]
 
-    model = GfpMaskModel(intensity_percentiles=(0.0, 1.0))
+    model = GfpMaskModel(threshold=0.1)
     batched = model(x)
 
     # Batched forward must equal stacking the single-volume function per volume.
     for b in range(len(vols)):
-        ref = create_gfp_mask_gpu(vols[b], intensity_percentiles=(0.0, 1.0))
+        ref = create_gfp_mask_gpu(vols[b], threshold=0.1)
         assert torch.equal(
             batched[b, 0].cpu(), torch.as_tensor(ref, device="cuda").cpu()
         )
@@ -94,11 +101,8 @@ def test_forward_matches_per_volume_function():
 
 def test_gfp_mask_model_from_json(tmp_path):
     params = {
-        "intensity_percentiles": [0.0, 1.0],
-        "background_sigma": [2, 8, 8],
-        "low_thresh": 0.1,
-        "high_thresh": 0.3,
-        "min_object_size": 50,
+        "threshold": 0.2,
+        "smooth_sigma": [0.5, 2, 2],
         # Pipeline-normalization keys live in the same file and must be ignored here.
         "normalize": "global",
         "norm_lower": 90.0,
@@ -109,14 +113,8 @@ def test_gfp_mask_model_from_json(tmp_path):
 
     model = GfpMaskModel.from_json(str(path))
 
-    # Sequence params parsed as tuples; scalars applied; missing keys defaulted.
-    assert model.intensity_percentiles == (0.0, 1.0)
-    assert model.background_sigma == (2, 8, 8)
-    assert model.low_thresh == 0.1
-    assert model.high_thresh == 0.3
-    assert model.min_object_size == 50
-    assert model.hole_size == 64  # default
-    assert model.min_intensity is None  # default
+    assert model.threshold == 0.2
+    assert model.smooth_sigma == (0.5, 2, 2)  # parsed to tuple
 
 
 def test_gfp_mask_model_from_json_rejects_unknown_key(tmp_path):
@@ -132,7 +130,7 @@ def test_read_pipeline_params(tmp_path):
     path.write_text(
         json.dumps(
             {
-                "low_thresh": 0.1,  # mask-model key -> not returned
+                "threshold": 0.1,  # mask-model key -> not returned
                 "normalize": "global",
                 "norm_lower": 90.0,
                 "norm_upper": 1200.0,

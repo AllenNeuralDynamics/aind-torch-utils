@@ -44,11 +44,14 @@ pipeline-normalization keys ``normalize``/``norm_lower``/``norm_upper`` — set
 percentile computation that bottlenecks prep, e.g.::
 
     {"normalize": "global", "norm_lower": 90.0, "norm_upper": 1200.0,
-     "low_thresh": 0.05, "high_thresh": 0.20}
+     "threshold": 0.1, "smooth_sigma": [0.5, 1, 1]}
+
+``threshold`` is in normalized ``[0, 1]`` (raw-intensity equivalent is
+``norm_lower + threshold*(norm_upper - norm_lower)``); lower => more oversegmentation.
 
 Performance
 -----------
-The gfp-mask "model" is a classical cupy/cuCIM routine, not a deep net. Its
+The gfp-mask "model" is a classical cupy routine, not a deep net. Its
 labeling/morphology steps stall the GPU on host syncs, so GPU *utilization* reads low
 even when the GPU stage is the bottleneck — judge by wall-clock and the bottleneck
 verdict logged from ``--metrics-json``, not by ``nvidia-smi`` utilization.

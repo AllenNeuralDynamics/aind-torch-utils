@@ -1,13 +1,16 @@
-"""GPU-accelerated post-processing functions that plug into the inference pipeline.
+"""GPU-accelerated GFP masking that plugs into the inference pipeline.
 
-This module mirrors a CPU scikit-image / scipy.ndimage masking routine on the GPU
-using `cupy <https://cupy.dev/>`_ and `cuCIM <https://github.com/rapidsai/cucim>`_.
+Produces a binary GFP mask by light Gaussian smoothing followed by a global intensity
+threshold. The input is assumed already normalized to ~``[0, 1]`` by the pipeline (e.g.
+``normalize="global"`` with dataset-wide ``norm_lower``/``norm_upper``), so the
+threshold is a single value in ``[0, 1]``. There is no connected-component cleanup:
+the mask is intentionally biased toward oversegmentation and the whole op is elementwise
++ one separable Gaussian, so it runs batched with no device->host syncs.
 
-The GPU stack (``cupy`` + ``cucim``) is imported at module top, so importing this
-module requires a working CUDA + cuCIM installation. The module is therefore imported
-lazily from the registry loader (see :func:`aind_torch_utils.models.load_gfp_mask`)
-rather than at package import time, keeping ``import aind_torch_utils`` usable on hosts
-without a GPU.
+``cupy`` is imported at module top, so importing this module requires a working CUDA
+install. The module is therefore imported lazily from the registry loader (see
+:func:`aind_torch_utils.models.load_gfp_mask`) rather than at package import time,
+keeping ``import aind_torch_utils`` usable on hosts without a GPU.
 """
 import json
 from typing import Optional, Tuple
@@ -15,7 +18,6 @@ from typing import Optional, Tuple
 import cupy as cp
 import cupyx.scipy.ndimage as cndi
 import torch
-from cucim.skimage import exposure, filters, morphology
 from torch import nn
 
 # Keys a params JSON may carry that configure the *pipeline* (PrepWorker
@@ -40,113 +42,43 @@ def read_pipeline_params(path: Optional[str]) -> dict:
 
 def create_gfp_mask_gpu(
     img,
-    intensity_percentiles,
-    min_intensity: Optional[float] = None,
-    background_sigma: Tuple[float, float, float] = (2, 10, 10),
-    min_object_size: int = 20,
-    hole_size: int = 64,
-    low_thresh: float = 0.05,
-    high_thresh: float = 0.20,
+    threshold: float = 0.1,
+    smooth_sigma: Optional[Tuple[float, float, float]] = (0.5, 1, 1),
 ) -> "cp.ndarray":
     """Create a binary GFP mask for a single 3D volume on the GPU.
 
-    GPU port of the CPU ``create_gfp_mask`` routine. Operates on one ``(Z, Y, X)``
-    volume; the result is a ``uint8`` cupy array of the same shape with values in
-    ``{0, 1}``.
+    Light Gaussian smooth + global threshold; no connected-component / morphology
+    cleanup (biased toward oversegmentation). The input is assumed normalized to
+    ~``[0, 1]`` by the pipeline, so ``threshold`` is a single value in ``[0, 1]``.
 
     Parameters
     ----------
     img : cupy.ndarray
-        Input volume of shape ``(Z, Y, X)``.
-    intensity_percentiles : tuple of float
-        ``(low, high)`` intensity values used to rescale the background-subtracted
-        image to ``[0, 1]`` (computed once per tile/volume by the caller).
-    min_intensity : float, optional
-        If provided, voxels with raw intensity below this value are forced to 0.
-    background_sigma : tuple of float
-        Anisotropic Gaussian sigma for background estimation (light-sheet).
-    min_object_size : int
-        Minimum connected-component size to keep.
-    hole_size : int
-        Maximum hole area to fill.
-    low_thresh, high_thresh : float
-        Low/high thresholds for hysteresis thresholding (in ``[0, 1]`` space).
+        Input volume of shape ``(Z, Y, X)``, normalized to ~``[0, 1]``.
+    threshold : float
+        Intensity threshold in ``[0, 1]``; voxels ``>= threshold`` are foreground.
+        Lower values oversegment more.
+    smooth_sigma : tuple of float, optional
+        Gaussian sigma (Z, Y, X) for denoising before thresholding. ``None`` skips
+        smoothing.
 
     Returns
     -------
     cupy.ndarray
         ``uint8`` mask of shape ``(Z, Y, X)`` with values in ``{0, 1}``.
     """
-    raw = img.astype(cp.float32)
-    smooth = _preprocess(
-        raw,
-        intensity_percentiles,
-        background_sigma=tuple(background_sigma),
-        smooth_sigma=(0.5, 1, 1),
-    )
-    return _threshold_and_clean(
-        smooth,
-        raw,
-        low_thresh=low_thresh,
-        high_thresh=high_thresh,
-        hole_size=hole_size,
-        min_object_size=min_object_size,
-        min_intensity=min_intensity,
-    )
-
-
-def _preprocess(vol, intensity_percentiles, background_sigma, smooth_sigma):
-    """Background-subtract, rescale, and smooth (the cheap, per-voxel ops).
-
-    Works on an N-D float32 array. ``background_sigma``/``smooth_sigma`` must match
-    the array's rank; pass ``0`` on any axis that must not be blurred (e.g. the batch
-    and channel axes of a ``(B, 1, Z, Y, X)`` array), which makes the batched result
-    identical to processing each volume independently.
-    """
-    bg = cndi.gaussian_filter(vol, sigma=background_sigma)
-    img_bs = cp.clip(vol - bg, 0, None)
-    img_clean = exposure.rescale_intensity(
-        img_bs,
-        in_range=(intensity_percentiles[0], intensity_percentiles[1]),
-        out_range=(0, 1),
-    )
-    return cndi.gaussian_filter(img_clean, sigma=smooth_sigma)
-
-
-def _threshold_and_clean(
-    smooth,
-    raw,
-    low_thresh,
-    high_thresh,
-    hole_size,
-    min_object_size,
-    min_intensity,
-) -> "cp.ndarray":
-    """Hysteresis threshold + morphological cleanup for a single 3D volume.
-
-    These steps use connected-component labeling, so they must run per-volume (never
-    on a stacked batch, which would connect adjacent volumes across the batch axis).
-    """
-    # Hysteresis threshold (consistent across all blocks).
-    mask = filters.apply_hysteresis_threshold(smooth, low=low_thresh, high=high_thresh)
-
-    # Cleanup — fill holes, close to bridge spine necks, THEN remove small.
-    mask = morphology.remove_small_holes(mask, max_size=hole_size)
-    mask = morphology.binary_closing(mask, morphology.ball(1))
-    mask = morphology.remove_small_objects(mask, max_size=min_object_size)
-
-    if min_intensity is not None:
-        mask[raw < min_intensity] = 0
-
-    return mask.astype(cp.uint8)
+    x = img.astype(cp.float32)
+    if smooth_sigma is not None:
+        x = cndi.gaussian_filter(x, sigma=tuple(smooth_sigma))
+    return (x >= threshold).astype(cp.uint8)
 
 
 class GfpMaskModel(nn.Module):
     """Pipeline "model" that produces a GFP mask for each volume in a batch.
 
-    The cheap per-voxel ops (background subtraction, rescale, smoothing) run once over
-    the whole ``(B, 1, Z, Y, X)`` batch; only the labeling/morphology cleanup loops
-    per-volume. The result equals :func:`create_gfp_mask_gpu` applied to each volume.
+    Light Gaussian smooth + global threshold, run once over the whole
+    ``(B, 1, Z, Y, X)`` batch (no per-volume loop, no connected-component cleanup).
+    The result equals :func:`create_gfp_mask_gpu` applied to each volume.
 
     Conforms to the inference pipeline's model contract: ``forward`` takes a CUDA
     tensor of shape ``(B, 1, Z, Y, X)`` (normalized to ~``[0, 1]`` by the prep
@@ -156,34 +88,22 @@ class GfpMaskModel(nn.Module):
 
     Parameters
     ----------
-    intensity_percentiles : tuple of float
-        Passed to :func:`create_gfp_mask_gpu`. With pipeline percentile
-        normalization the input is already in ``[0, 1]``, so ``(0.0, 1.0)`` makes
-        the rescale a near-identity and keeps thresholds in their tuned range.
-    background_sigma, min_object_size, hole_size, low_thresh, high_thresh,
-    min_intensity
-        Forwarded to :func:`create_gfp_mask_gpu`.
+    threshold : float
+        Intensity threshold in ``[0, 1]`` (input is globally normalized). Voxels
+        ``>= threshold`` are foreground; lower values oversegment more.
+    smooth_sigma : tuple of float, optional
+        Gaussian sigma (Z, Y, X) for denoising before thresholding. ``None`` skips it.
     """
 
     def __init__(
         self,
-        intensity_percentiles: Tuple[float, float] = (0.0, 1.0),
-        background_sigma: Tuple[float, float, float] = (2, 10, 10),
-        min_object_size: int = 20,
-        hole_size: int = 64,
-        low_thresh: float = 0.05,
-        high_thresh: float = 0.20,
-        min_intensity: Optional[float] = None,
+        threshold: float = 0.1,
+        smooth_sigma: Optional[Tuple[float, float, float]] = (0.5, 1, 1),
     ):
         """Store masking parameters (no learnable state)."""
         super().__init__()
-        self.intensity_percentiles = intensity_percentiles
-        self.background_sigma = background_sigma
-        self.min_object_size = min_object_size
-        self.hole_size = hole_size
-        self.low_thresh = low_thresh
-        self.high_thresh = high_thresh
-        self.min_intensity = min_intensity
+        self.threshold = threshold
+        self.smooth_sigma = smooth_sigma
 
     @classmethod
     def from_json(cls, path: str) -> "GfpMaskModel":
@@ -208,14 +128,13 @@ class GfpMaskModel(nn.Module):
         # Drop pipeline-only keys; the rest are mask-model params.
         params = {k: v for k, v in params.items() if k not in PIPELINE_PARAM_KEYS}
         # JSON arrays -> tuples for the sequence-valued params.
-        for key in ("intensity_percentiles", "background_sigma"):
-            if params.get(key) is not None:
-                params[key] = tuple(params[key])
+        if params.get("smooth_sigma") is not None:
+            params["smooth_sigma"] = tuple(params["smooth_sigma"])
         return cls(**params)
 
     @torch.compiler.disable
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the GFP mask to each volume in the batch.
+        """Mask the whole batch in one shot (smooth + threshold).
 
         Parameters
         ----------
@@ -230,30 +149,12 @@ class GfpMaskModel(nn.Module):
         # Honor the worker's device (e.g. cuda:1) so cupy doesn't default to GPU 0.
         idx = x.device.index if x.device.index is not None else 0
         with cp.cuda.Device(idx):
-            raw = cp.from_dlpack(x)  # zero-copy view, (B, 1, Z, Y, X), [0, 1]
-            # Cheap per-voxel ops run ONCE over the whole batch. Zero sigma on the
-            # batch/channel axes prevents any bleed across volumes, so this is
-            # numerically identical to processing each volume independently.
-            smooth = _preprocess(
-                raw.astype(cp.float32),
-                self.intensity_percentiles,
-                background_sigma=(0, 0) + tuple(self.background_sigma),
-                smooth_sigma=(0, 0, 0.5, 1, 1),
-            )
-            # Sync-heavy labeling/morphology stays per-volume.
-            outs = [
-                _threshold_and_clean(
-                    smooth[b, 0],
-                    raw[b, 0],
-                    low_thresh=self.low_thresh,
-                    high_thresh=self.high_thresh,
-                    hole_size=self.hole_size,
-                    min_object_size=self.min_object_size,
-                    min_intensity=self.min_intensity,
-                )
-                for b in range(raw.shape[0])
-            ]
-            mask = cp.stack(outs)[:, None]  # (B, 1, Z, Y, X) uint8
+            vol = cp.from_dlpack(x).astype(cp.float32)  # (B, 1, Z, Y, X), ~[0, 1]
+            if self.smooth_sigma is not None:
+                # Zero sigma on the batch/channel axes prevents bleed across volumes,
+                # so the batched smooth is identical to processing each independently.
+                vol = cndi.gaussian_filter(vol, sigma=(0, 0) + tuple(self.smooth_sigma))
+            mask = (vol >= self.threshold).astype(cp.uint8)
             # Clone into a torch-owned tensor so the cupy memory pool can't reclaim
             # the buffer while the writer's async D2H copy is still in flight.
             # torch.from_dlpack consumes cupy's __dlpack__ directly (no .toDlpack()).
