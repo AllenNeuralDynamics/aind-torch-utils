@@ -80,9 +80,9 @@ def create_gfp_mask_gpu(
     )
 
     # 5. Cleanup — fill holes, close to bridge spine necks, THEN remove small
-    mask = morphology.remove_small_holes(mask, area_threshold=hole_size)
+    mask = morphology.remove_small_holes(mask, max_size=hole_size)
     mask = morphology.binary_closing(mask, morphology.ball(1))
-    mask = morphology.remove_small_objects(mask, min_size=min_object_size)
+    mask = morphology.remove_small_objects(mask, max_size=min_object_size)
 
     if min_intensity is not None:
         mask[img < min_intensity] = 0
@@ -188,4 +188,5 @@ class GfpMaskModel(nn.Module):
             mask = cp.stack(outs)[:, None]  # (B, 1, Z, Y, X) uint8
             # Clone into a torch-owned tensor so the cupy memory pool can't reclaim
             # the buffer while the writer's async D2H copy is still in flight.
-            return torch.from_dlpack(mask.toDlpack()).clone()
+            # torch.from_dlpack consumes cupy's __dlpack__ directly (no .toDlpack()).
+            return torch.from_dlpack(mask).clone()
