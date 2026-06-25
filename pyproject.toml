@@ -40,6 +40,8 @@ dev = [
 [project.optional-dependencies]
 extras = ["matplotlib"]
 denoise-net = ["aind-exaspim-image-compression@git+https://github.com/AllenNeuralDynamics/aind-exaspim-image-compression.git@main"]
+# GPU post-processing (e.g. the "gfp-mask" model). Linux + CUDA only; the
+postprocess = ["cupy-cuda12x", "cucim-cu12"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
