@@ -15,6 +15,7 @@ import torch  # noqa: E402
 from aind_torch_utils.postprocessing import (  # noqa: E402
     GfpMaskModel,
     create_gfp_mask_gpu,
+    read_pipeline_params,
 )
 
 if not torch.cuda.is_available():
@@ -98,6 +99,10 @@ def test_gfp_mask_model_from_json(tmp_path):
         "low_thresh": 0.1,
         "high_thresh": 0.3,
         "min_object_size": 50,
+        # Pipeline-normalization keys live in the same file and must be ignored here.
+        "normalize": "global",
+        "norm_lower": 90.0,
+        "norm_upper": 1200.0,
     }
     path = tmp_path / "params.json"
     path.write_text(json.dumps(params))
@@ -120,3 +125,24 @@ def test_gfp_mask_model_from_json_rejects_unknown_key(tmp_path):
 
     with pytest.raises(TypeError):
         GfpMaskModel.from_json(str(path))
+
+
+def test_read_pipeline_params(tmp_path):
+    path = tmp_path / "params.json"
+    path.write_text(
+        json.dumps(
+            {
+                "low_thresh": 0.1,  # mask-model key -> not returned
+                "normalize": "global",
+                "norm_lower": 90.0,
+                "norm_upper": 1200.0,
+            }
+        )
+    )
+
+    assert read_pipeline_params(str(path)) == {
+        "normalize": "global",
+        "norm_lower": 90.0,
+        "norm_upper": 1200.0,
+    }
+    assert read_pipeline_params(None) == {}

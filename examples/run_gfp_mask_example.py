@@ -38,7 +38,13 @@ default pointing at::
     s3://aind-open-data/HCR_831990-s2-ls1_..._01-32-11/fusion/ch_488/fused.zarr/5
 
 (level 5). Mask parameters can be customized via ``--params-json`` (see
-``GfpMaskModel.from_json``); omit it to use defaults.
+``GfpMaskModel.from_json``); omit it to use defaults. That same JSON may also carry
+pipeline-normalization keys ``normalize``/``norm_lower``/``norm_upper`` — set
+``"normalize": "global"`` with the dataset's global min/max to skip the per-block
+percentile computation that bottlenecks prep, e.g.::
+
+    {"normalize": "global", "norm_lower": 90.0, "norm_upper": 1200.0,
+     "low_thresh": 0.05, "high_thresh": 0.20}
 
 Performance
 -----------
@@ -70,6 +76,7 @@ import boto3
 import tensorstore as ts
 
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.postprocessing import read_pipeline_params
 from aind_torch_utils.run import load_model, run
 from aind_torch_utils.utils import open_ts_spec
 from example_utils.utils import load_json
@@ -405,6 +412,30 @@ def _summarize_metrics(path: str) -> None:
     )
 
 
+def _normalization_kwargs(params_json: Optional[str]) -> dict:
+    """Build InferenceConfig normalization kwargs from the params JSON.
+
+    ``normalize="global"`` avoids the per-block percentile computation that
+    bottlenecks prep, but requires literal min/max values (``norm_lower``/
+    ``norm_upper``). Defaults to ``normalize="percentile"`` when no keys are given.
+    """
+    norm = read_pipeline_params(params_json)
+    normalize = norm.get("normalize", "percentile")
+    if normalize == "global" and (
+        norm.get("norm_lower") is None or norm.get("norm_upper") is None
+    ):
+        raise ValueError(
+            "normalize='global' requires norm_lower and norm_upper (global min/max) "
+            "in --params-json."
+        )
+    kwargs = {"normalize": normalize}
+    if norm.get("norm_lower") is not None:
+        kwargs["norm_lower"] = norm["norm_lower"]
+    if norm.get("norm_upper") is not None:
+        kwargs["norm_upper"] = norm["norm_upper"]
+    return kwargs
+
+
 def _parse_args(argv: List[str]) -> argparse.Namespace:
     """Parse command-line arguments."""
     ap = argparse.ArgumentParser(
@@ -538,6 +569,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     # multiple workers on it (hides the masking function's host-sync stalls).
     devices = args.devices * max(1, args.workers_per_device)
     logger.info("GPU workers: %s", devices)
+
+    # Normalization comes from the same --params-json (see _normalization_kwargs).
+    norm_kwargs = _normalization_kwargs(args.params_json)
+    logger.info("Normalization: %s", norm_kwargs)
+
     cfg = InferenceConfig(
         patch=patch,
         block=block,
@@ -547,9 +583,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         max_inflight_batches=args.max_inflight_batches,
         amp=False,  # no torch math in the model; avoid a pointless float16 copy
         use_compile=False,  # torch.compile cannot trace the cupy/cuCIM region
-        normalize="percentile",  # feed ~[0,1]; matches intensity_percentiles=(0,1)
         output_denormalize=False,  # mask is not in intensity space
         seam_mode="trim",
+        **norm_kwargs,  # normalize / norm_lower / norm_upper from --params-json
     )
     logger.info("Inference config:\n%s", cfg)
 

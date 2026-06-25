@@ -18,6 +18,25 @@ import torch
 from cucim.skimage import exposure, filters, morphology
 from torch import nn
 
+# Keys a params JSON may carry that configure the *pipeline* (PrepWorker
+# normalization), not the mask model. ``read_pipeline_params`` consumes these and
+# ``GfpMaskModel.from_json`` ignores them, so both live in one config file.
+PIPELINE_PARAM_KEYS = ("normalize", "norm_lower", "norm_upper")
+
+
+def read_pipeline_params(path: Optional[str]) -> dict:
+    """Return the pipeline-normalization keys present in a params JSON.
+
+    Returns an empty dict if ``path`` is ``None`` or the file carries none of
+    :data:`PIPELINE_PARAM_KEYS`. These configure ``InferenceConfig`` normalization,
+    separate from the mask-model params consumed by :meth:`GfpMaskModel.from_json`.
+    """
+    if not path:
+        return {}
+    with open(path) as f:
+        params = json.load(f)
+    return {k: params[k] for k in PIPELINE_PARAM_KEYS if k in params}
+
 
 def create_gfp_mask_gpu(
     img,
@@ -172,6 +191,8 @@ class GfpMaskModel(nn.Module):
 
         Keys mirror the ``__init__`` arguments; missing keys fall back to
         defaults and an unrecognized key raises ``TypeError`` (catches typos).
+        Pipeline-normalization keys (:data:`PIPELINE_PARAM_KEYS`) are ignored here so
+        the same file can also configure the pipeline.
 
         Parameters
         ----------
@@ -184,6 +205,8 @@ class GfpMaskModel(nn.Module):
         """
         with open(path) as f:
             params = json.load(f)
+        # Drop pipeline-only keys; the rest are mask-model params.
+        params = {k: v for k, v in params.items() if k not in PIPELINE_PARAM_KEYS}
         # JSON arrays -> tuples for the sequence-valued params.
         for key in ("intensity_percentiles", "background_sigma"):
             if params.get(key) is not None:
