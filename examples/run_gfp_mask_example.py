@@ -263,7 +263,7 @@ def _build_mask_pyramid(
     asyncio.run(_build_levels())
 
 
-def _write_output_zattrs(
+def _write_output_group_metadata(
     bucket: str,
     base_path: str,
     source_ms: dict,
@@ -271,22 +271,38 @@ def _write_output_zattrs(
     omero: Optional[dict],
     region: str,
 ) -> None:
-    """Write OME-NGFF .zattrs mirroring the source levels L..N.
+    """Write the zarr v2 group markers + OME-NGFF multiscales for the output.
 
-    Copies the source multiscales block, replacing its datasets with ``datasets_from_l``
-    verbatim (original paths + absolute scales), so the mask aligns spatially with the
-    source. Output is written as zarr v2 ``.zattrs`` even when the source was v3.
+    A valid OME-Zarr group needs both ``.zgroup`` (so readers like neuroglancer
+    recognize it as a group) and ``.zattrs`` (the multiscales metadata). We copy the
+    source multiscales block, replacing its datasets with ``datasets_from_l`` verbatim
+    (original paths + absolute scales) so the mask aligns spatially with the source.
     """
+    s3 = boto3.client("s3", region_name=region)
+
+    # .zgroup — without this the group is not a valid zarr v2 group and viewers
+    # silently ignore the multiscales metadata.
+    s3.put_object(
+        Bucket=bucket,
+        Key=f"{base_path}.zgroup",
+        Body=json.dumps({"zarr_format": 2}).encode(),
+    )
+
     ms = dict(source_ms)
     ms["datasets"] = datasets_from_l
     zattrs = {"multiscales": [ms]}
     if omero is not None:
         zattrs["omero"] = omero
-    key = f"{base_path}.zattrs"
-    boto3.client("s3", region_name=region).put_object(
-        Bucket=bucket, Key=key, Body=json.dumps(zattrs).encode()
+    s3.put_object(
+        Bucket=bucket,
+        Key=f"{base_path}.zattrs",
+        Body=json.dumps(zattrs).encode(),
     )
-    logger.info("Wrote OME-NGFF metadata to s3://%s/%s", bucket, key)
+    logger.info(
+        "Wrote OME-NGFF group metadata (.zgroup + .zattrs) to s3://%s/%s",
+        bucket,
+        base_path,
+    )
 
 
 def _bottleneck_verdict(prep_fill: Optional[float], write_fill: Optional[float]) -> str:
@@ -510,7 +526,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     # --- Coarser levels L+1..N + OME-NGFF metadata mirroring the source ---
     _build_mask_pyramid(args.out_bucket, base_path, datasets_from_l, args.aws_region)
-    _write_output_zattrs(
+    _write_output_group_metadata(
         args.out_bucket, base_path, source_ms, datasets_from_l, omero, args.aws_region
     )
     logger.info("Done. OME-Zarr mask written to s3://%s/%s", args.out_bucket, base_path)
