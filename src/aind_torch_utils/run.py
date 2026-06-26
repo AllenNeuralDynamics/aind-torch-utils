@@ -187,8 +187,8 @@ def _setup_workers(
     write_queues : List[queue.Queue]
         A list of writer queues.
     background : np.ndarray, optional
-        Full-resolution background field for flat-field correction, forwarded to
-        every PrepWorker. ``None`` disables the correction.
+        Coarse ``BackgroundField`` for flat-field correction, forwarded to every
+        PrepWorker (sampled per-block on demand). ``None`` disables the correction.
 
     Returns
     -------
@@ -320,9 +320,9 @@ def run(
     num_writer_workers : int, optional
         The number of writer workers to use, by default 1.
     background : np.ndarray, optional
-        Full processing-level-resolution background field (raw intensity units) for
-        flat-field correction. Applied per-block in PrepWorker when ``cfg.flatfield``
-        is set; ``None`` disables it.
+        Coarse ``BackgroundField`` (raw intensity units) for flat-field correction,
+        sampled per-block in PrepWorker when ``cfg.flatfield`` is set; ``None``
+        disables it.
     """
     output_stores: List[Any] = (
         output_store if isinstance(output_store, list) else [output_store]

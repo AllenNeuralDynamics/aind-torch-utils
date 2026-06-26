@@ -96,10 +96,10 @@ from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
 import boto3
-import numpy as np
 import tensorstore as ts
 
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.correction import BackgroundField
 from aind_torch_utils.postprocessing import read_pipeline_params
 from aind_torch_utils.run import load_model, run
 from aind_torch_utils.utils import open_ts_spec
@@ -239,16 +239,18 @@ def _spec_with_level(spec, new_level) -> dict:
 
 
 def _estimate_background(spec, cfg, processing_shape: Tuple[int, int, int]):
-    """Estimate a global flat-field background at the processing-level resolution.
+    """Estimate a coarse global flat-field background for white top-hat correction.
 
-    Reads the whole (small) ``cfg.flatfield_level`` volume, removes sparse bright cells
-    with a grey-opening and optional Gaussian smoothing (so the estimate captures only
-    the low-frequency shading / fusion inhomogeneity), then upsamples it to the
-    processing level's ``(Z, Y, X)``. Returns a host ``float32`` array in raw intensity
-    units, or ``None`` if flat-field is disabled.
+    Reads the whole (small) ``cfg.flatfield_level`` volume and removes sparse bright
+    cells with a grey-opening + optional Gaussian smoothing, so the estimate captures
+    only the low-frequency shading / fusion inhomogeneity. The field is kept at the
+    *coarse* resolution (a few MB) and interpolated up per-block inside PrepWorker, so
+    the full-resolution background of the whole volume is never materialized (which
+    would be tens of GB at fine processing levels). Returns a :class:`BackgroundField`
+    (coarse array + processing/coarse scale per axis), or ``None`` if disabled.
 
-    The result is a single global field; PrepWorker slices it by absolute coordinates,
-    so neighboring blocks see identical values and the correction adds no seams.
+    The field is global and sampled by absolute coordinates, so neighboring blocks see
+    identical values and the correction adds no seams.
     """
     if not cfg.flatfield:
         return None
@@ -273,17 +275,13 @@ def _estimate_background(spec, cfg, processing_shape: Tuple[int, int, int]):
     if cfg.flatfield_sigma > 0:
         cg = cndi.gaussian_filter(cg, sigma=float(cfg.flatfield_sigma))
 
-    zoom = tuple(t / s for t, s in zip(processing_shape, cg.shape))
-    cg = cndi.zoom(cg, zoom, order=1)
-    # Guard against off-by-one from fractional zoom: crop/pad to the exact shape.
-    pz, py, px = processing_shape
-    bg = cp.asnumpy(cg)[:pz, :py, :px]
-    if bg.shape != processing_shape:
-        padded = np.zeros(processing_shape, dtype="float32")
-        padded[: bg.shape[0], : bg.shape[1], : bg.shape[2]] = bg
-        bg = padded
-    logger.info("Flat-field: background field ready shape=%s", bg.shape)
-    return bg
+    field = cp.asnumpy(cg)
+    # Processing-level voxels per coarse voxel, per axis.
+    scale = tuple(float(p) / float(c) for p, c in zip(processing_shape, field.shape))
+    logger.info(
+        "Flat-field: coarse background ready shape=%s scale=%s", field.shape, scale
+    )
+    return BackgroundField(field=field, scale=scale)
 
 
 def _build_mask_pyramid(

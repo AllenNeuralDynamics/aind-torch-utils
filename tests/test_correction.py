@@ -1,7 +1,11 @@
 """Tests for flat-field background correction (pure numpy; no GPU/IO stack)."""
 import numpy as np
 
-from aind_torch_utils.correction import apply_flatfield
+from aind_torch_utils.correction import (
+    BackgroundField,
+    apply_flatfield,
+    sample_background,
+)
 
 
 def _global_field(shape=(40, 40), period=37.0):
@@ -74,6 +78,32 @@ def test_seam_free_across_overlapping_blocks():
         )
         # Shared region in A is columns 16:24 -> a[..., 16:24]; in B -> b[..., 0:8].
         np.testing.assert_array_equal(a[:, :, 16:24], b[:, :, 0:8])
+
+
+def test_sample_background_reproduces_coarse_at_scale_one():
+    # scale=1 (coarse == processing grid) -> sampling returns the field verbatim.
+    field = _global_field((8, 8))[None].repeat(4, axis=0).astype(np.float32)
+    out = sample_background(field, (1.0, 1.0, 1.0), 0, 4, 0, 8, 0, 8)
+    np.testing.assert_allclose(out, field, atol=1e-4)
+
+
+def test_sample_background_seam_free_across_blocks():
+    """Per-block sampling of the coarse field agrees on shared voxels (no seam)."""
+    cz, cy, cx = 4, 12, 12
+    rng = np.random.default_rng(1)
+    field = rng.uniform(50, 200, size=(cz, cy, cx)).astype(np.float32)
+    scale = (3.0, 4.0, 4.0)  # processing grid is 12 x 48 x 48
+
+    # Block A: x in [0, 30); block B: x in [20, 48); overlap [20, 30).
+    a = sample_background(field, scale, 0, 12, 0, 48, 0, 30)
+    b = sample_background(field, scale, 0, 12, 0, 48, 20, 48)
+    np.testing.assert_array_equal(a[:, :, 20:30], b[:, :, 0:10])
+
+
+def test_background_field_mean():
+    field = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    bf = BackgroundField(field=field, scale=(2.0, 2.0, 2.0))
+    assert bf.mean == float(field.mean())
 
 
 def test_subtract_flattens_shading_for_uniform_threshold():
