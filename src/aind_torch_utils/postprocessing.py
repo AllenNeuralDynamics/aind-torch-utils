@@ -12,6 +12,11 @@ and runs batched with no device->host syncs, biased toward oversegmentation.
 install. The module is therefore imported lazily from the registry loader (see
 :func:`aind_torch_utils.models.load_gfp_mask`) rather than at package import time,
 keeping ``import aind_torch_utils`` usable on hosts without a GPU.
+
+Note: when the pipeline runs with flat-field correction enabled (``cfg.flatfield``;
+see :data:`PIPELINE_PARAM_KEYS` and the example), the model's input is the
+background-flattened signal rather than raw normalized intensity, so ``threshold`` must
+be re-tuned for that flattened range (subtraction compresses the dynamic range).
 """
 import json
 from typing import Optional, Tuple
@@ -22,9 +27,18 @@ import torch
 from torch import nn
 
 # Keys a params JSON may carry that configure the *pipeline* (PrepWorker
-# normalization), not the mask model. ``read_pipeline_params`` consumes these and
-# ``GfpMaskModel.from_json`` ignores them, so both live in one config file.
-PIPELINE_PARAM_KEYS = ("normalize", "norm_lower", "norm_upper")
+# normalization + flat-field correction), not the mask model. ``read_pipeline_params``
+# consumes these and ``GfpMaskModel.from_json`` ignores them, so both live in one file.
+PIPELINE_PARAM_KEYS = (
+    "normalize",
+    "norm_lower",
+    "norm_upper",
+    "flatfield",
+    "flatfield_mode",
+    "flatfield_level",
+    "flatfield_opening_radius",
+    "flatfield_sigma",
+)
 
 
 def read_pipeline_params(path: Optional[str]) -> dict:

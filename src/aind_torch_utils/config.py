@@ -89,6 +89,37 @@ class InferenceConfig(BaseModel):
         description="If True, clip normalized values to [0,1]; if (lo,hi), clip to that range.",
     )
 
+    # Flat-field / white top-hat background correction. Removes low-frequency
+    # intensity inhomogeneity (light-sheet shading, fusion seams) before
+    # normalization so a single global threshold segments uniformly across the
+    # volume. The background field is estimated once (see the example) and applied
+    # per-block in PrepWorker; default off leaves existing behavior unchanged.
+    flatfield: bool = Field(
+        default=False, description="Enable flat-field background correction."
+    )
+    flatfield_mode: Literal["subtract", "divide"] = Field(
+        default="subtract",
+        description=(
+            "'subtract' = white top-hat (img - background, clamped >=0); "
+            "'divide' = multiplicative shading/gain correction."
+        ),
+    )
+    flatfield_level: Optional[int] = Field(
+        default=None,
+        description="Pyramid level to estimate the background from (e.g. 8).",
+    )
+    flatfield_opening_radius: int = Field(
+        default=0,
+        description=(
+            "Grey-opening structuring-element radius (in coarse-level voxels) used "
+            "to strip sparse cells from the background estimate; 0 disables it."
+        ),
+    )
+    flatfield_sigma: float = Field(
+        default=0.0,
+        description="Gaussian smoothing sigma (coarse-level voxels) for the estimate.",
+    )
+
     @model_validator(mode="after")
     def _validate(self):
         """
@@ -203,6 +234,25 @@ class InferenceConfig(BaseModel):
             if self.norm_lower >= self.norm_upper:
                 raise ValueError(
                     "For 'global' normalization, norm_lower must be < norm_upper."
+                )
+
+        # Flat-field correction
+        if self.flatfield:
+            if self.flatfield_level is None:
+                raise ValueError(
+                    "flatfield=True requires flatfield_level (pyramid level to "
+                    "estimate the background from)."
+                )
+            if self.flatfield_opening_radius < 0:
+                raise ValueError("flatfield_opening_radius must be >= 0")
+            if self.flatfield_sigma < 0:
+                raise ValueError("flatfield_sigma must be >= 0")
+            if self.normalize != "global":
+                warnings.warn(
+                    "flatfield correction assumes normalize='global'; with other "
+                    "modes the background subtraction may interact unexpectedly with "
+                    "per-block normalization.",
+                    RuntimeWarning,
                 )
 
         # clip_norm validation

@@ -166,6 +166,7 @@ def _setup_workers(
     num_prep_workers: int,
     prep_q: queue.Queue,
     write_queues: List[queue.Queue],
+    background: Optional[Any] = None,
 ) -> Tuple[List[PrepWorker], List[GpuWorker], List[WriterWorker]]:
     """Sets up the workers for the pipeline.
 
@@ -185,6 +186,9 @@ def _setup_workers(
         The prep queue.
     write_queues : List[queue.Queue]
         A list of writer queues.
+    background : np.ndarray, optional
+        Full-resolution background field for flat-field correction, forwarded to
+        every PrepWorker. ``None`` disables the correction.
 
     Returns
     -------
@@ -199,6 +203,7 @@ def _setup_workers(
             cfg.patch,
             worker_id=i,
             num_workers=num_prep_workers,
+            background=background,
         )
         for i in range(max(1, num_prep_workers))
     ]
@@ -222,6 +227,7 @@ def _setup_worker_threads(
     num_prep_workers: int,
     prep_q: queue.Queue,
     write_queues: List[queue.Queue],
+    background: Optional[Any] = None,
 ) -> Tuple[List[threading.Thread], List[threading.Thread], List[threading.Thread]]:
     """Sets up the worker threads for the pipeline.
 
@@ -259,6 +265,7 @@ def _setup_worker_threads(
         num_prep_workers,
         prep_q,
         write_queues,
+        background=background,
     )
 
     # Threads
@@ -287,6 +294,7 @@ def run(
     metrics_interval: float = 0.5,
     num_prep_workers: int = 1,
     num_writer_workers: int = 1,
+    background: Optional[Any] = None,
 ) -> None:
     """Runs the inference pipeline.
 
@@ -311,6 +319,10 @@ def run(
         The number of prep workers to use, by default 1.
     num_writer_workers : int, optional
         The number of writer workers to use, by default 1.
+    background : np.ndarray, optional
+        Full processing-level-resolution background field (raw intensity units) for
+        flat-field correction. Applied per-block in PrepWorker when ``cfg.flatfield``
+        is set; ``None`` disables it.
     """
     output_stores: List[Any] = (
         output_store if isinstance(output_store, list) else [output_store]
@@ -342,6 +354,7 @@ def run(
         num_prep_workers,
         prep_q,
         write_queues,
+        background=background,
     )
     all_threads = prep_threads + gpu_threads + writer_threads
 

@@ -51,6 +51,23 @@ percentile computation that bottlenecks prep, e.g.::
 ``open_iterations`` is a binary opening that removes tiny dots after thresholding
 (``0`` disables it; raise ``threshold`` and/or ``open_iterations`` to despeckle more).
 
+To fix chunk-to-chunk segmentation differences caused by source intensity
+inhomogeneity (light-sheet shading / fusion seams), enable white top-hat flat-field
+correction. A global background is estimated once from a coarse pyramid level and
+subtracted before normalization, so a single global threshold segments uniformly
+(seam-free). Add, e.g.::
+
+    {"normalize": "global", "norm_lower": 90.0, "norm_upper": 1200.0,
+     "threshold": 0.05, "smooth_sigma": [0.5, 1, 1], "open_iterations": 1,
+     "flatfield": true, "flatfield_level": 8, "flatfield_opening_radius": 2,
+     "flatfield_sigma": 1.0}
+
+With ``flatfield`` on, ``threshold`` applies to the *flattened* signal and must be
+re-tuned (subtraction compresses the dynamic range, so start lower). ``flatfield_level``
+is the coarse level the background is estimated from; ``flatfield_opening_radius``
+(coarse voxels) strips sparse cells from the estimate; ``flatfield_mode`` may be
+``"subtract"`` (default, white top-hat) or ``"divide"`` (multiplicative shading).
+
 Performance
 -----------
 The gfp-mask "model" is a classical cupy routine, not a deep net. Its
@@ -69,6 +86,7 @@ Tips:
 
 import argparse
 import asyncio
+import copy
 import json
 import logging
 import re
@@ -78,6 +96,7 @@ from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
 import boto3
+import numpy as np
 import tensorstore as ts
 
 from aind_torch_utils.config import InferenceConfig
@@ -197,6 +216,74 @@ def _read_source_multiscales(
         return None
     ms = multiscales[0]
     return ms, ms.get("datasets", []), ome.get("omero")
+
+
+def _spec_with_level(spec, new_level) -> dict:
+    """Return a copy of the input spec whose kvstore path points at ``new_level``.
+
+    Replaces the trailing ``/<level>`` of the kvstore path so the coarse pyramid level
+    used for background estimation is read from the same OME-Zarr group.
+    """
+    spec_dict = copy.deepcopy(_load_spec_dict(spec))
+    kv = spec_dict.get("kvstore", spec_dict)
+    if isinstance(kv, str):
+        new_kv = re.sub(r"/\d+/?$", f"/{new_level}/", kv.rstrip("/") + "/")
+        if "kvstore" in spec_dict:
+            spec_dict["kvstore"] = new_kv
+        else:
+            return new_kv  # shorthand spec was itself the kvstore string
+    else:
+        path = kv.get("path", "").rstrip("/")
+        kv["path"] = re.sub(r"/\d+$", f"/{new_level}", path) + "/"
+    return spec_dict
+
+
+def _estimate_background(spec, cfg, processing_shape: Tuple[int, int, int]):
+    """Estimate a global flat-field background at the processing-level resolution.
+
+    Reads the whole (small) ``cfg.flatfield_level`` volume, removes sparse bright cells
+    with a grey-opening and optional Gaussian smoothing (so the estimate captures only
+    the low-frequency shading / fusion inhomogeneity), then upsamples it to the
+    processing level's ``(Z, Y, X)``. Returns a host ``float32`` array in raw intensity
+    units, or ``None`` if flat-field is disabled.
+
+    The result is a single global field; PrepWorker slices it by absolute coordinates,
+    so neighboring blocks see identical values and the correction adds no seams.
+    """
+    if not cfg.flatfield:
+        return None
+
+    import cupy as cp
+    import cupyx.scipy.ndimage as cndi
+
+    coarse_spec = _spec_with_level(spec, cfg.flatfield_level)
+    coarse_store = open_ts_spec(coarse_spec)
+    logger.info(
+        "Flat-field: reading coarse level %s shape=%s",
+        cfg.flatfield_level,
+        tuple(coarse_store.domain.shape),
+    )
+    coarse = (
+        coarse_store[cfg.t_idx, cfg.c_idx].read().result().astype("float32", copy=False)
+    )
+    cg = cp.asarray(coarse)
+    if cfg.flatfield_opening_radius > 0:
+        size = 2 * int(cfg.flatfield_opening_radius) + 1
+        cg = cndi.grey_opening(cg, size=(size, size, size))
+    if cfg.flatfield_sigma > 0:
+        cg = cndi.gaussian_filter(cg, sigma=float(cfg.flatfield_sigma))
+
+    zoom = tuple(t / s for t, s in zip(processing_shape, cg.shape))
+    cg = cndi.zoom(cg, zoom, order=1)
+    # Guard against off-by-one from fractional zoom: crop/pad to the exact shape.
+    pz, py, px = processing_shape
+    bg = cp.asnumpy(cg)[:pz, :py, :px]
+    if bg.shape != processing_shape:
+        padded = np.zeros(processing_shape, dtype="float32")
+        padded[: bg.shape[0], : bg.shape[1], : bg.shape[2]] = bg
+        bg = padded
+    logger.info("Flat-field: background field ready shape=%s", bg.shape)
+    return bg
 
 
 def _build_mask_pyramid(
@@ -417,12 +504,24 @@ def _summarize_metrics(path: str) -> None:
     )
 
 
+_FLATFIELD_KEYS = (
+    "flatfield",
+    "flatfield_mode",
+    "flatfield_level",
+    "flatfield_opening_radius",
+    "flatfield_sigma",
+)
+
+
 def _normalization_kwargs(params_json: Optional[str]) -> dict:
-    """Build InferenceConfig normalization kwargs from the params JSON.
+    """Build InferenceConfig normalization + flat-field kwargs from the params JSON.
 
     ``normalize="global"`` avoids the per-block percentile computation that
     bottlenecks prep, but requires literal min/max values (``norm_lower``/
     ``norm_upper``). Defaults to ``normalize="percentile"`` when no keys are given.
+    Flat-field keys (``flatfield``/``flatfield_*``) are passed through verbatim to
+    enable white top-hat background correction; ``flatfield=True`` requires
+    ``flatfield_level``.
     """
     norm = read_pipeline_params(params_json)
     normalize = norm.get("normalize", "percentile")
@@ -438,6 +537,14 @@ def _normalization_kwargs(params_json: Optional[str]) -> dict:
         kwargs["norm_lower"] = norm["norm_lower"]
     if norm.get("norm_upper") is not None:
         kwargs["norm_upper"] = norm["norm_upper"]
+    for key in _FLATFIELD_KEYS:
+        if norm.get(key) is not None:
+            kwargs[key] = norm[key]
+    if kwargs.get("flatfield") and kwargs.get("flatfield_level") is None:
+        raise ValueError(
+            "flatfield=true requires flatfield_level (pyramid level to estimate the "
+            "background from) in --params-json."
+        )
     return kwargs
 
 
@@ -594,6 +701,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     logger.info("Inference config:\n%s", cfg)
 
+    # Optional flat-field background (estimated once at the processing resolution).
+    background = _estimate_background(spec, cfg, (z, y, x))
+
     run(
         model,
         input_store,
@@ -603,6 +713,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         metrics_interval=args.metrics_interval,
         num_prep_workers=max(1, args.prep_workers),
         num_writer_workers=max(1, args.writer_workers),
+        background=background,
     )
     _summarize_metrics(args.metrics_json)
 

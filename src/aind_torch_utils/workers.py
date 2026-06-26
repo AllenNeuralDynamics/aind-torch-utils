@@ -12,6 +12,7 @@ from torch import nn
 
 from aind_torch_utils.accumulators import BlockAccumulator
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.correction import apply_flatfield
 from aind_torch_utils.utils import iter_blocks_zyx, iter_patch_starts
 
 logger = logging.getLogger(__name__)
@@ -140,6 +141,7 @@ class PrepWorker:
         model_patch: Tuple[int, int, int],
         worker_id: int = 0,
         num_workers: int = 1,
+        background: Optional[np.ndarray] = None,
     ):
         """
         Initializes the PrepWorker.
@@ -158,6 +160,13 @@ class PrepWorker:
             The ID of this worker, by default 0.
         num_workers : int, optional
             The total number of preparation workers, by default 1.
+        background : np.ndarray, optional
+            Full processing-level-resolution background field (raw intensity units,
+            shape ``(Z, Y, X)`` matching the reader) for flat-field correction. When
+            ``cfg.flatfield`` is set, each block subtracts (or divides by) the matching
+            absolute-coordinate slice of this global field *before* normalization. The
+            field is global, so adjacent blocks/overlaps see identical values and the
+            correction introduces no seams. ``None`` disables the correction.
         """
         self.cfg = cfg
         self.reader = reader
@@ -166,6 +175,10 @@ class PrepWorker:
         self.full_zyx = self.reader.shape[-3:]
         self.worker_id = worker_id
         self.num_workers = max(1, num_workers)
+        self.background = background
+        # Mean of the background, used to preserve the overall intensity scale in
+        # 'divide' mode (so dividing by the field doesn't rescale the whole volume).
+        self._bg_mean = float(background.mean()) if background is not None else 1.0
 
     def run(self, stop_event: threading.Event) -> None:
         """
@@ -215,6 +228,20 @@ class PrepWorker:
             view = self.reader[t, c, slice(z0e, z1e), slice(y0e, y1e), slice(x0e, x1e)]
             norm_block = view.read().result().astype(np.float32, copy=False)
             bz, by, bx = acc_shape
+
+            # Flat-field / white top-hat correction, applied in raw intensity units
+            # before normalization. The background is a single global field sliced by
+            # absolute coordinates, so neighboring blocks agree exactly on shared
+            # voxels -> no seams.
+            if self.cfg.flatfield and self.background is not None:
+                bg = self.background[z0e:z1e, y0e:y1e, x0e:x1e]
+                norm_block = apply_flatfield(
+                    norm_block,
+                    bg,
+                    mode=self.cfg.flatfield_mode,
+                    eps=self.cfg.eps,
+                    bg_mean=self._bg_mean,
+                )
 
             if self.cfg.normalize == "percentile":
                 block_mn, block_mx = np.percentile(
