@@ -81,6 +81,53 @@ def sample_background(
     return out.astype(np.float32, copy=False)
 
 
+def normalize_global(block, lower: float, upper: float, eps: float = 1e-6):
+    """Clip to ``[lower, upper]`` then affine-scale to ``[0, 1]`` (global norm).
+
+    Mirrors the ``normalize="global"`` branch of ``PrepWorker.run`` so the pipeline and
+    the tuner share one implementation. Uses the array's own ``.clip`` method, so it
+    works on both numpy and cupy arrays without importing either.
+
+    Parameters
+    ----------
+    block : np.ndarray or cupy.ndarray
+        Raw-intensity array.
+    lower, upper : float
+        Global intensity bounds (e.g. dataset-wide percentiles).
+    eps : float
+        Floor for the divisor when ``upper == lower``.
+
+    Returns
+    -------
+    Same array type as ``block``, normalized to ~``[0, 1]``.
+    """
+    scale = max(upper - lower, eps)
+    return (block.clip(lower, upper) - lower) / scale
+
+
+def scale_params(
+    smooth_sigma: Tuple[float, float, float],
+    open_iterations: int,
+    factor: Tuple[float, float, float],
+) -> Tuple[Tuple[float, float, float], int]:
+    """Rescale voxel-unit mask params from a tune level to a target level.
+
+    ``smooth_sigma`` and ``open_iterations`` are measured in voxels, so a value tuned on
+    a coarse level must be multiplied by ``factor = scale_tune / scale_target`` (>= 1
+    when the target level is finer) to represent the same physical size at the target
+    resolution. ``open_iterations`` is an in-plane radius, scaled by the mean of the
+    Y/X factors and rounded. This is approximate (anisotropy, integer rounding).
+
+    Returns
+    -------
+    (scaled_smooth_sigma, scaled_open_iterations)
+    """
+    scaled_sigma = tuple(float(s) * float(f) for s, f in zip(smooth_sigma, factor))
+    yx = (float(factor[1]) + float(factor[2])) / 2.0
+    scaled_open = int(round(open_iterations * yx))
+    return scaled_sigma, scaled_open
+
+
 def apply_flatfield(
     block: np.ndarray,
     background: np.ndarray,

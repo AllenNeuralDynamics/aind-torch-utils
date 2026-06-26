@@ -4,7 +4,9 @@ import numpy as np
 from aind_torch_utils.correction import (
     BackgroundField,
     apply_flatfield,
+    normalize_global,
     sample_background,
+    scale_params,
 )
 
 
@@ -98,6 +100,37 @@ def test_sample_background_seam_free_across_blocks():
     a = sample_background(field, scale, 0, 12, 0, 48, 0, 30)
     b = sample_background(field, scale, 0, 12, 0, 48, 20, 48)
     np.testing.assert_array_equal(a[:, :, 20:30], b[:, :, 0:10])
+
+
+def test_normalize_global_clips_and_scales():
+    vol = np.array([50.0, 90.0, 600.0, 1200.0, 2000.0], dtype=np.float32)
+    out = normalize_global(vol, 90.0, 1200.0, eps=1e-6)
+    # 90 -> 0, 1200 -> 1; below/above clip to the bounds.
+    np.testing.assert_allclose(out[0], 0.0)  # 50 clipped to 90 -> 0
+    np.testing.assert_allclose(out[1], 0.0)  # exactly lower
+    np.testing.assert_allclose(out[3], 1.0)  # exactly upper
+    np.testing.assert_allclose(out[4], 1.0)  # 2000 clipped to 1200 -> 1
+    assert (out >= 0).all() and (out <= 1).all()
+    np.testing.assert_allclose(out[2], (600.0 - 90.0) / (1200.0 - 90.0), rtol=1e-6)
+
+
+def test_normalize_global_eps_guards_zero_range():
+    vol = np.array([5.0, 5.0], dtype=np.float32)
+    out = normalize_global(vol, 5.0, 5.0, eps=1e-6)  # upper == lower
+    assert np.isfinite(out).all()
+
+
+def test_scale_params_scales_sigma_and_open():
+    # Coarse tune -> finer target by 4x in every axis.
+    sigma, op = scale_params((0.5, 1.0, 1.0), 1, (4.0, 4.0, 4.0))
+    assert sigma == (2.0, 4.0, 4.0)
+    assert op == 4  # round(1 * mean(4,4))
+
+
+def test_scale_params_open_rounds_on_yx_only():
+    # Z factor must not affect the in-plane open scaling.
+    _, op = scale_params((1, 1, 1), 2, (10.0, 1.0, 1.0))
+    assert op == 2  # round(2 * mean(1,1))
 
 
 def test_background_field_mean():

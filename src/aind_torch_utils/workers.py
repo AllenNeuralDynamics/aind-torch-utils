@@ -15,6 +15,7 @@ from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.correction import (
     BackgroundField,
     apply_flatfield,
+    normalize_global,
     sample_background,
 )
 from aind_torch_utils.utils import iter_blocks_zyx, iter_patch_starts
@@ -272,11 +273,12 @@ class PrepWorker:
             elif self.cfg.normalize == "global":
                 block_mn = self.cfg.norm_lower
                 block_mx = self.cfg.norm_upper
-                block_scale = max(block_mx - block_mn, self.cfg.eps)
                 # Clip to [p_low, p_high] first, then normalize — matches
-                # PercentileNormalizationd._normalize_channel step order.
-                norm_block = np.clip(norm_block, block_mn, block_mx)
-                norm_block = (norm_block - block_mn) / block_scale
+                # PercentileNormalizationd._normalize_channel step order. Shared with
+                # the tuner via correction.normalize_global to avoid drift.
+                norm_block = normalize_global(
+                    norm_block, block_mn, block_mx, self.cfg.eps
+                )
             else:  # False
                 # Bypass normalization entirely (identity). We pretend (mn,mx)=(0,1)
                 # so the writer performs a no-op inverse transform.
