@@ -164,8 +164,12 @@ def _render_montage(
 
 
 def _scaling_report(
-    bucket: str, group_path: str, tune_level: str, target_level: str,
-    sigmas: List[Tuple[float, float, float]], open_iters: List[int],
+    bucket: str,
+    group_path: str,
+    tune_level: str,
+    target_level: str,
+    sigmas: List[Tuple[float, float, float]],
+    open_iters: List[int],
 ) -> None:
     """Print smooth_sigma/open_iterations scaled from the tune level to the target."""
     ms_info = _read_source_multiscales(bucket, group_path)
@@ -177,7 +181,9 @@ def _scaling_report(
     if tune_level not in by_path or target_level not in by_path:
         logger.warning(
             "Levels %s/%s not both in datasets %s; skipping scaling report.",
-            tune_level, target_level, list(by_path),
+            tune_level,
+            target_level,
+            list(by_path),
         )
         return
     s_tune = _scale_zyx(by_path[tune_level])
@@ -189,14 +195,19 @@ def _scaling_report(
     logger.info(
         "Scaling report: tune level %s -> target level %s, factor (Z,Y,X)=%s "
         "(approximate; round as needed):",
-        tune_level, target_level, tuple(round(f, 3) for f in factor),
+        tune_level,
+        target_level,
+        tuple(round(f, 3) for f in factor),
     )
     for sigma in sigmas:
         for op in open_iters:
             ssig, sop = scale_params(sigma, op, factor)
             logger.info(
                 "  tune (σ=%s, open=%d)  ->  target (σ=%s, open=%d)",
-                sigma, op, tuple(round(s, 2) for s in ssig), sop,
+                sigma,
+                op,
+                tuple(round(s, 2) for s in ssig),
+                sop,
             )
 
 
@@ -216,30 +227,49 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     )
     ap.add_argument("--params-json", default=None, help="normalize/flatfield params.")
     ap.add_argument(
-        "--thresholds", type=float, nargs="+", default=[0.02, 0.05, 0.1],
+        "--thresholds",
+        type=float,
+        nargs="+",
+        default=[0.02, 0.05, 0.1],
         help="Threshold values to sweep (montage rows).",
     )
     ap.add_argument(
-        "--smooth-sigmas", type=_parse_sigma, nargs="+",
+        "--smooth-sigmas",
+        type=_parse_sigma,
+        nargs="+",
         default=[(0.5, 1, 1), (1, 2, 2), (1, 3, 3)],
         help="smooth_sigma 'z,y,x' triples to sweep (montage columns).",
     )
     ap.add_argument(
-        "--open-iterations", type=int, nargs="+", default=[1],
+        "--open-iterations",
+        type=int,
+        nargs="+",
+        default=[1],
         help="open_iterations values; one montage PNG per value.",
     )
     ap.add_argument(
-        "--crop", type=int, nargs=6, default=None,
+        "--crop",
+        type=int,
+        nargs=6,
+        default=None,
         metavar=("Z0", "Z1", "Y0", "Y1", "X0", "X1"),
         help="Optional sub-region (absolute tune-level voxel coords).",
     )
     ap.add_argument("--mip-axis", type=int, default=0, help="MIP axis (0=Z,1=Y,2=X).")
     ap.add_argument(
-        "--sweep-flatfield", action="store_true",
+        "--sweep-flatfield",
+        action="store_true",
         help="Also render a flat-field OFF montage for comparison.",
     )
     ap.add_argument("--out", default="gfp_tune.png", help="Output PNG path (base).")
     ap.add_argument("--aws-region", default="us-west-2")
+    ap.add_argument(
+        "--max-gb", type=float, default=3.0,
+        help=(
+            "Abort if the crop exceeds this many GB (float32). The GPU is the limiter: "
+            "peak VRAM is ~4x the crop, so 3 GB ~= 12 GB on a 16 GB GPU."
+        ),
+    )
     return ap.parse_args(argv)
 
 
@@ -261,6 +291,24 @@ def main(argv: Optional[List[str]] = None) -> None:
         z0, y0, x0 = 0, 0, 0
         z1, y1, x1 = full_shape
     bbox = (z0, z1, y0, y1, x0, x1)
+
+    # Guard against OOM: the crop is held in RAM as float32 and copied to the GPU,
+    # with several more float32 buffers allocated per sweep cell. Abort early with
+    # guidance instead of getting silently Killed.
+    n_vox = (z1 - z0) * (y1 - y0) * (x1 - x0)
+    gb = n_vox * 4 / 1e9
+    logger.info(
+        "Crop %s = %.2f GB float32 (needs ~3-4x that across RAM+GPU).",
+        (z1 - z0, y1 - y0, x1 - x0),
+        gb,
+    )
+    if gb > args.max_gb:
+        raise SystemExit(
+            f"Crop is {gb:.1f} GB (> --max-gb {args.max_gb}). Point --in-spec at a "
+            f"coarser pyramid level (the tuner is meant for a downsampled level) or "
+            f"restrict it with --crop Z0 Z1 Y0 Y1 X0 X1."
+        )
+
     raw = (
         store[cfg.t_idx, cfg.c_idx, z0:z1, y0:y1, x0:x1]
         .read()
@@ -288,14 +336,24 @@ def main(argv: Optional[List[str]] = None) -> None:
                 f"open_iterations={op}  (rows=threshold, cols=smooth_sigma)"
             )
             _render_montage(
-                vol_cp, gray_mip, args.thresholds, args.smooth_sigmas,
-                op, args.mip_axis, out_path, suptitle,
+                vol_cp,
+                gray_mip,
+                args.thresholds,
+                args.smooth_sigmas,
+                op,
+                args.mip_axis,
+                out_path,
+                suptitle,
             )
 
     if args.target_level is not None:
         _scaling_report(
-            bucket, group_path, tune_level, args.target_level,
-            args.smooth_sigmas, args.open_iterations,
+            bucket,
+            group_path,
+            tune_level,
+            args.target_level,
+            args.smooth_sigmas,
+            args.open_iterations,
         )
 
 
