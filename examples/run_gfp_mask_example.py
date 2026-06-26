@@ -564,7 +564,11 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     ap.add_argument(
         "--out-prefix",
         required=True,
-        help="Output written to s3://<out-bucket>/<out-prefix>/gfp_mask.zarr/",
+        help=(
+            "Output written to s3://<out-bucket>/<out-prefix>/<source-tile-name>/, "
+            "where <source-tile-name> mirrors the input dataset group (e.g. "
+            "Tile_X_0002_Y_0006_Z_0000_ch_488.ome.zarr)."
+        ),
     )
     ap.add_argument("--aws-region", default="us-west-2")
     ap.add_argument("--devices", nargs="+", default=["cuda:0"])
@@ -665,7 +669,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         )
 
     # --- Output: segmented level written at the source's level index ---
-    base_path = f"{args.out_prefix.rstrip('/')}/gfp_mask.zarr/"
+    # Mirror the source dataset/tile name (the ".ome.zarr"/".zarr" group), e.g.
+    # ".../Tile_X_0002_Y_0006_Z_0000_ch_488.ome.zarr/0" -> the output group is
+    # "<out-prefix>/Tile_X_0002_Y_0006_Z_0000_ch_488.ome.zarr/".
+    tile_name = group_path.rstrip("/").rsplit("/", 1)[-1]
+    base_path = f"{args.out_prefix.rstrip('/')}/{tile_name}/"
     seg_path = f"{base_path}{level}/"
     chunks = (1, 1, min(128, z), min(128, y), min(128, x))
     logger.info("Creating segmented level: s3://%s/%s", args.out_bucket, seg_path)
