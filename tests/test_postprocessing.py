@@ -53,9 +53,25 @@ def test_create_gfp_mask_gpu_basic():
 def test_threshold_monotonicity():
     # A lower threshold oversegments more (mask grows).
     vol = _synthetic_volume()
-    low = create_gfp_mask_gpu(vol, threshold=0.05)
-    high = create_gfp_mask_gpu(vol, threshold=0.5)
+    low = create_gfp_mask_gpu(vol, threshold=0.05, open_iterations=0)
+    high = create_gfp_mask_gpu(vol, threshold=0.5, open_iterations=0)
     assert int(low.sum()) >= int(high.sum())
+
+
+def test_opening_removes_tiny_dots():
+    # A solid blob plus isolated single-voxel specks above threshold.
+    vol = _synthetic_volume()
+    for cz, cy, cx in [(2, 2, 2), (30, 60, 60), (5, 55, 10)]:
+        vol[cz, cy, cx] = 1.0
+
+    no_clean = create_gfp_mask_gpu(vol, threshold=0.1, open_iterations=0)
+    opened = create_gfp_mask_gpu(vol, threshold=0.1, open_iterations=1)
+
+    # Opening drops the specks (mask shrinks) but keeps the solid blob.
+    assert int(opened.sum()) < int(no_clean.sum())
+    assert int(opened[8, 16, 16]) == 1  # blob center survives
+    for cz, cy, cx in [(2, 2, 2), (30, 60, 60), (5, 55, 10)]:
+        assert int(opened[cz, cy, cx]) == 0  # isolated dots removed
 
 
 def test_gfp_mask_model_roundtrip():
@@ -88,12 +104,12 @@ def test_forward_matches_per_volume_function():
         vols[i] = cp.roll(v, shift=i * 3, axis=0)
     x = torch.stack([torch.as_tensor(v, device="cuda") for v in vols])[:, None]
 
-    model = GfpMaskModel(threshold=0.1)
+    model = GfpMaskModel(threshold=0.1, open_iterations=1)
     batched = model(x)
 
     # Batched forward must equal stacking the single-volume function per volume.
     for b in range(len(vols)):
-        ref = create_gfp_mask_gpu(vols[b], threshold=0.1)
+        ref = create_gfp_mask_gpu(vols[b], threshold=0.1, open_iterations=1)
         assert torch.equal(
             batched[b, 0].cpu(), torch.as_tensor(ref, device="cuda").cpu()
         )
@@ -103,6 +119,7 @@ def test_gfp_mask_model_from_json(tmp_path):
     params = {
         "threshold": 0.2,
         "smooth_sigma": [0.5, 2, 2],
+        "open_iterations": 2,
         # Pipeline-normalization keys live in the same file and must be ignored here.
         "normalize": "global",
         "norm_lower": 90.0,
@@ -115,6 +132,7 @@ def test_gfp_mask_model_from_json(tmp_path):
 
     assert model.threshold == 0.2
     assert model.smooth_sigma == (0.5, 2, 2)  # parsed to tuple
+    assert model.open_iterations == 2
 
 
 def test_gfp_mask_model_from_json_rejects_unknown_key(tmp_path):

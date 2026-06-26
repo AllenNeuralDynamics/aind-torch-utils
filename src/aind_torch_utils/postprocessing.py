@@ -1,11 +1,12 @@
 """GPU-accelerated GFP masking that plugs into the inference pipeline.
 
-Produces a binary GFP mask by light Gaussian smoothing followed by a global intensity
-threshold. The input is assumed already normalized to ~``[0, 1]`` by the pipeline (e.g.
-``normalize="global"`` with dataset-wide ``norm_lower``/``norm_upper``), so the
-threshold is a single value in ``[0, 1]``. There is no connected-component cleanup:
-the mask is intentionally biased toward oversegmentation and the whole op is elementwise
-+ one separable Gaussian, so it runs batched with no device->host syncs.
+Produces a binary GFP mask by light Gaussian smoothing, a global intensity threshold,
+and an optional morphological opening that removes tiny specks. The input is assumed
+already normalized to ~``[0, 1]`` by the pipeline (e.g. ``normalize="global"`` with
+dataset-wide ``norm_lower``/``norm_upper``), so the threshold is a single value in
+``[0, 1]``. The opening is a *local* erosion->dilation (not connected-component
+labeling), so the whole op stays elementwise + separable Gaussian + local morphology
+and runs batched with no device->host syncs, biased toward oversegmentation.
 
 ``cupy`` is imported at module top, so importing this module requires a working CUDA
 install. The module is therefore imported lazily from the registry loader (see
@@ -44,12 +45,14 @@ def create_gfp_mask_gpu(
     img,
     threshold: float = 0.1,
     smooth_sigma: Optional[Tuple[float, float, float]] = (0.5, 1, 1),
+    open_iterations: int = 1,
 ) -> "cp.ndarray":
     """Create a binary GFP mask for a single 3D volume on the GPU.
 
-    Light Gaussian smooth + global threshold; no connected-component / morphology
-    cleanup (biased toward oversegmentation). The input is assumed normalized to
-    ~``[0, 1]`` by the pipeline, so ``threshold`` is a single value in ``[0, 1]``.
+    Light Gaussian smooth + global threshold + optional morphological opening to
+    drop tiny specks (still biased toward oversegmentation). The input is assumed
+    normalized to ~``[0, 1]`` by the pipeline, so ``threshold`` is a single value in
+    ``[0, 1]``.
 
     Parameters
     ----------
@@ -61,6 +64,10 @@ def create_gfp_mask_gpu(
     smooth_sigma : tuple of float, optional
         Gaussian sigma (Z, Y, X) for denoising before thresholding. ``None`` skips
         smoothing.
+    open_iterations : int
+        Iterations of binary opening (erosion->dilation) with a 3x3x3 cube to remove
+        tiny dots after thresholding. ``0`` disables cleanup; higher values remove
+        larger specks. This is a local op (no connected-component labeling).
 
     Returns
     -------
@@ -70,15 +77,20 @@ def create_gfp_mask_gpu(
     x = img.astype(cp.float32)
     if smooth_sigma is not None:
         x = cndi.gaussian_filter(x, sigma=tuple(smooth_sigma))
-    return (x >= threshold).astype(cp.uint8)
+    mask = x >= threshold
+    if open_iterations > 0:
+        struct = cp.ones((3, 3, 3), dtype=bool)  # full 3x3x3 cube
+        mask = cndi.binary_opening(mask, structure=struct, iterations=open_iterations)
+    return mask.astype(cp.uint8)
 
 
 class GfpMaskModel(nn.Module):
     """Pipeline "model" that produces a GFP mask for each volume in a batch.
 
-    Light Gaussian smooth + global threshold, run once over the whole
-    ``(B, 1, Z, Y, X)`` batch (no per-volume loop, no connected-component cleanup).
-    The result equals :func:`create_gfp_mask_gpu` applied to each volume.
+    Light Gaussian smooth + global threshold + optional morphological opening, run
+    once over the whole ``(B, 1, Z, Y, X)`` batch (no per-volume loop, no
+    connected-component labeling). The result equals :func:`create_gfp_mask_gpu`
+    applied to each volume.
 
     Conforms to the inference pipeline's model contract: ``forward`` takes a CUDA
     tensor of shape ``(B, 1, Z, Y, X)`` (normalized to ~``[0, 1]`` by the prep
@@ -93,17 +105,23 @@ class GfpMaskModel(nn.Module):
         ``>= threshold`` are foreground; lower values oversegment more.
     smooth_sigma : tuple of float, optional
         Gaussian sigma (Z, Y, X) for denoising before thresholding. ``None`` skips it.
+    open_iterations : int
+        Iterations of binary opening (erosion->dilation) with a 3x3x3 cube to remove
+        tiny dots after thresholding. ``0`` disables cleanup; higher values remove
+        larger specks.
     """
 
     def __init__(
         self,
         threshold: float = 0.1,
         smooth_sigma: Optional[Tuple[float, float, float]] = (0.5, 1, 1),
+        open_iterations: int = 1,
     ):
         """Store masking parameters (no learnable state)."""
         super().__init__()
         self.threshold = threshold
         self.smooth_sigma = smooth_sigma
+        self.open_iterations = open_iterations
 
     @classmethod
     def from_json(cls, path: str) -> "GfpMaskModel":
@@ -154,7 +172,15 @@ class GfpMaskModel(nn.Module):
                 # Zero sigma on the batch/channel axes prevents bleed across volumes,
                 # so the batched smooth is identical to processing each independently.
                 vol = cndi.gaussian_filter(vol, sigma=(0, 0) + tuple(self.smooth_sigma))
-            mask = (vol >= self.threshold).astype(cp.uint8)
+            mask = vol >= self.threshold  # bool, (B, 1, Z, Y, X)
+            if self.open_iterations > 0:
+                # Unit extent on the batch/channel axes confines the opening to each
+                # volume's (Z, Y, X), so the batched result matches per-volume.
+                struct = cp.ones((1, 1, 3, 3, 3), dtype=bool)
+                mask = cndi.binary_opening(
+                    mask, structure=struct, iterations=self.open_iterations
+                )
+            mask = mask.astype(cp.uint8)
             # Clone into a torch-owned tensor so the cupy memory pool can't reclaim
             # the buffer while the writer's async D2H copy is still in flight.
             # torch.from_dlpack consumes cupy's __dlpack__ directly (no .toDlpack()).
