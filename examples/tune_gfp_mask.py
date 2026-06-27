@@ -21,15 +21,17 @@ Example::
     python examples/tune_gfp_mask.py \\
         --in-spec /scratch/seg_tile_spec.json --params-json /scratch/params.json \\
         --thresholds 0.02 0.05 0.1 --smooth-sigmas 0.5,1,1 1,2,2 1,3,3 \\
-        --open-iterations 0 1 --target-level 0 --ortho --rotate 24 --out tune.png
+        --open-iterations 0 1 --target-level 0 --ortho --rotate 24 --out tune
 
-``--ortho`` adds XY/XZ/YZ projection montages (depth via three views); ``--rotate N``
-saves a rotating-MIP GIF (parallax depth) for the first swept param set.
+All outputs go into the ``--out`` folder. ``--ortho`` adds XY/XZ/YZ projection montages
+(depth via three views); ``--rotate N`` writes N rotating-MIP overlay PNG frames
+(parallax depth) per param combo into a ``rotate_*`` subfolder.
 
 Requires the ``postprocess`` (cupy) + ``extras`` (matplotlib) optional dependencies.
 """
 import argparse
 import logging
+import os
 import re
 import sys
 from typing import List, Optional, Tuple
@@ -179,29 +181,29 @@ def _render_montage(
     logger.info("Wrote %s", out_path)
 
 
-def _render_rotation(
+def _render_rotation_frames(
     vol_cp,
     threshold: float,
     sigma: Tuple[float, float, float],
     open_it: int,
     n_frames: int,
-    out_path: str,
+    frame_dir: str,
 ) -> None:
-    """Save a rotating-MIP GIF for a single param set (parallax -> 3D perception).
+    """Save rotating-MIP overlay PNG frames for one param set into ``frame_dir``.
 
     Spins the volume about the vertical (y) axis; for each angle it rotates, recomputes
-    the mask, and MIPs both along z. Frames are rendered sequentially so peak GPU memory
-    stays near one extra volume.
+    the mask, MIPs both along z, and writes ``angle_###.png``. Frames are rendered
+    sequentially so peak GPU memory stays near one extra volume.
     """
     import cupyx.scipy.ndimage as cndi  # GPU only; lazy import
 
     try:
         from PIL import Image
     except ImportError:
-        logger.warning("Pillow not installed; skipping rotation GIF %s", out_path)
+        logger.warning("Pillow not installed; skipping rotation frames %s", frame_dir)
         return
 
-    frames = []
+    os.makedirs(frame_dir, exist_ok=True)
     for i in range(n_frames):
         angle = i * 360.0 / n_frames
         rot = cndi.rotate(vol_cp, angle, axes=(0, 2), reshape=False, order=1)
@@ -210,15 +212,44 @@ def _render_rotation(
         )
         gray = cp.asnumpy(rot.max(axis=0))
         mask_mip = cp.asnumpy(mask.max(axis=0))
-        frames.append(Image.fromarray(_overlay_rgb(gray, mask_mip)))
-    frames[0].save(
-        out_path,
-        save_all=True,
-        append_images=frames[1:],
-        duration=120,
-        loop=0,
-    )
-    logger.info("Wrote %s (%d frames)", out_path, n_frames)
+        frame = Image.fromarray(_overlay_rgb(gray, mask_mip))
+        frame.save(os.path.join(frame_dir, f"angle_{i:03d}.png"))
+    logger.info("Wrote %d rotation frames to %s/", n_frames, frame_dir)
+
+
+def _render_for_ff(vol, ff_tag, tune_level, out_dir, axes_list, axis_tag, args) -> None:
+    """Render all montages (+ optional rotation frames) for one flat-field setting."""
+    vol_cp = cp.asarray(vol)
+    for op in args.open_iterations:
+        for ax in axes_list:
+            gray_mip = vol.max(axis=ax)
+            suffix = f"{ff_tag}_open{op}_{axis_tag[ax]}"
+            suptitle = (
+                f"level {tune_level}  flatfield={'on' if ff_tag == 'ff' else 'off'}"
+                f"  open={op}  proj={axis_tag[ax]}  (rows=threshold, cols=sigma)"
+            )
+            _render_montage(
+                vol_cp,
+                gray_mip,
+                args.thresholds,
+                args.smooth_sigmas,
+                op,
+                ax,
+                os.path.join(out_dir, f"montage_{suffix}.png"),
+                suptitle,
+            )
+    # Rotation: PNG frames per parameter combo, each in its own subfolder.
+    if args.rotate > 0:
+        for thr in args.thresholds:
+            for sigma in args.smooth_sigmas:
+                for op in args.open_iterations:
+                    sig_tag = "x".join(f"{s:g}" for s in sigma)
+                    frame_dir = os.path.join(
+                        out_dir, f"rotate_{ff_tag}_thr{thr:g}_sig{sig_tag}_open{op}"
+                    )
+                    _render_rotation_frames(
+                        vol_cp, thr, sigma, op, args.rotate, frame_dir
+                    )
 
 
 def _scaling_report(
@@ -341,15 +372,20 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "--rotate",
         type=int,
         default=0,
-        help="If >0, also save a rotating-MIP GIF (N frames over 360deg) for the first "
-        "swept param set, for pseudo-3D depth perception.",
+        help="If >0, save N rotating-MIP overlay PNG frames (over 360deg) per param "
+        "combo, each in its own rotate_* subfolder, for pseudo-3D depth perception.",
     )
     ap.add_argument(
         "--sweep-flatfield",
         action="store_true",
         help="Also render a flat-field OFF montage for comparison.",
     )
-    ap.add_argument("--out", default="gfp_tune.png", help="Output PNG path (base).")
+    ap.add_argument(
+        "--out",
+        default="gfp_tune",
+        help="Output folder (a trailing '.png' is stripped). Montages + rotation "
+        "frame subfolders are written inside it.",
+    )
     ap.add_argument("--aws-region", default="us-west-2")
     ap.add_argument(
         "--max-gb",
@@ -412,50 +448,30 @@ def main(argv: Optional[List[str]] = None) -> None:
     if args.sweep_flatfield and cfg.flatfield:
         ff_settings.append(False)
 
-    base = args.out[:-4] if args.out.lower().endswith(".png") else args.out
+    # All outputs go into one folder derived from --out (".png" stripped).
+    out_dir = args.out[:-4] if args.out.lower().endswith(".png") else args.out
+    os.makedirs(out_dir, exist_ok=True)
+    logger.info("Writing outputs to %s/", out_dir)
     # --ortho renders all three projections; otherwise just the requested axis.
     axis_tag = {0: "xy", 1: "xz", 2: "yz"}
     axes_list = [0, 1, 2] if args.ortho else [args.mip_axis]
+    if args.rotate > 0:
+        n_rot = (
+            len(args.thresholds)
+            * len(args.smooth_sigmas)
+            * len(args.open_iterations)
+            * len(ff_settings)
+        )
+        logger.info(
+            "Rotation enabled: %d param combos x %d frames each (reduce sweep lists "
+            "if this is too many).",
+            n_rot,
+            args.rotate,
+        )
     for use_ff in ff_settings:
         vol = _preprocess(spec, cfg, raw, bbox, full_shape, use_ff)
-        vol_cp = cp.asarray(vol)
         ff_tag = "ff" if (use_ff and cfg.flatfield) else "noff"
-        for op in args.open_iterations:
-            for ax in axes_list:
-                gray_mip = vol.max(axis=ax)
-                suffix = f"{ff_tag}_open{op}_{axis_tag[ax]}"
-                out_path = f"{base}_{suffix}.png"
-                suptitle = (
-                    f"level {tune_level}  flatfield={'on' if ff_tag == 'ff' else 'off'}"
-                    f"  open={op}  proj={axis_tag[ax]}  (rows=threshold, cols=sigma)"
-                )
-                _render_montage(
-                    vol_cp,
-                    gray_mip,
-                    args.thresholds,
-                    args.smooth_sigmas,
-                    op,
-                    ax,
-                    out_path,
-                    suptitle,
-                )
-        if args.rotate > 0:
-            # Inspect a single param set (first of each sweep list) in 3D-ish rotation.
-            thr0, sig0, op0 = (
-                args.thresholds[0],
-                args.smooth_sigmas[0],
-                args.open_iterations[0],
-            )
-            logger.info(
-                "Rotation GIF for thr=%g σ=%s open=%d (pass single-element sweeps to "
-                "inspect a specific set)",
-                thr0,
-                sig0,
-                op0,
-            )
-            _render_rotation(
-                vol_cp, thr0, sig0, op0, args.rotate, f"{base}_{ff_tag}_rotate.gif"
-            )
+        _render_for_ff(vol, ff_tag, tune_level, out_dir, axes_list, axis_tag, args)
 
     if args.target_level is not None:
         _scaling_report(
