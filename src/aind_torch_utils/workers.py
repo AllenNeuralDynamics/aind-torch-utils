@@ -34,7 +34,11 @@ class Batch:
         List of (z, y, x) start coordinates for each patch in the batch,
         relative to the expanded block.
     host_in : torch.Tensor
-        The input tensor of patches, pinned to host memory.
+        The input tensor of patches, pinned to host memory. When compiling
+        (cfg.use_compile), tail batches are zero-padded up to batch_size so
+        the model sees a constant input shape, and rows beyond
+        len(starts_in_block) are padding. In eager mode it has exactly
+        len(starts_in_block) rows.
     valid_sizes : List[Tuple[int, int, int]]
         List of (dz, dy, dx) valid dimensions for each patch, handling
         boundary conditions.
@@ -260,10 +264,18 @@ class PrepWorker:
             # batch over those starts
             for i in range(0, total_patches, self.cfg.batch_size):
                 batch_starts = starts[i : i + self.cfg.batch_size]
-                B = len(batch_starts)
+                n_real = len(batch_starts)
                 pin_memory = any("cuda" in d for d in self.cfg.devices)
+                # When compiling, pad the tail batch up to batch_size so the
+                # model always sees a constant input shape; this prevents
+                # torch.compile from recompiling at runtime (not thread-safe
+                # across GPU workers). Writers ignore padded rows since they
+                # only index rows in starts_in_block. In eager mode there is
+                # no shape constraint, so allocate exactly n_real rows and
+                # avoid wasting compute and copy bandwidth on padding.
+                n_rows = self.cfg.batch_size if self.cfg.use_compile else n_real
                 host_in = torch.zeros(
-                    (B, 1, pz, py, px),
+                    (n_rows, 1, pz, py, px),
                     dtype=torch.float16 if self.cfg.amp else torch.float32,
                     pin_memory=pin_memory,
                 )
@@ -351,18 +363,68 @@ class GpuWorker:
         self.copy_stream = torch.cuda.Stream(device=self.device)
 
         if getattr(torch, "compile", None) and self.cfg.use_compile:
+            self._compile_model()
+
+    def _autocast_context(self):
+        return (
+            torch.autocast(device_type="cuda", dtype=torch.float16)
+            if self.cfg.amp
+            else nullcontext()
+        )
+
+    def _compile_model(self) -> None:
+        # Keep a handle to the original module so we can fall back to eager
+        # execution if compilation fails. torch.compile returns a new wrapper
+        # and does not mutate the original, so this reference stays valid.
+        eager_model = self.model
+        try:
             try:
-                # dynamic=True avoids recompiles when the final batch is smaller
+                # PrepWorker pads tail batches to batch_size, so input shapes
+                # are constant and no runtime recompiles are expected
+                # regardless of the `dynamic` setting.
                 self.model = torch.compile(
                     self.model,
                     mode=self.cfg.compile_mode,
                     dynamic=self.cfg.compile_dynamic,
                 )
-                logger.info("Successfully compiled model.")
+                logger.info("Compiled model on %s.", self.device)
             except TypeError:
                 # older PyTorch without `dynamic` kwarg
                 self.model = torch.compile(self.model, mode=self.cfg.compile_mode)
-                logger.info("Successfully compiled model (older pytorch).")
+                logger.info("Compiled model on %s (older pytorch).", self.device)
+
+            # Compilation is lazy: the graph is traced on the first forward,
+            # so tracing/guard errors surface here in warmup, not above.
+            self._warmup_compiled_model()
+        except Exception as exc:
+            # Some models do host-side numpy/Python work in forward that
+            # dynamo cannot trace. Fall back to eager so the run proceeds
+            # instead of aborting. Warmup runs on the main thread, so this
+            # also keeps the failure off the worker threads.
+            logger.warning(
+                "torch.compile failed on %s (%s); falling back to eager "
+                "execution.",
+                self.device,
+                type(exc).__name__,
+                exc_info=True,
+            )
+            self.model = eager_model
+
+    def _warmup_compiled_model(self) -> None:
+        torch.cuda.set_device(self.device)
+        dtype = torch.float16 if self.cfg.amp else torch.float32
+        shape = (self.cfg.batch_size, 1, *self.cfg.patch)
+        warmup_in = torch.zeros(shape, dtype=dtype, device=self.device)
+
+        logger.info(
+            "Warming compiled model on %s with shape %s.", self.device, shape
+        )
+        with torch.inference_mode():
+            with self._autocast_context():
+                warmup_out = self.model(warmup_in)
+        torch.cuda.synchronize(self.device)
+        del warmup_in, warmup_out
+        logger.info("Finished compiled model warmup on %s.", self.device)
 
     def run(self, stop_event: threading.Event) -> None:
         """
@@ -376,11 +438,7 @@ class GpuWorker:
         stop_event : threading.Event
             An event that signals the worker to stop.
         """
-        autocast_ctx = (
-            torch.autocast(device_type="cuda", dtype=torch.float16)
-            if self.cfg.amp
-            else nullcontext()
-        )
+        autocast_ctx = self._autocast_context()
 
         # Ensure the current device matches self.device for streams/events
         torch.cuda.set_device(self.device)
