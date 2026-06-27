@@ -3,8 +3,9 @@
 Runs the *exact same* GPU mask chain as the pipeline (``create_gfp_mask_gpu``: smooth +
 threshold + opening, optionally preceded by flat-field correction + global
 normalization) over a small coarse pyramid level, and renders a montage of
-maximum-intensity-projection (MIP) overlays — red mask over grayscale signal — for a
-grid of ``threshold`` x ``smooth_sigma`` values (one montage per ``open_iterations``).
+maximum-intensity-projection (MIP) overlays — the mask depth-coded (turbo, near->far)
+over the grayscale signal (use ``--flat-mask`` for plain red) — for a grid of
+``threshold`` x ``smooth_sigma`` values (one montage per ``open_iterations``).
 This lets you pick mask parameters by eye in seconds instead of running the full
 pipeline.
 
@@ -126,26 +127,62 @@ def _preprocess(
     return _apply_normalization(vol, cfg)
 
 
-def _overlay_rgb(gray: np.ndarray, mask_mip: np.ndarray) -> np.ndarray:
-    """Build an (H, W, 3) uint8 image: grayscale signal with mask in translucent red.
+def _mip_and_depth(mask, axis: int):
+    """Project a 3D mask: return (binary MIP, normalized centroid-depth) as numpy.
 
-    Min-max normalizes ``gray`` for display, then blends red (alpha 0.5) where the mask
-    MIP is positive. Used by both the montage cells and the rotation GIF frames.
+    ``depth`` is the intensity-weighted mean index of the foreground along ``axis``
+    (the mask's centroid in depth for each output pixel), normalized to ``[0, 1]``
+    (near -> far). Only meaningful where the MIP is positive.
+    """
+    length = mask.shape[axis]
+    mask_mip = mask.max(axis=axis)
+    shape = [1, 1, 1]
+    shape[axis] = length
+    idx = cp.arange(length, dtype=cp.float32).reshape(shape)
+    mf = mask.astype(cp.float32)
+    msum = mf.sum(axis=axis)
+    depth = (mf * idx).sum(axis=axis) / cp.maximum(msum, 1.0)
+    depth_norm = depth / max(length - 1, 1)
+    return cp.asnumpy(mask_mip), cp.asnumpy(depth_norm)
+
+
+def _overlay_rgb(
+    gray: np.ndarray,
+    mask_mip: np.ndarray,
+    depth_norm: Optional[np.ndarray] = None,
+    alpha: float = 0.6,
+    cmap_name: str = "turbo",
+) -> np.ndarray:
+    """Build an (H, W, 3) uint8 image: grayscale signal with the mask overlaid.
+
+    Min-max normalizes ``gray`` for display, then blends the mask on top where
+    ``mask_mip`` is positive. If ``depth_norm`` is given, the mask is depth-coded via
+    ``cmap_name`` (near -> far); otherwise it is flat red. Used by montage cells and
+    rotation frames.
     """
     g = gray.astype(np.float32)
     lo, hi = float(g.min()), float(g.max())
     g = (g - lo) / (hi - lo) if hi > lo else np.zeros_like(g)
     rgb = np.repeat(g[..., None], 3, axis=2)  # grayscale base
-    m = (mask_mip > 0).astype(np.float32) * 0.5  # red alpha
-    rgb[..., 0] = rgb[..., 0] * (1.0 - m) + m  # blend pure red into R
-    rgb[..., 1] = rgb[..., 1] * (1.0 - m)
-    rgb[..., 2] = rgb[..., 2] * (1.0 - m)
+    if depth_norm is not None:
+        color = plt.get_cmap(cmap_name)(np.clip(depth_norm, 0.0, 1.0))[..., :3]
+    else:
+        color = np.zeros(rgb.shape, dtype=np.float32)
+        color[..., 0] = 1.0  # flat red
+    a = (mask_mip > 0).astype(np.float32)[..., None] * alpha
+    rgb = rgb * (1.0 - a) + color * a
     return (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)
 
 
-def _overlay(ax, gray: np.ndarray, mask_mip: np.ndarray, title: str) -> None:
-    """Draw a grayscale MIP with the mask MIP overlaid in translucent red."""
-    ax.imshow(_overlay_rgb(gray, mask_mip))
+def _overlay(
+    ax,
+    gray: np.ndarray,
+    mask_mip: np.ndarray,
+    title: str,
+    depth_norm: Optional[np.ndarray] = None,
+) -> None:
+    """Draw a grayscale MIP with the (optionally depth-coded) mask overlaid."""
+    ax.imshow(_overlay_rgb(gray, mask_mip, depth_norm))
     ax.set_title(title, fontsize=8)
     ax.axis("off")
 
@@ -159,8 +196,13 @@ def _render_montage(
     mip_axis: int,
     out_path: str,
     suptitle: str,
+    depth_color: bool = True,
 ) -> None:
-    """Sweep threshold x smooth_sigma at a fixed open_iters; save one montage PNG."""
+    """Sweep threshold x smooth_sigma at a fixed open_iters; save one montage PNG.
+
+    When ``depth_color`` is set the mask is depth-coded (turbo, near->far) along the
+    projection axis; otherwise it is flat red.
+    """
     nrows, ncols = len(thresholds), len(sigmas)
     fig, axes = plt.subplots(
         nrows, ncols, figsize=(3.0 * ncols, 3.0 * nrows), squeeze=False
@@ -171,9 +213,12 @@ def _render_montage(
                 vol_cp, threshold=thr, smooth_sigma=sigma, open_iterations=open_iters
             )
             fg = float(mask.mean())
-            mask_mip = cp.asnumpy(mask.max(axis=mip_axis))
+            if depth_color:
+                mask_mip, depth_norm = _mip_and_depth(mask, mip_axis)
+            else:
+                mask_mip, depth_norm = cp.asnumpy(mask.max(axis=mip_axis)), None
             title = f"thr={thr:g} σ={sigma} fg={fg:.3f}"
-            _overlay(axes[r][c], gray_mip, mask_mip, title)
+            _overlay(axes[r][c], gray_mip, mask_mip, title, depth_norm)
     fig.suptitle(suptitle, fontsize=10)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(out_path, dpi=120)
@@ -188,12 +233,14 @@ def _render_rotation_frames(
     open_it: int,
     n_frames: int,
     frame_dir: str,
+    depth_color: bool = True,
 ) -> None:
     """Save rotating-MIP overlay PNG frames for one param set into ``frame_dir``.
 
     Spins the volume about the vertical (y) axis; for each angle it rotates, recomputes
-    the mask, MIPs both along z, and writes ``angle_###.png``. Frames are rendered
-    sequentially so peak GPU memory stays near one extra volume.
+    the mask, MIPs both along z, and writes ``angle_###.png`` (mask depth-coded along z
+    when ``depth_color`` is set). Frames are rendered sequentially so peak GPU memory
+    stays near one extra volume.
     """
     import cupyx.scipy.ndimage as cndi  # GPU only; lazy import
 
@@ -211,8 +258,11 @@ def _render_rotation_frames(
             rot, threshold=threshold, smooth_sigma=sigma, open_iterations=open_it
         )
         gray = cp.asnumpy(rot.max(axis=0))
-        mask_mip = cp.asnumpy(mask.max(axis=0))
-        frame = Image.fromarray(_overlay_rgb(gray, mask_mip))
+        if depth_color:
+            mask_mip, depth_norm = _mip_and_depth(mask, 0)
+        else:
+            mask_mip, depth_norm = cp.asnumpy(mask.max(axis=0)), None
+        frame = Image.fromarray(_overlay_rgb(gray, mask_mip, depth_norm))
         frame.save(os.path.join(frame_dir, f"angle_{i:03d}.png"))
     logger.info("Wrote %d rotation frames to %s/", n_frames, frame_dir)
 
@@ -220,6 +270,8 @@ def _render_rotation_frames(
 def _render_for_ff(vol, ff_tag, tune_level, out_dir, axes_list, axis_tag, args) -> None:
     """Render all montages (+ optional rotation frames) for one flat-field setting."""
     vol_cp = cp.asarray(vol)
+    depth_color = not args.flat_mask
+    depth_note = "  mask depth-coded (turbo near->far)" if depth_color else ""
     for op in args.open_iterations:
         for ax in axes_list:
             gray_mip = vol.max(axis=ax)
@@ -227,6 +279,7 @@ def _render_for_ff(vol, ff_tag, tune_level, out_dir, axes_list, axis_tag, args) 
             suptitle = (
                 f"level {tune_level}  flatfield={'on' if ff_tag == 'ff' else 'off'}"
                 f"  open={op}  proj={axis_tag[ax]}  (rows=threshold, cols=sigma)"
+                f"{depth_note}"
             )
             _render_montage(
                 vol_cp,
@@ -237,6 +290,7 @@ def _render_for_ff(vol, ff_tag, tune_level, out_dir, axes_list, axis_tag, args) 
                 ax,
                 os.path.join(out_dir, f"montage_{suffix}.png"),
                 suptitle,
+                depth_color,
             )
     # Rotation: PNG frames per parameter combo, each in its own subfolder.
     if args.rotate > 0:
@@ -248,7 +302,7 @@ def _render_for_ff(vol, ff_tag, tune_level, out_dir, axes_list, axis_tag, args) 
                         out_dir, f"rotate_{ff_tag}_thr{thr:g}_sig{sig_tag}_open{op}"
                     )
                     _render_rotation_frames(
-                        vol_cp, thr, sigma, op, args.rotate, frame_dir
+                        vol_cp, thr, sigma, op, args.rotate, frame_dir, depth_color
                     )
 
 
@@ -363,6 +417,11 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         help="Optional sub-region (absolute tune-level voxel coords).",
     )
     ap.add_argument("--mip-axis", type=int, default=0, help="MIP axis (0=Z,1=Y,2=X).")
+    ap.add_argument(
+        "--flat-mask",
+        action="store_true",
+        help="Overlay the mask in flat red instead of depth-coding it by z (turbo).",
+    )
     ap.add_argument(
         "--ortho",
         action="store_true",
