@@ -68,6 +68,18 @@ is the coarse level the background is estimated from; ``flatfield_opening_radius
 (coarse voxels) strips sparse cells from the estimate; ``flatfield_mode`` may be
 ``"subtract"`` (default, white top-hat) or ``"divide"`` (multiplicative shading).
 
+For *per-tile* flooding at full-volume scale (whole fused tiles segmented), use
+``normalize="adaptive"`` instead: the model is fed a per-voxel local z-score
+``(img - B) / S`` (B/S estimated once at a coarse level, sampled per-block, seam-free),
+so the threshold adapts per tile. ``threshold`` is then a z-score ``k`` (~2-4). Add::
+
+    {"normalize": "adaptive", "adaptive_level": 6, "adaptive_radius": 8,
+     "adaptive_bg_pct": 25.0, "adaptive_hi_pct": 95.0,
+     "threshold": 3.0, "smooth_sigma": [0.5, 1, 1], "open_iterations": 1}
+
+``adaptive_radius`` (coarse voxels) is the local window; keep it smaller than a fusion
+tile but larger than a neuron cross-section. ``adaptive_*`` subsumes flat-field.
+
 Performance
 -----------
 The gfp-mask "model" is a classical cupy routine, not a deep net. Its
@@ -119,6 +131,9 @@ DEFAULT_IN_SPEC = {
     },
 }
 DOWNSAMPLE_METHOD = "max"  # keeps coarser mask levels strictly binary
+# Max per-axis size for the (low-frequency) flat-field estimate; larger coarse levels
+# are stride-subsampled to this before the GPU morphology, to avoid OOM.
+FLATFIELD_MAX_DIM = 256
 MAX_INFLIGHT = 8  # concurrent downsample chunks (peak RAM ~ MAX_INFLIGHT x chunk)
 
 logging.basicConfig(
@@ -238,50 +253,96 @@ def _spec_with_level(spec, new_level) -> dict:
     return spec_dict
 
 
+def _np_from_cupy(arr):
+    """Move a cupy array to host numpy (lazy cupy import; GPU only)."""
+    import cupy as cp
+
+    return cp.asnumpy(arr)
+
+
+def _read_coarse_subsampled(spec, cfg, level: int):
+    """Read a coarse pyramid level onto the GPU as float32, capped to a safe size.
+
+    Reads in the native dtype (e.g. uint16) to keep the host footprint small, stride-
+    subsamples to <= ``FLATFIELD_MAX_DIM`` per axis (the estimate is low-frequency, so
+    no detail is lost) and only then casts the small array to float32 on the GPU.
+    Returns ``(cg, step)`` where ``cg`` is the cupy float32 array and ``step`` is the
+    stride applied (so radii/windows can be divided by it to preserve physical extent).
+    """
+    import cupy as cp
+
+    coarse_store = open_ts_spec(_spec_with_level(spec, level))
+    coarse = coarse_store[cfg.t_idx, cfg.c_idx].read().result()  # native dtype
+    logger.info(
+        "Estimate: read coarse level %s shape=%s dtype=%s (~%.2f GB)",
+        level,
+        coarse.shape,
+        coarse.dtype,
+        coarse.nbytes / 1e9,
+    )
+    step = max(1, (max(coarse.shape) + FLATFIELD_MAX_DIM - 1) // FLATFIELD_MAX_DIM)
+    if step > 1:
+        coarse = coarse[::step, ::step, ::step]
+        logger.info("Estimate: subsampled to %s (stride %d) to fit the GPU.",
+                    coarse.shape, step)
+    return cp.asarray(coarse).astype(cp.float32), step
+
+
 def _estimate_background(spec, cfg, processing_shape: Tuple[int, int, int]):
     """Estimate a coarse global flat-field background for white top-hat correction.
 
-    Reads the whole (small) ``cfg.flatfield_level`` volume and removes sparse bright
-    cells with a grey-opening + optional Gaussian smoothing, so the estimate captures
-    only the low-frequency shading / fusion inhomogeneity. The field is kept at the
-    *coarse* resolution (a few MB) and interpolated up per-block inside PrepWorker, so
-    the full-resolution background of the whole volume is never materialized (which
-    would be tens of GB at fine processing levels). Returns a :class:`BackgroundField`
-    (coarse array + processing/coarse scale per axis), or ``None`` if disabled.
-
-    The field is global and sampled by absolute coordinates, so neighboring blocks see
-    identical values and the correction adds no seams.
+    Removes sparse bright cells with a grey-opening + optional Gaussian smoothing on a
+    coarse level so the estimate captures only the low-frequency shading / fusion
+    inhomogeneity, then keeps it at coarse resolution (interpolated per-block in
+    PrepWorker -> seam-free). Returns a :class:`BackgroundField`, or ``None`` if
+    flat-field is disabled.
     """
     if not cfg.flatfield:
         return None
 
-    import cupy as cp
     import cupyx.scipy.ndimage as cndi
 
-    coarse_spec = _spec_with_level(spec, cfg.flatfield_level)
-    coarse_store = open_ts_spec(coarse_spec)
-    logger.info(
-        "Flat-field: reading coarse level %s shape=%s",
-        cfg.flatfield_level,
-        tuple(coarse_store.domain.shape),
-    )
-    coarse = (
-        coarse_store[cfg.t_idx, cfg.c_idx].read().result().astype("float32", copy=False)
-    )
-    cg = cp.asarray(coarse)
-    if cfg.flatfield_opening_radius > 0:
-        size = 2 * int(cfg.flatfield_opening_radius) + 1
+    cg, step = _read_coarse_subsampled(spec, cfg, cfg.flatfield_level)
+    radius = int(round(cfg.flatfield_opening_radius / step))
+    if cfg.flatfield_opening_radius > 0 and radius > 0:
+        size = 2 * radius + 1
         cg = cndi.grey_opening(cg, size=(size, size, size))
     if cfg.flatfield_sigma > 0:
-        cg = cndi.gaussian_filter(cg, sigma=float(cfg.flatfield_sigma))
+        cg = cndi.gaussian_filter(cg, sigma=float(cfg.flatfield_sigma) / step)
 
-    field = cp.asnumpy(cg)
-    # Processing-level voxels per coarse voxel, per axis.
+    field = _np_from_cupy(cg)
     scale = tuple(float(p) / float(c) for p, c in zip(processing_shape, field.shape))
     logger.info(
         "Flat-field: coarse background ready shape=%s scale=%s", field.shape, scale
     )
     return BackgroundField(field=field, scale=scale)
+
+
+def _estimate_local_stats(spec, cfg, processing_shape: Tuple[int, int, int]):
+    """Estimate coarse local background ``B`` and spread ``S`` for adaptive threshold.
+
+    ``B`` is a low-percentile filter (robust background floor; edge-preserving, so it
+    follows sharp per-tile fusion steps without knowing the tile grid) and
+    ``S = hi_pct - bg_pct`` is a robust local spread (scales with gain). Both stay at
+    coarse resolution and are sampled per-block in PrepWorker (seam-free). The model
+    thresholds the local z-score ``(img - B) / S`` at ``threshold`` (a z-score k).
+    Returns a :class:`BackgroundField` carrying both ``field=B`` and ``spread=S``.
+    """
+    import cupyx.scipy.ndimage as cndi
+
+    cg, step = _read_coarse_subsampled(spec, cfg, cfg.adaptive_level)
+    win = 2 * max(1, int(round(cfg.adaptive_radius / step))) + 1
+    bg = cndi.percentile_filter(cg, float(cfg.adaptive_bg_pct), size=win)
+    hi = cndi.percentile_filter(cg, float(cfg.adaptive_hi_pct), size=win)
+    spread = hi - bg
+
+    bg_np = _np_from_cupy(bg)
+    spread_np = _np_from_cupy(spread)
+    scale = tuple(float(p) / float(c) for p, c in zip(processing_shape, bg_np.shape))
+    logger.info(
+        "Adaptive: B/S fields ready shape=%s win=%d scale=%s", bg_np.shape, win, scale
+    )
+    return BackgroundField(field=bg_np, scale=scale, spread=spread_np)
 
 
 def _build_mask_pyramid(
@@ -508,6 +569,10 @@ _FLATFIELD_KEYS = (
     "flatfield_level",
     "flatfield_opening_radius",
     "flatfield_sigma",
+    "adaptive_level",
+    "adaptive_radius",
+    "adaptive_bg_pct",
+    "adaptive_hi_pct",
 )
 
 
@@ -529,6 +594,11 @@ def _normalization_kwargs(params_json: Optional[str]) -> dict:
         raise ValueError(
             "normalize='global' requires norm_lower and norm_upper (global min/max) "
             "in --params-json."
+        )
+    if normalize == "adaptive" and norm.get("adaptive_level") is None:
+        raise ValueError(
+            "normalize='adaptive' requires adaptive_level (pyramid level to estimate "
+            "the local B/S fields from) in --params-json."
         )
     kwargs = {"normalize": normalize}
     if norm.get("norm_lower") is not None:
@@ -707,8 +777,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     logger.info("Inference config:\n%s", cfg)
 
-    # Optional flat-field background (estimated once at the processing resolution).
-    background = _estimate_background(spec, cfg, (z, y, x))
+    # Coarse fields, estimated once and sampled per-block (seam-free): adaptive local
+    # stats (B + spread) for normalize="adaptive", else the optional flat-field bg.
+    if cfg.normalize == "adaptive":
+        background = _estimate_local_stats(spec, cfg, (z, y, x))
+    else:
+        background = _estimate_background(spec, cfg, (z, y, x))
 
     run(
         model,

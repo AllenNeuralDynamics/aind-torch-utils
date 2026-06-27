@@ -4,6 +4,7 @@ import numpy as np
 from aind_torch_utils.correction import (
     BackgroundField,
     apply_flatfield,
+    local_zscore,
     normalize_global,
     sample_background,
     scale_params,
@@ -117,6 +118,37 @@ def test_normalize_global_clips_and_scales():
 def test_normalize_global_eps_guards_zero_range():
     vol = np.array([5.0, 5.0], dtype=np.float32)
     out = normalize_global(vol, 5.0, 5.0, eps=1e-6)  # upper == lower
+    assert np.isfinite(out).all()
+
+
+def test_local_zscore_basic():
+    block = np.array([[10.0, 20.0]], dtype=np.float32)
+    bg = np.array([[5.0, 5.0]], dtype=np.float32)
+    spread = np.array([[5.0, 5.0]], dtype=np.float32)
+    out = local_zscore(block, bg, spread, eps=1e-6)
+    np.testing.assert_allclose(out, [[1.0, 3.0]])
+
+
+def test_local_zscore_is_adaptive_across_tiles():
+    """Two tiles with different baseline+gain give the same z-score for like structure.
+
+    This is why adaptive thresholding stops per-tile flooding: a fixed z-score threshold
+    keys on local contrast, not absolute intensity, so a high-baseline tile does not
+    flood. Tile A: bg=100,S=10; tile B: bg=500,S=50. A structure 2*S above background
+    yields z=2 in both.
+    """
+    a = local_zscore(np.float32(100 + 2 * 10), np.float32(100), np.float32(10))
+    b = local_zscore(np.float32(500 + 2 * 50), np.float32(500), np.float32(50))
+    np.testing.assert_allclose([a, b], [2.0, 2.0])
+
+
+def test_local_zscore_eps_guards_zero_spread():
+    out = local_zscore(
+        np.array([5.0], dtype=np.float32),
+        np.array([0.0], dtype=np.float32),
+        np.array([0.0], dtype=np.float32),
+        eps=1e-6,
+    )
     assert np.isfinite(out).all()
 
 

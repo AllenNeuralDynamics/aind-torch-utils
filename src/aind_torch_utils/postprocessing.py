@@ -17,6 +17,11 @@ Note: when the pipeline runs with flat-field correction enabled (``cfg.flatfield
 see :data:`PIPELINE_PARAM_KEYS` and the example), the model's input is the
 background-flattened signal rather than raw normalized intensity, so ``threshold`` must
 be re-tuned for that flattened range (subtraction compresses the dynamic range).
+
+With ``normalize="adaptive"`` the pipeline feeds the model a per-voxel *local z-score*
+``(img - B) / S`` (B/S estimated at a coarse level; see the example), so ``threshold``
+becomes a z-score ``k`` (typically ~2-4). This makes the threshold locally adaptive,
+preventing high-baseline fusion tiles from flooding the mask.
 """
 import json
 from typing import Optional, Tuple
@@ -38,6 +43,10 @@ PIPELINE_PARAM_KEYS = (
     "flatfield_level",
     "flatfield_opening_radius",
     "flatfield_sigma",
+    "adaptive_level",
+    "adaptive_radius",
+    "adaptive_bg_pct",
+    "adaptive_hi_pct",
 )
 
 
@@ -94,7 +103,10 @@ def create_gfp_mask_gpu(
     mask = x >= threshold
     if open_iterations > 0:
         struct = cp.ones((3, 3, 3), dtype=bool)  # full 3x3x3 cube
-        mask = cndi.binary_opening(mask, structure=struct, iterations=open_iterations)
+        # brute_force=True: cupy only implements the brute-force path for iterations>1.
+        mask = cndi.binary_opening(
+            mask, structure=struct, iterations=open_iterations, brute_force=True
+        )
     return mask.astype(cp.uint8)
 
 
@@ -191,8 +203,12 @@ class GfpMaskModel(nn.Module):
                 # Unit extent on the batch/channel axes confines the opening to each
                 # volume's (Z, Y, X), so the batched result matches per-volume.
                 struct = cp.ones((1, 1, 3, 3, 3), dtype=bool)
+                # brute_force=True: cupy only implements that path for iterations>1.
                 mask = cndi.binary_opening(
-                    mask, structure=struct, iterations=self.open_iterations
+                    mask,
+                    structure=struct,
+                    iterations=self.open_iterations,
+                    brute_force=True,
                 )
             mask = mask.astype(cp.uint8)
             # Clone into a torch-owned tensor so the cupy memory pool can't reclaim

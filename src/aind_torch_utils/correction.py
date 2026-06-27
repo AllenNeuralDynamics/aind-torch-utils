@@ -4,7 +4,7 @@ Kept dependency-light (numpy only, no torch/tensorstore/cupy) so the math can be
 imported and unit-tested on hosts without the GPU/IO stack.
 """
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -26,10 +26,14 @@ class BackgroundField:
     scale : tuple of float
         Processing-level voxels per coarse voxel, per axis
         (``processing_size / coarse_size``).
+    spread : np.ndarray, optional
+        Coarse local spread ``S`` on the same grid as ``field``, used by the adaptive
+        (local z-score) normalization. ``None`` for plain flat-field background.
     """
 
     field: np.ndarray
     scale: Tuple[float, float, float]
+    spread: Optional[np.ndarray] = None
 
     @property
     def mean(self) -> float:
@@ -103,6 +107,32 @@ def normalize_global(block, lower: float, upper: float, eps: float = 1e-6):
     """
     scale = max(upper - lower, eps)
     return (block.clip(lower, upper) - lower) / scale
+
+
+def local_zscore(block, bg, spread, eps: float = 1e-6):
+    """Local z-score ``(block - bg) / max(spread, eps)`` for adaptive thresholding.
+
+    ``bg`` and ``spread`` are per-voxel local-background and local-spread fields aligned
+    to ``block`` (sampled from coarse global fields). The result is a local contrast in
+    units of the local spread, so a downstream global threshold ``k`` becomes a *locally
+    adaptive* threshold: it self-raises where the background/brightness is high, which
+    stops high-baseline fusion tiles from flooding. Backend-agnostic (numpy or cupy).
+
+    Parameters
+    ----------
+    block : np.ndarray or cupy.ndarray
+        Raw-intensity array.
+    bg, spread : same type as ``block``
+        Local background and spread, broadcastable to ``block``.
+    eps : float
+        Floor for the divisor where the spread is ~0.
+
+    Returns
+    -------
+    Same array type as ``block``: the local z-score.
+    """
+    denom = spread.clip(eps, None) if hasattr(spread, "clip") else max(spread, eps)
+    return (block - bg) / denom
 
 
 def scale_params(

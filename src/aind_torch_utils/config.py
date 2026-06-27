@@ -80,9 +80,12 @@ class InferenceConfig(BaseModel):
     norm_upper: float = Field(
         default=99.9, description="Upper percentile for normalization, or global max."
     )
-    normalize: Union[Literal["percentile", "global"], bool] = Field(
+    normalize: Union[Literal["percentile", "global", "adaptive"], bool] = Field(
         default="percentile",
-        description="Normalization strategy: 'percentile', 'global', or False to disable.",
+        description=(
+            "Normalization strategy: 'percentile', 'global', 'adaptive' "
+            "(local z-score; see adaptive_* fields), or False to disable."
+        ),
     )
     clip_norm: Union[bool, Tuple[float, float]] = Field(
         default=False,
@@ -118,6 +121,31 @@ class InferenceConfig(BaseModel):
     flatfield_sigma: float = Field(
         default=0.0,
         description="Gaussian smoothing sigma (coarse-level voxels) for the estimate.",
+    )
+
+    # Local adaptive threshold (normalize="adaptive"). Feeds the model a per-voxel
+    # local z-score (img - B) / S, where B (background) and S (spread) are robust,
+    # edge-preserving fields estimated once at a coarse level and sampled per-block
+    # (seam-free). The threshold then self-raises in high-baseline/bright tiles, fixing
+    # per-tile flooding from fusion. The model's `threshold` becomes a z-score k (~2-4).
+    adaptive_level: Optional[int] = Field(
+        default=None,
+        description="Pyramid level to estimate the adaptive B/S fields from (e.g. 6).",
+    )
+    adaptive_radius: int = Field(
+        default=8,
+        description=(
+            "Percentile-filter window radius (coarse-level voxels) for B/S; should be "
+            "smaller than a fusion tile but larger than a neuron cross-section."
+        ),
+    )
+    adaptive_bg_pct: float = Field(
+        default=25.0,
+        description="Low percentile for local background B (robust to bright cells).",
+    )
+    adaptive_hi_pct: float = Field(
+        default=95.0,
+        description="High percentile; local spread S = hi_pct - bg_pct.",
     )
 
     @model_validator(mode="after")
@@ -234,6 +262,24 @@ class InferenceConfig(BaseModel):
             if self.norm_lower >= self.norm_upper:
                 raise ValueError(
                     "For 'global' normalization, norm_lower must be < norm_upper."
+                )
+        elif self.normalize == "adaptive":
+            if self.adaptive_level is None:
+                raise ValueError(
+                    "For 'adaptive' normalization, adaptive_level is required "
+                    "(pyramid level to estimate the local B/S fields from)."
+                )
+            if self.adaptive_radius < 1:
+                raise ValueError("adaptive_radius must be >= 1")
+            if not (0.0 <= self.adaptive_bg_pct < self.adaptive_hi_pct <= 100.0):
+                raise ValueError(
+                    "adaptive percentiles must satisfy 0 <= bg_pct < hi_pct <= 100."
+                )
+            if self.flatfield:
+                warnings.warn(
+                    "normalize='adaptive' subsumes background subtraction; the "
+                    "flatfield setting is ignored in this mode.",
+                    RuntimeWarning,
                 )
 
         # Flat-field correction

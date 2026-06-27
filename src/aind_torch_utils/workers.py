@@ -15,6 +15,7 @@ from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.correction import (
     BackgroundField,
     apply_flatfield,
+    local_zscore,
     normalize_global,
     sample_background,
 )
@@ -279,13 +280,31 @@ class PrepWorker:
                 norm_block = normalize_global(
                     norm_block, block_mn, block_mx, self.cfg.eps
                 )
+            elif self.cfg.normalize == "adaptive":
+                # Local z-score (img - B) / S, with B/S sampled from coarse global
+                # fields by absolute coords -> seam-free. Subsumes flat-field; the
+                # model's threshold becomes a local (per-tile-adaptive) z-score.
+                if self.background is None or self.background.spread is None:
+                    raise ValueError(
+                        "normalize='adaptive' requires a background with a spread "
+                        "field (estimate it before run(); see _estimate_local_stats)."
+                    )
+                coords = (z0e, z1e, y0e, y1e, x0e, x1e)
+                bg = sample_background(
+                    self.background.field, self.background.scale, *coords
+                )
+                spread = sample_background(
+                    self.background.spread, self.background.scale, *coords
+                )
+                norm_block = local_zscore(norm_block, bg, spread, self.cfg.eps)
+                block_mn, block_mx = 0.0, 1.0
             else:  # False
                 # Bypass normalization entirely (identity). We pretend (mn,mx)=(0,1)
                 # so the writer performs a no-op inverse transform.
                 block_mn, block_mx = 0.0, 1.0
 
-            # optional clipping
-            if self.cfg.clip_norm:
+            # optional clipping (skipped for adaptive: z-scores exceed [0,1] by design)
+            if self.cfg.clip_norm and self.cfg.normalize != "adaptive":
                 if self.cfg.clip_norm is True:
                     norm_block = np.clip(norm_block, 0.0, 1.0)
                 else:
