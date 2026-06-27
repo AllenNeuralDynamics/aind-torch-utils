@@ -25,8 +25,8 @@ Example::
         --open-iterations 0 1 --target-level 0 --ortho --rotate 24 --out tune
 
 All outputs go into the ``--out`` folder. ``--ortho`` adds XY/XZ/YZ projection montages
-(depth via three views); ``--rotate N`` writes N rotating-MIP overlay PNG frames
-(parallax depth) per param combo into a ``rotate_*`` subfolder.
+(depth via three views); ``--rotate N`` writes a rotating-MIP overlay GIF (N frames,
+parallax depth) per param combo into the folder.
 
 Requires the ``postprocess`` (cupy) + ``extras`` (matplotlib) optional dependencies.
 """
@@ -226,20 +226,20 @@ def _render_montage(
     logger.info("Wrote %s", out_path)
 
 
-def _render_rotation_frames(
+def _render_rotation_gif(
     vol_cp,
     threshold: float,
     sigma: Tuple[float, float, float],
     open_it: int,
     n_frames: int,
-    frame_dir: str,
+    out_path: str,
     depth_color: bool = True,
 ) -> None:
-    """Save rotating-MIP overlay PNG frames for one param set into ``frame_dir``.
+    """Save a rotating-MIP overlay GIF for one param set to ``out_path``.
 
     Spins the volume about the vertical (y) axis; for each angle it rotates, recomputes
-    the mask, MIPs both along z, and writes ``angle_###.png`` (mask depth-coded along z
-    when ``depth_color`` is set). Frames are rendered sequentially so peak GPU memory
+    the mask, MIPs both along z (mask depth-coded along z when ``depth_color`` is set),
+    and writes an animated GIF. Frames are rendered sequentially so peak GPU memory
     stays near one extra volume.
     """
     import cupyx.scipy.ndimage as cndi  # GPU only; lazy import
@@ -247,10 +247,10 @@ def _render_rotation_frames(
     try:
         from PIL import Image
     except ImportError:
-        logger.warning("Pillow not installed; skipping rotation frames %s", frame_dir)
+        logger.warning("Pillow not installed; skipping rotation GIF %s", out_path)
         return
 
-    os.makedirs(frame_dir, exist_ok=True)
+    frames = []
     for i in range(n_frames):
         angle = i * 360.0 / n_frames
         rot = cndi.rotate(vol_cp, angle, axes=(0, 2), reshape=False, order=1)
@@ -262,9 +262,15 @@ def _render_rotation_frames(
             mask_mip, depth_norm = _mip_and_depth(mask, 0)
         else:
             mask_mip, depth_norm = cp.asnumpy(mask.max(axis=0)), None
-        frame = Image.fromarray(_overlay_rgb(gray, mask_mip, depth_norm))
-        frame.save(os.path.join(frame_dir, f"angle_{i:03d}.png"))
-    logger.info("Wrote %d rotation frames to %s/", n_frames, frame_dir)
+        frames.append(Image.fromarray(_overlay_rgb(gray, mask_mip, depth_norm)))
+    frames[0].save(
+        out_path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=120,
+        loop=0,
+    )
+    logger.info("Wrote %s (%d frames)", out_path, n_frames)
 
 
 def _render_for_ff(vol, ff_tag, tune_level, out_dir, axes_list, axis_tag, args) -> None:
@@ -292,17 +298,17 @@ def _render_for_ff(vol, ff_tag, tune_level, out_dir, axes_list, axis_tag, args) 
                 suptitle,
                 depth_color,
             )
-    # Rotation: PNG frames per parameter combo, each in its own subfolder.
+    # Rotation: one animated GIF per parameter combo, in the output folder.
     if args.rotate > 0:
         for thr in args.thresholds:
             for sigma in args.smooth_sigmas:
                 for op in args.open_iterations:
                     sig_tag = "x".join(f"{s:g}" for s in sigma)
-                    frame_dir = os.path.join(
-                        out_dir, f"rotate_{ff_tag}_thr{thr:g}_sig{sig_tag}_open{op}"
+                    gif_path = os.path.join(
+                        out_dir, f"rotate_{ff_tag}_thr{thr:g}_sig{sig_tag}_open{op}.gif"
                     )
-                    _render_rotation_frames(
-                        vol_cp, thr, sigma, op, args.rotate, frame_dir, depth_color
+                    _render_rotation_gif(
+                        vol_cp, thr, sigma, op, args.rotate, gif_path, depth_color
                     )
 
 
@@ -431,8 +437,8 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "--rotate",
         type=int,
         default=0,
-        help="If >0, save N rotating-MIP overlay PNG frames (over 360deg) per param "
-        "combo, each in its own rotate_* subfolder, for pseudo-3D depth perception.",
+        help="If >0, save a rotating-MIP overlay GIF (N frames over 360deg) per param "
+        "combo into the output folder, for pseudo-3D depth perception.",
     )
     ap.add_argument(
         "--sweep-flatfield",
