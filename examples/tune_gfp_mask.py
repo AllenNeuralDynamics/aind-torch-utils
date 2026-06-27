@@ -21,7 +21,10 @@ Example::
     python examples/tune_gfp_mask.py \\
         --in-spec /scratch/seg_tile_spec.json --params-json /scratch/params.json \\
         --thresholds 0.02 0.05 0.1 --smooth-sigmas 0.5,1,1 1,2,2 1,3,3 \\
-        --open-iterations 0 1 --target-level 0 --out tune.png
+        --open-iterations 0 1 --target-level 0 --ortho --rotate 24 --out tune.png
+
+``--ortho`` adds XY/XZ/YZ projection montages (depth via three views); ``--rotate N``
+saves a rotating-MIP GIF (parallax depth) for the first swept param set.
 
 Requires the ``postprocess`` (cupy) + ``extras`` (matplotlib) optional dependencies.
 """
@@ -121,13 +124,26 @@ def _preprocess(
     return _apply_normalization(vol, cfg)
 
 
+def _overlay_rgb(gray: np.ndarray, mask_mip: np.ndarray) -> np.ndarray:
+    """Build an (H, W, 3) uint8 image: grayscale signal with mask in translucent red.
+
+    Min-max normalizes ``gray`` for display, then blends red (alpha 0.5) where the mask
+    MIP is positive. Used by both the montage cells and the rotation GIF frames.
+    """
+    g = gray.astype(np.float32)
+    lo, hi = float(g.min()), float(g.max())
+    g = (g - lo) / (hi - lo) if hi > lo else np.zeros_like(g)
+    rgb = np.repeat(g[..., None], 3, axis=2)  # grayscale base
+    m = (mask_mip > 0).astype(np.float32) * 0.5  # red alpha
+    rgb[..., 0] = rgb[..., 0] * (1.0 - m) + m  # blend pure red into R
+    rgb[..., 1] = rgb[..., 1] * (1.0 - m)
+    rgb[..., 2] = rgb[..., 2] * (1.0 - m)
+    return (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)
+
+
 def _overlay(ax, gray: np.ndarray, mask_mip: np.ndarray, title: str) -> None:
     """Draw a grayscale MIP with the mask MIP overlaid in translucent red."""
-    ax.imshow(gray, cmap="gray")
-    rgba = np.zeros(mask_mip.shape + (4,), dtype=np.float32)
-    rgba[..., 0] = 1.0  # red channel
-    rgba[..., 3] = (mask_mip > 0).astype(np.float32) * 0.5  # alpha where masked
-    ax.imshow(rgba)
+    ax.imshow(_overlay_rgb(gray, mask_mip))
     ax.set_title(title, fontsize=8)
     ax.axis("off")
 
@@ -161,6 +177,48 @@ def _render_montage(
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
     logger.info("Wrote %s", out_path)
+
+
+def _render_rotation(
+    vol_cp,
+    threshold: float,
+    sigma: Tuple[float, float, float],
+    open_it: int,
+    n_frames: int,
+    out_path: str,
+) -> None:
+    """Save a rotating-MIP GIF for a single param set (parallax -> 3D perception).
+
+    Spins the volume about the vertical (y) axis; for each angle it rotates, recomputes
+    the mask, and MIPs both along z. Frames are rendered sequentially so peak GPU memory
+    stays near one extra volume.
+    """
+    import cupyx.scipy.ndimage as cndi  # GPU only; lazy import
+
+    try:
+        from PIL import Image
+    except ImportError:
+        logger.warning("Pillow not installed; skipping rotation GIF %s", out_path)
+        return
+
+    frames = []
+    for i in range(n_frames):
+        angle = i * 360.0 / n_frames
+        rot = cndi.rotate(vol_cp, angle, axes=(0, 2), reshape=False, order=1)
+        mask = create_gfp_mask_gpu(
+            rot, threshold=threshold, smooth_sigma=sigma, open_iterations=open_it
+        )
+        gray = cp.asnumpy(rot.max(axis=0))
+        mask_mip = cp.asnumpy(mask.max(axis=0))
+        frames.append(Image.fromarray(_overlay_rgb(gray, mask_mip)))
+    frames[0].save(
+        out_path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=120,
+        loop=0,
+    )
+    logger.info("Wrote %s (%d frames)", out_path, n_frames)
 
 
 def _scaling_report(
@@ -209,6 +267,24 @@ def _scaling_report(
                 tuple(round(s, 2) for s in ssig),
                 sop,
             )
+    yx = (factor[1] + factor[2]) / 2.0
+    logger.info(
+        "Transfer guidance: the finer target level has ~%.0fx more per-voxel noise and "
+        "~%.0fx more voxels; the scaled sigma recovers most SNR but the noise tail "
+        "needs calibration:",
+        yx**1.5,
+        factor[0] * factor[1] * factor[2],
+    )
+    logger.info("  - keep the scaled σ above (preserves the physical smoothing scale);")
+    logger.info(
+        "  - nudge threshold UP slightly and add ~1 open_iteration to clear the extra "
+        "noise-tail specks at full resolution;"
+    )
+    logger.info(
+        "  - VALIDATE: rerun this tuner with --in-spec at the target level + a small "
+        "--crop to calibrate threshold/opening in the real noise regime (the coarse "
+        "sweep only fixes the physical scale)."
+    )
 
 
 def _parse_args(argv: List[str]) -> argparse.Namespace:
@@ -257,6 +333,18 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     )
     ap.add_argument("--mip-axis", type=int, default=0, help="MIP axis (0=Z,1=Y,2=X).")
     ap.add_argument(
+        "--ortho",
+        action="store_true",
+        help="Render all three projections (XY/XZ/YZ) for depth, not just --mip-axis.",
+    )
+    ap.add_argument(
+        "--rotate",
+        type=int,
+        default=0,
+        help="If >0, also save a rotating-MIP GIF (N frames over 360deg) for the first "
+        "swept param set, for pseudo-3D depth perception.",
+    )
+    ap.add_argument(
         "--sweep-flatfield",
         action="store_true",
         help="Also render a flat-field OFF montage for comparison.",
@@ -264,7 +352,9 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     ap.add_argument("--out", default="gfp_tune.png", help="Output PNG path (base).")
     ap.add_argument("--aws-region", default="us-west-2")
     ap.add_argument(
-        "--max-gb", type=float, default=3.0,
+        "--max-gb",
+        type=float,
+        default=3.0,
         help=(
             "Abort if the crop exceeds this many GB (float32). The GPU is the limiter: "
             "peak VRAM is ~4x the crop, so 3 GB ~= 12 GB on a 16 GB GPU."
@@ -323,27 +413,48 @@ def main(argv: Optional[List[str]] = None) -> None:
         ff_settings.append(False)
 
     base = args.out[:-4] if args.out.lower().endswith(".png") else args.out
+    # --ortho renders all three projections; otherwise just the requested axis.
+    axis_tag = {0: "xy", 1: "xz", 2: "yz"}
+    axes_list = [0, 1, 2] if args.ortho else [args.mip_axis]
     for use_ff in ff_settings:
         vol = _preprocess(spec, cfg, raw, bbox, full_shape, use_ff)
         vol_cp = cp.asarray(vol)
-        gray_mip = vol.max(axis=args.mip_axis)
         ff_tag = "ff" if (use_ff and cfg.flatfield) else "noff"
         for op in args.open_iterations:
-            tag = f"{ff_tag}_open{op}"
-            out_path = f"{base}_{tag}.png"
-            suptitle = (
-                f"level {tune_level}  flatfield={'on' if ff_tag == 'ff' else 'off'}  "
-                f"open_iterations={op}  (rows=threshold, cols=smooth_sigma)"
+            for ax in axes_list:
+                gray_mip = vol.max(axis=ax)
+                suffix = f"{ff_tag}_open{op}_{axis_tag[ax]}"
+                out_path = f"{base}_{suffix}.png"
+                suptitle = (
+                    f"level {tune_level}  flatfield={'on' if ff_tag == 'ff' else 'off'}"
+                    f"  open={op}  proj={axis_tag[ax]}  (rows=threshold, cols=sigma)"
+                )
+                _render_montage(
+                    vol_cp,
+                    gray_mip,
+                    args.thresholds,
+                    args.smooth_sigmas,
+                    op,
+                    ax,
+                    out_path,
+                    suptitle,
+                )
+        if args.rotate > 0:
+            # Inspect a single param set (first of each sweep list) in 3D-ish rotation.
+            thr0, sig0, op0 = (
+                args.thresholds[0],
+                args.smooth_sigmas[0],
+                args.open_iterations[0],
             )
-            _render_montage(
-                vol_cp,
-                gray_mip,
-                args.thresholds,
-                args.smooth_sigmas,
-                op,
-                args.mip_axis,
-                out_path,
-                suptitle,
+            logger.info(
+                "Rotation GIF for thr=%g σ=%s open=%d (pass single-element sweeps to "
+                "inspect a specific set)",
+                thr0,
+                sig0,
+                op0,
+            )
+            _render_rotation(
+                vol_cp, thr0, sig0, op0, args.rotate, f"{base}_{ff_tag}_rotate.gif"
             )
 
     if args.target_level is not None:
