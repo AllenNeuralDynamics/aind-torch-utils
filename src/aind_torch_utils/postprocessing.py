@@ -94,7 +94,10 @@ def create_gfp_mask_gpu(
     mask = x >= threshold
     if open_iterations > 0:
         struct = cp.ones((3, 3, 3), dtype=bool)  # full 3x3x3 cube
-        mask = cndi.binary_opening(mask, structure=struct, iterations=open_iterations)
+        # brute_force=True: cupy only implements the brute-force path for iterations>1.
+        mask = cndi.binary_opening(
+            mask, structure=struct, iterations=open_iterations, brute_force=True
+        )
     return mask.astype(cp.uint8)
 
 
@@ -191,8 +194,12 @@ class GfpMaskModel(nn.Module):
                 # Unit extent on the batch/channel axes confines the opening to each
                 # volume's (Z, Y, X), so the batched result matches per-volume.
                 struct = cp.ones((1, 1, 3, 3, 3), dtype=bool)
+                # brute_force=True: cupy only implements that path for iterations>1.
                 mask = cndi.binary_opening(
-                    mask, structure=struct, iterations=self.open_iterations
+                    mask,
+                    structure=struct,
+                    iterations=self.open_iterations,
+                    brute_force=True,
                 )
             mask = mask.astype(cp.uint8)
             # Clone into a torch-owned tensor so the cupy memory pool can't reclaim

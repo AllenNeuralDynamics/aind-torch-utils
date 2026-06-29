@@ -22,15 +22,16 @@ Example::
     python examples/tune_gfp_mask.py \\
         --in-spec /scratch/seg_tile_spec.json --params-json /scratch/params.json \\
         --thresholds 0.02 0.05 0.1 --smooth-sigmas 0.5,1,1 1,2,2 1,3,3 \\
-        --open-iterations 0 1 --target-level 0 --ortho --rotate 24 --out tune
+        --open-iterations 0 1 --target-level 0 --ortho --out tune
 
-All outputs go into the ``--out`` folder. ``--ortho`` adds XY/XZ/YZ projection montages
-(depth via three views); ``--rotate N`` writes a rotating-MIP overlay GIF (N frames,
-parallax depth) per param combo into the folder.
+All outputs go into the ``--out`` folder: a montage per (flatfield, open, projection)
+with each cell titled by its metrics, plus a ``metrics.csv`` ranking table. ``--ortho``
+adds XY/XZ/YZ projection montages (depth via three views).
 
 Requires the ``postprocess`` (cupy) + ``extras`` (matplotlib) optional dependencies.
 """
 import argparse
+import csv
 import logging
 import os
 import re
@@ -157,8 +158,7 @@ def _overlay_rgb(
 
     Min-max normalizes ``gray`` for display, then blends the mask on top where
     ``mask_mip`` is positive. If ``depth_norm`` is given, the mask is depth-coded via
-    ``cmap_name`` (near -> far); otherwise it is flat red. Used by montage cells and
-    rotation frames.
+    ``cmap_name`` (near -> far); otherwise it is flat red.
     """
     g = gray.astype(np.float32)
     lo, hi = float(g.min()), float(g.max())
@@ -187,6 +187,50 @@ def _overlay(
     ax.axis("off")
 
 
+def _combo_metrics(vol_cp, thr, sigma, op) -> dict:
+    """Unsupervised quality proxies for one (threshold, sigma, open) mask.
+
+    Returns foreground fraction, connected-component count (fragmentation), the share
+    of foreground in the largest component (contiguity), and the intensity contrast
+    between predicted foreground and background. Computed on the 3D mask, so it is
+    independent of the projection axis.
+    """
+    import cupyx.scipy.ndimage as cndi  # GPU only; lazy import
+
+    mask = create_gfp_mask_gpu(
+        vol_cp, threshold=thr, smooth_sigma=sigma, open_iterations=op
+    )
+    fg_frac = float(mask.mean())
+    labeled, n = cndi.label(mask)
+    if n > 0:
+        counts = cp.bincount(labeled.ravel())[1:]  # drop background label 0
+        fg_vox = float(counts.sum())
+        largest_frac = float(counts.max()) / fg_vox if fg_vox > 0 else 0.0
+    else:
+        largest_frac = 0.0
+    mb = mask.astype(bool)
+    n_fg = int(mb.sum())
+    fg_mean = float(vol_cp[mb].mean()) if n_fg > 0 else 0.0
+    bg_mean = float(vol_cp[~mb].mean()) if n_fg < mb.size else 0.0
+    return {
+        "fg_frac": fg_frac,
+        "n_components": int(n),
+        "largest_frac": largest_frac,
+        "contrast": fg_mean - bg_mean,
+    }
+
+
+def _write_metrics_csv(path: str, rows: List[dict]) -> None:
+    """Write the per-combo metrics table for offline ranking/sorting."""
+    if not rows:
+        return
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    logger.info("Wrote %s (%d rows)", path, len(rows))
+
+
 def _render_montage(
     vol_cp,
     gray_mip: np.ndarray,
@@ -196,12 +240,14 @@ def _render_montage(
     mip_axis: int,
     out_path: str,
     suptitle: str,
+    metrics: dict,
     depth_color: bool = True,
 ) -> None:
     """Sweep threshold x smooth_sigma at a fixed open_iters; save one montage PNG.
 
-    When ``depth_color`` is set the mask is depth-coded (turbo, near->far) along the
-    projection axis; otherwise it is flat red.
+    Each cell is titled with its metrics (fg fraction, #components, largest-component
+    fraction). When ``depth_color`` is set the mask is depth-coded (turbo, near->far)
+    along the projection axis; otherwise it is flat red.
     """
     nrows, ncols = len(thresholds), len(sigmas)
     fig, axes = plt.subplots(
@@ -212,72 +258,49 @@ def _render_montage(
             mask = create_gfp_mask_gpu(
                 vol_cp, threshold=thr, smooth_sigma=sigma, open_iterations=open_iters
             )
-            fg = float(mask.mean())
             if depth_color:
                 mask_mip, depth_norm = _mip_and_depth(mask, mip_axis)
             else:
                 mask_mip, depth_norm = cp.asnumpy(mask.max(axis=mip_axis)), None
-            title = f"thr={thr:g} σ={sigma} fg={fg:.3f}"
+            m = metrics[(thr, sigma, open_iters)]
+            title = (
+                f"thr={thr:g} σ={sigma}\n"
+                f"fg={m['fg_frac']:.3f} n={m['n_components']} "
+                f"top={m['largest_frac']:.2f}"
+            )
             _overlay(axes[r][c], gray_mip, mask_mip, title, depth_norm)
     fig.suptitle(suptitle, fontsize=10)
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
     logger.info("Wrote %s", out_path)
 
 
-def _render_rotation_gif(
-    vol_cp,
-    threshold: float,
-    sigma: Tuple[float, float, float],
-    open_it: int,
-    n_frames: int,
-    out_path: str,
-    depth_color: bool = True,
-) -> None:
-    """Save a rotating-MIP overlay GIF for one param set to ``out_path``.
-
-    Spins the volume about the vertical (y) axis; for each angle it rotates, recomputes
-    the mask, MIPs both along z (mask depth-coded along z when ``depth_color`` is set),
-    and writes an animated GIF. Frames are rendered sequentially so peak GPU memory
-    stays near one extra volume.
-    """
-    import cupyx.scipy.ndimage as cndi  # GPU only; lazy import
-
-    try:
-        from PIL import Image
-    except ImportError:
-        logger.warning("Pillow not installed; skipping rotation GIF %s", out_path)
-        return
-
-    frames = []
-    for i in range(n_frames):
-        angle = i * 360.0 / n_frames
-        rot = cndi.rotate(vol_cp, angle, axes=(0, 2), reshape=False, order=1)
-        mask = create_gfp_mask_gpu(
-            rot, threshold=threshold, smooth_sigma=sigma, open_iterations=open_it
-        )
-        gray = cp.asnumpy(rot.max(axis=0))
-        if depth_color:
-            mask_mip, depth_norm = _mip_and_depth(mask, 0)
-        else:
-            mask_mip, depth_norm = cp.asnumpy(mask.max(axis=0)), None
-        frames.append(Image.fromarray(_overlay_rgb(gray, mask_mip, depth_norm)))
-    frames[0].save(
-        out_path,
-        save_all=True,
-        append_images=frames[1:],
-        duration=120,
-        loop=0,
-    )
-    logger.info("Wrote %s (%d frames)", out_path, n_frames)
-
-
-def _render_for_ff(vol, ff_tag, tune_level, out_dir, axes_list, axis_tag, args) -> None:
-    """Render all montages (+ optional rotation frames) for one flat-field setting."""
+def _render_for_ff(vol, ff_tag, tune_level, out_dir, axes_list, axis_tag, args) -> list:
+    """Render montages for one flat-field setting; return the per-combo metric rows."""
     vol_cp = cp.asarray(vol)
     depth_color = not args.flat_mask
     depth_note = "  mask depth-coded (turbo near->far)" if depth_color else ""
+
+    # Metrics pass (once per combo; independent of projection axis).
+    metrics, rows = {}, []
+    for thr in args.thresholds:
+        for sigma in args.smooth_sigmas:
+            for op in args.open_iterations:
+                m = _combo_metrics(vol_cp, thr, sigma, op)
+                metrics[(thr, sigma, op)] = m
+                sig_tag = "x".join(f"{s:g}" for s in sigma)
+                rows.append(
+                    {
+                        "flatfield": ff_tag,
+                        "threshold": thr,
+                        "sigma": sig_tag,
+                        "open": op,
+                        **m,
+                    }
+                )
+
+    # Montage pass (per open_iters x projection axis).
     for op in args.open_iterations:
         for ax in axes_list:
             gray_mip = vol.max(axis=ax)
@@ -296,20 +319,10 @@ def _render_for_ff(vol, ff_tag, tune_level, out_dir, axes_list, axis_tag, args) 
                 ax,
                 os.path.join(out_dir, f"montage_{suffix}.png"),
                 suptitle,
+                metrics,
                 depth_color,
             )
-    # Rotation: one animated GIF per parameter combo, in the output folder.
-    if args.rotate > 0:
-        for thr in args.thresholds:
-            for sigma in args.smooth_sigmas:
-                for op in args.open_iterations:
-                    sig_tag = "x".join(f"{s:g}" for s in sigma)
-                    gif_path = os.path.join(
-                        out_dir, f"rotate_{ff_tag}_thr{thr:g}_sig{sig_tag}_open{op}.gif"
-                    )
-                    _render_rotation_gif(
-                        vol_cp, thr, sigma, op, args.rotate, gif_path, depth_color
-                    )
+    return rows
 
 
 def _scaling_report(
@@ -434,13 +447,6 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         help="Render all three projections (XY/XZ/YZ) for depth, not just --mip-axis.",
     )
     ap.add_argument(
-        "--rotate",
-        type=int,
-        default=0,
-        help="If >0, save a rotating-MIP overlay GIF (N frames over 360deg) per param "
-        "combo into the output folder, for pseudo-3D depth perception.",
-    )
-    ap.add_argument(
         "--sweep-flatfield",
         action="store_true",
         help="Also render a flat-field OFF montage for comparison.",
@@ -448,8 +454,8 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     ap.add_argument(
         "--out",
         default="gfp_tune",
-        help="Output folder (a trailing '.png' is stripped). Montages + rotation "
-        "frame subfolders are written inside it.",
+        help="Output folder (a trailing '.png' is stripped). Montages + metrics.csv "
+        "are written inside it.",
     )
     ap.add_argument("--aws-region", default="us-west-2")
     ap.add_argument(
@@ -520,23 +526,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     # --ortho renders all three projections; otherwise just the requested axis.
     axis_tag = {0: "xy", 1: "xz", 2: "yz"}
     axes_list = [0, 1, 2] if args.ortho else [args.mip_axis]
-    if args.rotate > 0:
-        n_rot = (
-            len(args.thresholds)
-            * len(args.smooth_sigmas)
-            * len(args.open_iterations)
-            * len(ff_settings)
-        )
-        logger.info(
-            "Rotation enabled: %d param combos x %d frames each (reduce sweep lists "
-            "if this is too many).",
-            n_rot,
-            args.rotate,
-        )
+    all_rows = []
     for use_ff in ff_settings:
         vol = _preprocess(spec, cfg, raw, bbox, full_shape, use_ff)
         ff_tag = "ff" if (use_ff and cfg.flatfield) else "noff"
-        _render_for_ff(vol, ff_tag, tune_level, out_dir, axes_list, axis_tag, args)
+        all_rows += _render_for_ff(
+            vol, ff_tag, tune_level, out_dir, axes_list, axis_tag, args
+        )
+    _write_metrics_csv(os.path.join(out_dir, "metrics.csv"), all_rows)
 
     if args.target_level is not None:
         _scaling_report(

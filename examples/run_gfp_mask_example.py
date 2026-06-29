@@ -119,6 +119,9 @@ DEFAULT_IN_SPEC = {
     },
 }
 DOWNSAMPLE_METHOD = "max"  # keeps coarser mask levels strictly binary
+# Max per-axis size for the (low-frequency) flat-field estimate; larger coarse levels
+# are stride-subsampled to this before the GPU morphology, to avoid OOM.
+FLATFIELD_MAX_DIM = 256
 MAX_INFLIGHT = 8  # concurrent downsample chunks (peak RAM ~ MAX_INFLIGHT x chunk)
 
 logging.basicConfig(
@@ -260,20 +263,37 @@ def _estimate_background(spec, cfg, processing_shape: Tuple[int, int, int]):
 
     coarse_spec = _spec_with_level(spec, cfg.flatfield_level)
     coarse_store = open_ts_spec(coarse_spec)
+    # Read in the native dtype (e.g. uint16, 2 bytes); do NOT float32-cast the full
+    # volume — that would double the host footprint. We cast only the subsampled array.
+    coarse = coarse_store[cfg.t_idx, cfg.c_idx].read().result()
     logger.info(
-        "Flat-field: reading coarse level %s shape=%s",
+        "Flat-field: read coarse level %s shape=%s dtype=%s (~%.2f GB)",
         cfg.flatfield_level,
-        tuple(coarse_store.domain.shape),
+        coarse.shape,
+        coarse.dtype,
+        coarse.nbytes / 1e9,
     )
-    coarse = (
-        coarse_store[cfg.t_idx, cfg.c_idx].read().result().astype("float32", copy=False)
-    )
-    cg = cp.asarray(coarse)
-    if cfg.flatfield_opening_radius > 0:
-        size = 2 * int(cfg.flatfield_opening_radius) + 1
+
+    # The background is low-frequency, so cap its resolution before the GPU morphology
+    # to avoid OOM when flatfield_level is still large. Stride-subsample on the host
+    # (cheap view), then cast just the small array to float32 on the GPU. The opening
+    # radius and sigma are divided by the stride so the physical extent is preserved.
+    step = max(1, (max(coarse.shape) + FLATFIELD_MAX_DIM - 1) // FLATFIELD_MAX_DIM)
+    if step > 1:
+        coarse = coarse[::step, ::step, ::step]
+        logger.info(
+            "Flat-field: subsampled estimate to %s (stride %d) to fit the GPU.",
+            coarse.shape,
+            step,
+        )
+
+    cg = cp.asarray(coarse).astype(cp.float32)
+    radius = int(round(cfg.flatfield_opening_radius / step))
+    if cfg.flatfield_opening_radius > 0 and radius > 0:
+        size = 2 * radius + 1
         cg = cndi.grey_opening(cg, size=(size, size, size))
     if cfg.flatfield_sigma > 0:
-        cg = cndi.gaussian_filter(cg, sigma=float(cfg.flatfield_sigma))
+        cg = cndi.gaussian_filter(cg, sigma=float(cfg.flatfield_sigma) / step)
 
     field = cp.asnumpy(cg)
     # Processing-level voxels per coarse voxel, per axis.
