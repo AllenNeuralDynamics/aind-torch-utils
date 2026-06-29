@@ -1,17 +1,18 @@
-"""Parameter-sweep tuner for the gfp-mask segmentation (MIP montage on a coarse level).
+"""Parameter-sweep tuner for the gfp-mask segmentation (per-combo tri-view on a level).
 
 Runs the *exact same* GPU mask chain as the pipeline (``create_gfp_mask_gpu``: smooth +
 threshold + opening, optionally preceded by flat-field correction + global
-normalization) over a small coarse pyramid level, and renders a montage of
-maximum-intensity-projection (MIP) overlays — the mask depth-coded (turbo, near->far)
-over the grayscale signal (use ``--flat-mask`` for plain red) — for a grid of
-``threshold`` x ``smooth_sigma`` values (one montage per ``open_iterations``).
-This lets you pick mask parameters by eye in seconds instead of running the full
-pipeline.
+normalization) over a small coarse pyramid level, sweeping ``threshold`` x
+``smooth_sigma`` x ``open_iterations``. Each parameter combination gets its own output
+folder containing a single high-res PNG with the XY / ZX / ZY orthogonal MIP overlays
+(the mask depth-coded by the depth of its brightest voxel along each view axis -- turbo,
+near->far, with a per-panel colorbar; use ``--flat-mask`` for plain red) and a
+``params.txt`` listing that combo's params plus the proposed params for a destination
+resolution. A ``metrics.csv`` at the root ranks all combos.
 
 Because ``smooth_sigma`` / ``open_iterations`` are in *voxels*, values tuned on a coarse
-level do not transfer 1:1 to a finer processing level. Pass ``--target-level`` to print
-the scaled equivalents for the level your real run uses.
+level do not transfer 1:1 to a finer processing level. Pass ``--target-level`` to record
+the scaled equivalents (in each combo's ``params.txt``) for the level your run uses.
 
 Reads the tune level from ``--in-spec`` (same convention as ``run_gfp_mask_example.py``:
 the level is the trailing digit of the kvstore path). Normalization and flat-field
@@ -22,11 +23,14 @@ Example::
     python examples/tune_gfp_mask.py \\
         --in-spec /scratch/seg_tile_spec.json --params-json /scratch/params.json \\
         --thresholds 0.02 0.05 0.1 --smooth-sigmas 0.5,1,1 1,2,2 1,3,3 \\
-        --open-iterations 0 1 --target-level 0 --ortho --out tune
+        --open-iterations 0 1 --target-level 0 --dpi 200 --out tune
 
-All outputs go into the ``--out`` folder: a montage per (flatfield, open, projection)
-with each cell titled by its metrics, plus a ``metrics.csv`` ranking table. ``--ortho``
-adds XY/XZ/YZ projection montages (depth via three views).
+Output layout (one folder per combo)::
+
+    tune/
+      metrics.csv
+      thr_0.05_sigma_0.5-1-1_open_1/{views.png, params.txt}
+      ...
 
 Requires the ``postprocess`` (cupy) + ``extras`` (matplotlib) optional dependencies.
 """
@@ -44,6 +48,8 @@ import numpy as np
 
 matplotlib.use("Agg")  # headless: write PNGs without a display
 import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib.cm import ScalarMappable  # noqa: E402
+from matplotlib.colors import Normalize  # noqa: E402
 
 from aind_torch_utils.config import InferenceConfig  # noqa: E402
 from aind_torch_utils.correction import (  # noqa: E402
@@ -128,22 +134,21 @@ def _preprocess(
     return _apply_normalization(vol, cfg)
 
 
-def _mip_and_depth(mask, axis: int):
-    """Project a 3D mask: return (binary MIP, normalized centroid-depth) as numpy.
+def _mip_and_depth(mask, vol, axis: int):
+    """Project a 3D mask: return (binary MIP, normalized depth) as numpy.
 
-    ``depth`` is the intensity-weighted mean index of the foreground along ``axis``
-    (the mask's centroid in depth for each output pixel), normalized to ``[0, 1]``
-    (near -> far). Only meaningful where the MIP is positive.
+    ``depth`` is the index along ``axis`` of the **brightest masked voxel** in each
+    output column (a true depth-coded MIP, consistent with the grayscale signal MIP
+    shown underneath), normalized to ``[0, 1]`` (near -> far). Unambiguous for columns
+    that contain mask at multiple depths, unlike a centroid. Only meaningful where the
+    MIP is positive (unmasked columns argmax to 0 but are drawn with zero alpha).
     """
     length = mask.shape[axis]
     mask_mip = mask.max(axis=axis)
-    shape = [1, 1, 1]
-    shape[axis] = length
-    idx = cp.arange(length, dtype=cp.float32).reshape(shape)
-    mf = mask.astype(cp.float32)
-    msum = mf.sum(axis=axis)
-    depth = (mf * idx).sum(axis=axis) / cp.maximum(msum, 1.0)
-    depth_norm = depth / max(length - 1, 1)
+    # Depth of the brightest masked voxel: argmax of the signal restricted to the mask.
+    masked = cp.where(mask > 0, vol, cp.float32(-cp.inf))
+    depth_idx = masked.argmax(axis=axis).astype(cp.float32)
+    depth_norm = depth_idx / max(length - 1, 1)
     return cp.asnumpy(mask_mip), cp.asnumpy(depth_norm)
 
 
@@ -231,64 +236,74 @@ def _write_metrics_csv(path: str, rows: List[dict]) -> None:
     logger.info("Wrote %s (%d rows)", path, len(rows))
 
 
-def _render_montage(
-    vol_cp,
-    gray_mip: np.ndarray,
-    thresholds: List[float],
-    sigmas: List[Tuple[float, float, float]],
-    open_iters: int,
-    mip_axis: int,
-    out_path: str,
-    suptitle: str,
-    metrics: dict,
-    depth_color: bool = True,
-) -> None:
-    """Sweep threshold x smooth_sigma at a fixed open_iters; save one montage PNG.
+def _combo_dirname(
+    thr: float, sigma: Tuple[float, float, float], op: int, ff_tag: str, multi_ff: bool
+) -> str:
+    """Folder name for one parameter combo, e.g. 'thr_0.05_sigma_0.5-1-1_open_1'."""
+    sig = "-".join(f"{s:g}" for s in sigma)
+    name = f"thr_{thr:g}_sigma_{sig}_open_{op}"
+    return f"{name}_{ff_tag}" if multi_ff else name
 
-    Each cell is titled with its metrics (fg fraction, #components, largest-component
-    fraction). When ``depth_color`` is set the mask is depth-coded (turbo, near->far)
-    along the projection axis; otherwise it is flat red.
+
+# View axis -> (label, depth-axis name). XY projects along z, ZX along y, ZY along x.
+_VIEWS = [(0, "XY", "z"), (1, "ZX", "y"), (2, "ZY", "x")]
+
+
+def _render_triview(
+    vol_cp, thr, sigma, op, metric: dict, depth_color: bool, dpi: int, out_path: str
+) -> None:
+    """Render one combo's XY/ZX/ZY depth-coded overlays as a single high-res PNG.
+
+    The mask is computed once; each panel is a max-projection along one axis, with the
+    mask depth-coded (turbo) by the depth of its brightest voxel along that axis and its
+    own colorbar (the depth axis differs per view). ``dpi`` sets zoomable resolution.
     """
-    nrows, ncols = len(thresholds), len(sigmas)
-    fig, axes = plt.subplots(
-        nrows, ncols, figsize=(3.0 * ncols, 3.0 * nrows), squeeze=False
+    mask = create_gfp_mask_gpu(
+        vol_cp, threshold=thr, smooth_sigma=sigma, open_iterations=op
     )
-    for r, thr in enumerate(thresholds):
-        for c, sigma in enumerate(sigmas):
-            mask = create_gfp_mask_gpu(
-                vol_cp, threshold=thr, smooth_sigma=sigma, open_iterations=open_iters
+    fig, axes = plt.subplots(
+        1, 3, figsize=(7 * 3, 7), squeeze=False, constrained_layout=True
+    )
+    for col, (axis, view, depth_axis) in enumerate(_VIEWS):
+        ax = axes[0][col]
+        gray = cp.asnumpy(vol_cp.max(axis=axis))
+        if depth_color:
+            mask_mip, depth_norm = _mip_and_depth(mask, vol_cp, axis)
+        else:
+            mask_mip, depth_norm = cp.asnumpy(mask.max(axis=axis)), None
+        _overlay(ax, gray, mask_mip, view, depth_norm)
+        if depth_color:
+            length = int(vol_cp.shape[axis])
+            sm = ScalarMappable(cmap="turbo", norm=Normalize(0, max(length - 1, 1)))
+            fig.colorbar(
+                sm,
+                ax=ax,
+                fraction=0.046,
+                pad=0.02,
+                label=f"{depth_axis} depth: near -> far (vox)",
             )
-            if depth_color:
-                mask_mip, depth_norm = _mip_and_depth(mask, mip_axis)
-            else:
-                mask_mip, depth_norm = cp.asnumpy(mask.max(axis=mip_axis)), None
-            m = metrics[(thr, sigma, open_iters)]
-            title = (
-                f"thr={thr:g} σ={sigma}\n"
-                f"fg={m['fg_frac']:.3f} n={m['n_components']} "
-                f"top={m['largest_frac']:.2f}"
-            )
-            _overlay(axes[r][c], gray_mip, mask_mip, title, depth_norm)
-    fig.suptitle(suptitle, fontsize=10)
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
-    fig.savefig(out_path, dpi=120)
+    fig.suptitle(
+        f"thr={thr:g}  σ={sigma}  open={op}   "
+        f"fg={metric['fg_frac']:.3f} n={metric['n_components']} "
+        f"top={metric['largest_frac']:.2f} contrast={metric['contrast']:.3f}",
+        fontsize=12,
+    )
+    fig.savefig(out_path, dpi=dpi)
     plt.close(fig)
     logger.info("Wrote %s", out_path)
 
 
-def _render_for_ff(vol, ff_tag, tune_level, out_dir, axes_list, axis_tag, args) -> list:
-    """Render montages for one flat-field setting; return the per-combo metric rows."""
+def _render_for_ff(
+    vol, ff_tag, tune_level, out_dir, args, cfg, factor, multi_ff
+) -> list:
+    """One folder per combo (views.png + params.txt); return the metric rows for CSV."""
     vol_cp = cp.asarray(vol)
     depth_color = not args.flat_mask
-    depth_note = "  mask depth-coded (turbo near->far)" if depth_color else ""
-
-    # Metrics pass (once per combo; independent of projection axis).
-    metrics, rows = {}, []
+    rows = []
     for thr in args.thresholds:
         for sigma in args.smooth_sigmas:
             for op in args.open_iterations:
                 m = _combo_metrics(vol_cp, thr, sigma, op)
-                metrics[(thr, sigma, op)] = m
                 sig_tag = "x".join(f"{s:g}" for s in sigma)
                 rows.append(
                     {
@@ -299,101 +314,129 @@ def _render_for_ff(vol, ff_tag, tune_level, out_dir, axes_list, axis_tag, args) 
                         **m,
                     }
                 )
-
-    # Montage pass (per open_iters x projection axis).
-    for op in args.open_iterations:
-        for ax in axes_list:
-            gray_mip = vol.max(axis=ax)
-            suffix = f"{ff_tag}_open{op}_{axis_tag[ax]}"
-            suptitle = (
-                f"level {tune_level}  flatfield={'on' if ff_tag == 'ff' else 'off'}"
-                f"  open={op}  proj={axis_tag[ax]}  (rows=threshold, cols=sigma)"
-                f"{depth_note}"
-            )
-            _render_montage(
-                vol_cp,
-                gray_mip,
-                args.thresholds,
-                args.smooth_sigmas,
-                op,
-                ax,
-                os.path.join(out_dir, f"montage_{suffix}.png"),
-                suptitle,
-                metrics,
-                depth_color,
-            )
+                combo_dir = os.path.join(
+                    out_dir, _combo_dirname(thr, sigma, op, ff_tag, multi_ff)
+                )
+                os.makedirs(combo_dir, exist_ok=True)
+                _render_triview(
+                    vol_cp,
+                    thr,
+                    sigma,
+                    op,
+                    m,
+                    depth_color,
+                    args.dpi,
+                    os.path.join(combo_dir, "views.png"),
+                )
+                _write_combo_params(
+                    os.path.join(combo_dir, "params.txt"),
+                    thr,
+                    sigma,
+                    op,
+                    cfg,
+                    tune_level,
+                    args.target_level,
+                    factor,
+                )
     return rows
 
 
-def _scaling_report(
-    bucket: str,
-    group_path: str,
-    tune_level: str,
-    target_level: str,
-    sigmas: List[Tuple[float, float, float]],
-    open_iters: List[int],
-) -> None:
-    """Print smooth_sigma/open_iterations scaled from the tune level to the target."""
+def _compute_scale_factor(bucket, group_path, tune_level, target_level):
+    """Return the (Z,Y,X) tune->target voxel-size factor, or None if unavailable.
+
+    Logs the factor + transfer guidance once. ``None`` when ``--target-level`` is unset
+    or the source multiscales metadata doesn't contain both levels.
+    """
+    if target_level is None:
+        return None
     ms_info = _read_source_multiscales(bucket, group_path)
     if ms_info is None:
-        logger.warning("No multiscales metadata; cannot compute scaling report.")
-        return
+        logger.warning("No multiscales metadata; cannot propose target-level params.")
+        return None
     _, datasets, _ = ms_info
     by_path = {d.get("path"): d for d in datasets}
     if tune_level not in by_path or target_level not in by_path:
         logger.warning(
-            "Levels %s/%s not both in datasets %s; skipping scaling report.",
+            "Levels %s/%s not both in datasets %s; no target-level proposals.",
             tune_level,
             target_level,
             list(by_path),
         )
-        return
+        return None
     s_tune = _scale_zyx(by_path[tune_level])
     s_target = _scale_zyx(by_path[target_level])
     if s_tune is None or s_target is None:
-        logger.warning("Missing scale transforms; skipping scaling report.")
-        return
+        logger.warning("Missing scale transforms; no target-level proposals.")
+        return None
     factor = tuple(t / s for t, s in zip(s_tune, s_target))
     logger.info(
-        "Scaling report: tune level %s -> target level %s, factor (Z,Y,X)=%s "
-        "(approximate; round as needed):",
+        "Tune level %s -> target level %s, factor (Z,Y,X)=%s (per-combo params.txt "
+        "carries the scaled values).",
         tune_level,
         target_level,
         tuple(round(f, 3) for f in factor),
     )
-    for sigma in sigmas:
-        for op in open_iters:
-            ssig, sop = scale_params(sigma, op, factor)
-            logger.info(
-                "  tune (σ=%s, open=%d)  ->  target (σ=%s, open=%d)",
-                sigma,
-                op,
-                tuple(round(s, 2) for s in ssig),
-                sop,
-            )
-    yx = (factor[1] + factor[2]) / 2.0
-    logger.info(
-        "Transfer guidance: the finer target level has ~%.0fx more per-voxel noise and "
-        "~%.0fx more voxels; the scaled sigma recovers most SNR but the noise tail "
-        "needs calibration:",
-        yx**1.5,
-        factor[0] * factor[1] * factor[2],
-    )
-    logger.info("  - keep the scaled σ above (preserves the physical smoothing scale);")
-    logger.info(
-        "  - nudge threshold UP slightly and add ~1 open_iteration to clear the extra "
-        "noise-tail specks at full resolution;"
-    )
-    logger.info(
-        "  - VALIDATE: rerun this tuner with --in-spec at the target level + a small "
-        "--crop to calibrate threshold/opening in the real noise regime (the coarse "
-        "sweep only fixes the physical scale)."
-    )
+    return factor
+
+
+_TRANSFER_GUIDANCE = (
+    "Transfer notes: threshold is in normalized units and transfers as-is. The scaled "
+    "sigma preserves the physical smoothing scale, but the finer level is noisier "
+    "(~factor^1.5x per-voxel) with more voxels, so nudge threshold UP slightly and add "
+    "~1 open_iteration, then validate on a small --crop at the target level."
+)
+
+
+def _write_combo_params(
+    path, thr, sigma, op, cfg, tune_level, target_level, factor
+) -> None:
+    """Write a per-combo params.txt: the tuner params + proposed target-level params."""
+    lines = [
+        "# GFP-mask tuning parameters",
+        f"tune_level: {tune_level}",
+        "",
+        "[mask params at this (tune) level]",
+        f"threshold: {thr:g}",
+        f"smooth_sigma: {list(sigma)}",
+        f"open_iterations: {op}",
+        "",
+        "[normalization config]",
+        f"normalize: {cfg.normalize}",
+        f"norm_lower: {cfg.norm_lower}",
+        f"norm_upper: {cfg.norm_upper}",
+        f"flatfield: {cfg.flatfield}",
+    ]
+    if cfg.flatfield:
+        lines += [
+            f"flatfield_mode: {cfg.flatfield_mode}",
+            f"flatfield_level: {cfg.flatfield_level}",
+            f"flatfield_opening_radius: {cfg.flatfield_opening_radius}",
+            f"flatfield_sigma: {cfg.flatfield_sigma}",
+        ]
+    lines.append("")
+    if factor is not None:
+        ssig, sop = scale_params(sigma, op, factor)
+        lines += [
+            f"[proposed params for target level {target_level}]",
+            f"threshold: {thr:g}",
+            f"smooth_sigma: {[round(s, 3) for s in ssig]}",
+            f"open_iterations: {sop}",
+            f"scale_factor_zyx: {tuple(round(f, 3) for f in factor)}",
+            "",
+            _TRANSFER_GUIDANCE,
+        ]
+    else:
+        lines.append(
+            "[proposed params] pass --target-level (with source multiscales) to get "
+            "target-resolution proposals."
+        )
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def _parse_args(argv: List[str]) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Sweep gfp-mask parameters on a coarse level; render MIP montages."
+        description="Sweep gfp-mask parameters on a coarse level; one folder per combo."
     )
     ap.add_argument(
         "--in-spec",
@@ -411,21 +454,21 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         type=float,
         nargs="+",
         default=[0.02, 0.05, 0.1],
-        help="Threshold values to sweep (montage rows).",
+        help="Threshold values to sweep.",
     )
     ap.add_argument(
         "--smooth-sigmas",
         type=_parse_sigma,
         nargs="+",
         default=[(0.5, 1, 1), (1, 2, 2), (1, 3, 3)],
-        help="smooth_sigma 'z,y,x' triples to sweep (montage columns).",
+        help="smooth_sigma 'z,y,x' triples to sweep.",
     )
     ap.add_argument(
         "--open-iterations",
         type=int,
         nargs="+",
         default=[1],
-        help="open_iterations values; one montage PNG per value.",
+        help="open_iterations values to sweep.",
     )
     ap.add_argument(
         "--crop",
@@ -435,27 +478,27 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         metavar=("Z0", "Z1", "Y0", "Y1", "X0", "X1"),
         help="Optional sub-region (absolute tune-level voxel coords).",
     )
-    ap.add_argument("--mip-axis", type=int, default=0, help="MIP axis (0=Z,1=Y,2=X).")
     ap.add_argument(
         "--flat-mask",
         action="store_true",
-        help="Overlay the mask in flat red instead of depth-coding it by z (turbo).",
-    )
-    ap.add_argument(
-        "--ortho",
-        action="store_true",
-        help="Render all three projections (XY/XZ/YZ) for depth, not just --mip-axis.",
+        help="Overlay the mask in flat red instead of depth-coding it (turbo).",
     )
     ap.add_argument(
         "--sweep-flatfield",
         action="store_true",
-        help="Also render a flat-field OFF montage for comparison.",
+        help="Also render a flat-field OFF variant for comparison.",
+    )
+    ap.add_argument(
+        "--dpi",
+        type=int,
+        default=200,
+        help="Output PNG resolution; raise (e.g. 300) for more zoomable detail.",
     )
     ap.add_argument(
         "--out",
         default="gfp_tune",
-        help="Output folder (a trailing '.png' is stripped). Montages + metrics.csv "
-        "are written inside it.",
+        help="Output root folder (trailing '.png' stripped). One subfolder per param "
+        "combo (views.png + params.txt) plus metrics.csv.",
     )
     ap.add_argument("--aws-region", default="us-west-2")
     ap.add_argument(
@@ -471,7 +514,7 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    """Render parameter-sweep MIP montages for the gfp-mask on a coarse level."""
+    """Sweep gfp-mask params; one folder per combo (tri-view PNG + params.txt)."""
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     spec = args.in_spec if args.in_spec is not None else DEFAULT_IN_SPEC
 
@@ -519,31 +562,23 @@ def main(argv: Optional[List[str]] = None) -> None:
     if args.sweep_flatfield and cfg.flatfield:
         ff_settings.append(False)
 
-    # All outputs go into one folder derived from --out (".png" stripped).
+    # All outputs go into one root folder derived from --out (".png" stripped).
     out_dir = args.out[:-4] if args.out.lower().endswith(".png") else args.out
     os.makedirs(out_dir, exist_ok=True)
     logger.info("Writing outputs to %s/", out_dir)
-    # --ortho renders all three projections; otherwise just the requested axis.
-    axis_tag = {0: "xy", 1: "xz", 2: "yz"}
-    axes_list = [0, 1, 2] if args.ortho else [args.mip_axis]
+
+    # Tune->target voxel-size factor (once) for the per-combo params.txt proposals.
+    factor = _compute_scale_factor(bucket, group_path, tune_level, args.target_level)
+    multi_ff = len(ff_settings) > 1
+
     all_rows = []
     for use_ff in ff_settings:
         vol = _preprocess(spec, cfg, raw, bbox, full_shape, use_ff)
         ff_tag = "ff" if (use_ff and cfg.flatfield) else "noff"
         all_rows += _render_for_ff(
-            vol, ff_tag, tune_level, out_dir, axes_list, axis_tag, args
+            vol, ff_tag, tune_level, out_dir, args, cfg, factor, multi_ff
         )
     _write_metrics_csv(os.path.join(out_dir, "metrics.csv"), all_rows)
-
-    if args.target_level is not None:
-        _scaling_report(
-            bucket,
-            group_path,
-            tune_level,
-            args.target_level,
-            args.smooth_sigmas,
-            args.open_iterations,
-        )
 
 
 if __name__ == "__main__":
