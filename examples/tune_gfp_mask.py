@@ -36,6 +36,7 @@ Requires the ``postprocess`` (cupy) + ``extras`` (matplotlib) optional dependenc
 """
 import argparse
 import csv
+import json
 import logging
 import os
 import re
@@ -387,10 +388,76 @@ _TRANSFER_GUIDANCE = (
 )
 
 
+def _normalization_params(cfg) -> dict:
+    """Normalization/flat-field keys from cfg, as a params.json dict fragment."""
+    out = {
+        "normalize": cfg.normalize,
+        "norm_lower": cfg.norm_lower,
+        "norm_upper": cfg.norm_upper,
+    }
+    if cfg.flatfield:
+        out.update(
+            {
+                "flatfield": True,
+                "flatfield_mode": cfg.flatfield_mode,
+                "flatfield_level": cfg.flatfield_level,
+                "flatfield_opening_radius": cfg.flatfield_opening_radius,
+                "flatfield_sigma": cfg.flatfield_sigma,
+            }
+        )
+    return out
+
+
 def _write_combo_params(
     path, thr, sigma, op, cfg, tune_level, target_level, factor
 ) -> None:
-    """Write a per-combo params.txt: the tuner params + proposed target-level params."""
+    """Write a per-combo params.txt + run_params.json with copy-paste run commands.
+
+    ``run_params.json`` (written next to params.txt) carries the destination-resolution
+    params (scaled sigma/open if a tune->target factor is available, threshold as-is)
+    plus the normalization config, so both the crop-validation and full-scale commands
+    are runnable as-is once you fill in the spec/bucket/crop placeholders.
+    """
+    combo_dir = os.path.dirname(path)
+    # Destination-resolution params (scaled to the target level when possible).
+    if factor is not None:
+        dest_sigma_t, dest_op = scale_params(sigma, op, factor)
+        dest_sigma = [round(s, 3) for s in dest_sigma_t]
+        dest_level = target_level
+    else:
+        dest_sigma, dest_op, dest_level = list(sigma), op, tune_level
+
+    run_params = {
+        **_normalization_params(cfg),
+        "threshold": thr,
+        "smooth_sigma": dest_sigma,
+        "open_iterations": dest_op,
+    }
+    with open(os.path.join(combo_dir, "run_params.json"), "w") as f:
+        json.dump(run_params, f, indent=2)
+
+    sig_csv = ",".join(f"{s:g}" for s in dest_sigma)
+    spec = f"<SPEC@level{dest_level}>"  # tensorstore spec/JSON pointing at dest level
+    crop_cmd = " \\\n".join(
+        [
+            "python examples/tune_gfp_mask.py",
+            f"  --in-spec {spec} --params-json run_params.json",
+            f"  --thresholds {thr:g} --smooth-sigmas {sig_csv} "
+            f"--open-iterations {dest_op}",
+            "  --crop Z0 Z1 Y0 Y1 X0 X1 --out crop_check",
+        ]
+    )
+    scale_cmd = " \\\n".join(
+        [
+            "python examples/run_gfp_mask_example.py",
+            f"  --in-spec {spec}",
+            "  --out-bucket <OUT_BUCKET> --out-prefix <OUT_PREFIX>",
+            "  --params-json run_params.json",
+            "  --devices cuda:0 --prep-workers 8 --writer-workers 4 --batch 32",
+            "  --metrics-json run_metrics.json",
+        ]
+    )
+
     lines = [
         "# GFP-mask tuning parameters",
         f"tune_level: {tune_level}",
@@ -415,21 +482,31 @@ def _write_combo_params(
         ]
     lines.append("")
     if factor is not None:
-        ssig, sop = scale_params(sigma, op, factor)
         lines += [
-            f"[proposed params for target level {target_level}]",
+            f"[proposed params for target level {target_level}] "
+            "(also in run_params.json)",
             f"threshold: {thr:g}",
-            f"smooth_sigma: {[round(s, 3) for s in ssig]}",
-            f"open_iterations: {sop}",
+            f"smooth_sigma: {dest_sigma}",
+            f"open_iterations: {dest_op}",
             f"scale_factor_zyx: {tuple(round(f, 3) for f in factor)}",
             "",
             _TRANSFER_GUIDANCE,
         ]
     else:
         lines.append(
-            "[proposed params] pass --target-level (with source multiscales) to get "
-            "target-resolution proposals."
+            "[proposed params] pass --target-level (with source multiscales) for "
+            "target-resolution proposals; run_params.json uses the tune-level values."
         )
+    lines += [
+        "",
+        f"# 1) PROOF-READ on a small crop at level {dest_level} (set the --crop bbox),",
+        "#    then visually inspect crop_check/.../views.png before scaling up:",
+        crop_cmd,
+        "",
+        f"# 2) RUN AT SCALE to the final destination at level {dest_level} once the",
+        "#    crop looks good (fill in OUT_BUCKET/OUT_PREFIX and tune worker counts):",
+        scale_cmd,
+    ]
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
 
