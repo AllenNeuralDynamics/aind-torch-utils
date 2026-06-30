@@ -60,8 +60,9 @@ def create_gfp_mask_gpu(
     threshold: float = 0.1,
     smooth_sigma: Optional[Tuple[float, float, float]] = (0.5, 1, 1),
     open_iterations: int = 1,
+    seed_threshold: Optional[float] = None,
 ) -> "cp.ndarray":
-    """Create a binary GFP mask for a single 3D volume on the GPU.
+    """Create a GFP mask for a single 3D volume on the GPU.
 
     Light Gaussian smooth + global threshold + optional morphological opening to
     drop tiny specks (still biased toward oversegmentation). The input is assumed
@@ -82,23 +83,34 @@ def create_gfp_mask_gpu(
         Iterations of binary opening (erosion->dilation) with a 3x3x3 cube to remove
         tiny dots after thresholding. ``0`` disables cleanup; higher values remove
         larger specks. This is a local op (no connected-component labeling).
+    seed_threshold : float, optional
+        If given (must be ``> threshold``), emit a **2-level** mask for downstream
+        hysteresis instead of a binary one: ``0`` background, ``1`` grow
+        (``>= threshold``), ``2`` seed (``>= seed_threshold``, a subset of grow). A
+        later connected-components pass keeps only grow components that contain a seed.
+        ``None`` keeps the plain binary ``{0, 1}`` behavior.
 
     Returns
     -------
     cupy.ndarray
-        ``uint8`` mask of shape ``(Z, Y, X)`` with values in ``{0, 1}``.
+        ``uint8`` mask of shape ``(Z, Y, X)``, values in ``{0, 1}`` (or ``{0, 1, 2}``
+        when ``seed_threshold`` is set).
     """
     x = img.astype(cp.float32)
     if smooth_sigma is not None:
         x = cndi.gaussian_filter(x, sigma=tuple(smooth_sigma))
-    mask = x >= threshold
+    low = x >= threshold
     if open_iterations > 0:
         struct = cp.ones((3, 3, 3), dtype=bool)  # full 3x3x3 cube
         # brute_force=True: cupy only implements the brute-force path for iterations>1.
-        mask = cndi.binary_opening(
-            mask, structure=struct, iterations=open_iterations, brute_force=True
+        low = cndi.binary_opening(
+            low, structure=struct, iterations=open_iterations, brute_force=True
         )
-    return mask.astype(cp.uint8)
+    if seed_threshold is None:
+        return low.astype(cp.uint8)
+    # 2-level: seed (>= seed_threshold) AND grow, so level 2 implies level 1.
+    seed = (x >= seed_threshold) & low
+    return low.astype(cp.uint8) + seed.astype(cp.uint8)
 
 
 class GfpMaskModel(nn.Module):
@@ -126,6 +138,9 @@ class GfpMaskModel(nn.Module):
         Iterations of binary opening (erosion->dilation) with a 3x3x3 cube to remove
         tiny dots after thresholding. ``0`` disables cleanup; higher values remove
         larger specks.
+    seed_threshold : float, optional
+        If set (``> threshold``), emit a 2-level mask (``0`` bg, ``1`` grow, ``2`` seed)
+        for downstream hysteresis instead of binary. ``None`` keeps binary ``{0, 1}``.
     """
 
     def __init__(
@@ -133,12 +148,14 @@ class GfpMaskModel(nn.Module):
         threshold: float = 0.1,
         smooth_sigma: Optional[Tuple[float, float, float]] = (0.5, 1, 1),
         open_iterations: int = 1,
+        seed_threshold: Optional[float] = None,
     ):
         """Store masking parameters (no learnable state)."""
         super().__init__()
         self.threshold = threshold
         self.smooth_sigma = smooth_sigma
         self.open_iterations = open_iterations
+        self.seed_threshold = seed_threshold
 
     @classmethod
     def from_json(cls, path: str) -> "GfpMaskModel":
@@ -189,19 +206,24 @@ class GfpMaskModel(nn.Module):
                 # Zero sigma on the batch/channel axes prevents bleed across volumes,
                 # so the batched smooth is identical to processing each independently.
                 vol = cndi.gaussian_filter(vol, sigma=(0, 0) + tuple(self.smooth_sigma))
-            mask = vol >= self.threshold  # bool, (B, 1, Z, Y, X)
+            low = vol >= self.threshold  # bool, (B, 1, Z, Y, X)
             if self.open_iterations > 0:
                 # Unit extent on the batch/channel axes confines the opening to each
                 # volume's (Z, Y, X), so the batched result matches per-volume.
                 struct = cp.ones((1, 1, 3, 3, 3), dtype=bool)
                 # brute_force=True: cupy only implements that path for iterations>1.
-                mask = cndi.binary_opening(
-                    mask,
+                low = cndi.binary_opening(
+                    low,
                     structure=struct,
                     iterations=self.open_iterations,
                     brute_force=True,
                 )
-            mask = mask.astype(cp.uint8)
+            if self.seed_threshold is None:
+                mask = low.astype(cp.uint8)
+            else:
+                # 2-level mask {0,1,2} for hysteresis (seed implies grow).
+                seed = (vol >= self.seed_threshold) & low
+                mask = low.astype(cp.uint8) + seed.astype(cp.uint8)
             # Clone into a torch-owned tensor so the cupy memory pool can't reclaim
             # the buffer while the writer's async D2H copy is still in flight.
             # torch.from_dlpack consumes cupy's __dlpack__ directly (no .toDlpack()).

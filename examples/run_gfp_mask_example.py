@@ -101,6 +101,7 @@ import tensorstore as ts
 
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.correction import BackgroundField
+from aind_torch_utils.labeling import UnionFind, block_ranges, union_faces
 from aind_torch_utils.postprocessing import read_pipeline_params
 from aind_torch_utils.run import load_model, run
 from aind_torch_utils.utils import open_ts_spec
@@ -503,6 +504,165 @@ def _upsample_mask_pyramid(
     asyncio.run(_build_levels())
 
 
+def _hysteresis_connect(
+    bucket: str,
+    base_path: str,
+    seed_src_path: str,
+    final_path: str,
+    region: str,
+    block: int = 512,
+    chunk: int = 128,
+) -> None:
+    """Collapse a 2-level mask {0,1,2} into a binary mask by seam-correct hysteresis.
+
+    Keeps 26-connected components of the grow mask (``m >= 1``) that contain >=1
+    seed (``m == 2``). Labels each block on the GPU with cucim, stitches labels across
+    block faces with a union-find, propagates seed membership to component roots, then
+    re-labels each block and writes the binary result. Correct across block seams and
+    streamed block-by-block (no full int32 label volume is materialized).
+    """
+    import cupy as cp
+    from cucim.skimage.measure import label as cucim_label
+
+    ctx = ts.Context({"data_copy_concurrency": {"limit": 4}})
+    src = ts.open(
+        {
+            "driver": "zarr",
+            "kvstore": {
+                "driver": "s3",
+                "bucket": bucket,
+                "path": f"{base_path}{seed_src_path}",
+                "aws_region": region,
+            },
+        },
+        context=ctx,
+    ).result()
+    nz, ny, nx = (int(s) for s in src.domain.shape[-3:])
+
+    blocks = [
+        (z0, z1, y0, y1, x0, x1)
+        for (z0, z1) in block_ranges(nz, block)
+        for (y0, y1) in block_ranges(ny, block)
+        for (x0, x1) in block_ranges(nx, block)
+    ]
+
+    def _label_block(z0, z1, y0, y1, x0, x1):
+        m = cp.asarray(src[0, 0, z0:z1, y0:y1, x0:x1].read().result())
+        labels, k = cucim_label(m >= 1, return_num=True, connectivity=3)
+        return m, labels.astype(cp.int64), int(k)
+
+    # Pass A: label each block, record counts/offsets, seed labels, and 6 face planes.
+    metas = {}
+    offset = 0
+    for blk in blocks:
+        m, labels, k = _label_block(*blk)
+        seed = cp.unique(labels[m == 2])
+        seed = seed[seed > 0]
+        metas[blk] = {
+            "off": offset,
+            "seed": cp.asnumpy(seed),
+            "zlo": cp.asnumpy(labels[0]),
+            "zhi": cp.asnumpy(labels[-1]),
+            "ylo": cp.asnumpy(labels[:, 0]),
+            "yhi": cp.asnumpy(labels[:, -1]),
+            "xlo": cp.asnumpy(labels[:, :, 0]),
+            "xhi": cp.asnumpy(labels[:, :, -1]),
+        }
+        offset += k
+        del m, labels
+    total = offset
+    logger.info("[hysteresis] %d blocks, %d raw components", len(blocks), total)
+
+    # Union-find over global labels + seed flags.
+    uf = UnionFind(total + 1)
+    seeded = np.zeros(total + 1, dtype=bool)
+    for meta in metas.values():
+        seeded[meta["seed"].astype(np.int64) + meta["off"]] = True
+
+    def _glob(face, off):
+        g = face.astype(np.int64)
+        g = np.where(g > 0, g + off, 0)
+        return g
+
+    by_coord = {}  # (z0,y0,x0) -> blk for neighbour lookup
+    for blk in blocks:
+        by_coord[(blk[0], blk[2], blk[4])] = blk
+    for blk in blocks:
+        z0, z1, y0, y1, x0, x1 = blk
+        off_a = metas[blk]["off"]
+        for hi, lo, nbr in (
+            ("zhi", "zlo", (z1, y0, x0)),
+            ("yhi", "ylo", (z0, y1, x0)),
+            ("xhi", "xlo", (z0, y0, x1)),
+        ):
+            nb = by_coord.get(nbr)
+            if nb is None:
+                continue
+            union_faces(
+                uf,
+                _glob(metas[blk][hi], off_a),
+                _glob(metas[nb][lo], metas[nb]["off"]),
+            )
+
+    roots = uf.flatten_roots()
+    root_seeded = np.zeros(total + 1, dtype=bool)
+    np.logical_or.at(root_seeded, roots, seeded)
+    keep = root_seeded[roots]
+    keep[0] = False  # background
+
+    # Pass B: re-label each block, map to root, write the kept (binary) mask.
+    cz, cy, cx = min(chunk, nz), min(chunk, ny), min(chunk, nx)
+    out = ts.open(
+        {
+            "driver": "zarr",
+            "kvstore": {
+                "driver": "s3",
+                "bucket": bucket,
+                "path": f"{base_path}{final_path}",
+                "aws_region": region,
+            },
+            "metadata": {
+                "shape": [1, 1, nz, ny, nx],
+                "chunks": [1, 1, cz, cy, cx],
+                "dtype": "|u1",
+                "dimension_separator": "/",
+            },
+            "create": True,
+            "delete_existing": True,
+        },
+        context=ctx,
+    ).result()
+    keep_gpu = cp.asarray(keep)
+    for blk in blocks:
+        z0, z1, y0, y1, x0, x1 = blk
+        _, labels, _ = _label_block(*blk)
+        gl = cp.where(labels > 0, labels + metas[blk]["off"], 0)
+        out_block = keep_gpu[gl].astype(cp.uint8)
+        out[0, 0, z0:z1, y0:y1, x0:x1].write(cp.asnumpy(out_block)).result()
+        del labels, gl, out_block
+    logger.info(
+        "[hysteresis] wrote binary mask to %s%s (%d seeded components)",
+        base_path,
+        final_path,
+        int(root_seeded.sum()),
+    )
+
+
+def _run_hysteresis(args, base_path: str, level: str, seg_path: str) -> None:
+    """Collapse the 2-level mask into the final binary level, then clean up."""
+    logger.info("Hysteresis: %s -> %s%s/", seg_path, base_path, level)
+    _hysteresis_connect(
+        args.out_bucket,
+        base_path,
+        f"{level}_seed/",
+        f"{level}/",
+        args.aws_region,
+        block=args.hysteresis_block,
+    )
+    if not args.keep_seed_mask:
+        _delete_s3_prefix(args.out_bucket, seg_path, args.aws_region)
+
+
 def _write_output_group_metadata(
     bucket: str,
     base_path: str,
@@ -554,6 +714,27 @@ def _write_output_group_metadata(
         "Wrote OME-NGFF group metadata (.zgroup + .zattrs) to s3://%s/%s",
         bucket,
         base_path,
+    )
+
+
+def _finalize_pyramid(
+    args, base_path, spec, start, datasets, datasets_from_l, source_ms, omero
+) -> None:
+    """Build coarser levels (+ optional finer upsample) and write OME group metadata."""
+    _build_mask_pyramid(args.out_bucket, base_path, datasets_from_l, args.aws_region)
+
+    fill_finer = args.fill_finer_levels and start > 0
+    if args.fill_finer_levels and start == 0:
+        logger.info("--fill-finer-levels: segmented level is already finest; nothing.")
+    if fill_finer:
+        _upsample_mask_pyramid(
+            args.out_bucket, base_path, spec, datasets[: start + 1], args.aws_region
+        )
+
+    # Metadata lists every level when finer levels were filled, else L..N only.
+    meta_datasets = datasets if fill_finer else datasets_from_l
+    _write_output_group_metadata(
+        args.out_bucket, base_path, source_ms, meta_datasets, omero, args.aws_region
     )
 
 
@@ -674,6 +855,50 @@ def _normalization_kwargs(params_json: Optional[str]) -> dict:
     return kwargs
 
 
+def _seed_threshold(params_json: Optional[str], threshold: float) -> Optional[float]:
+    """Return the model's ``seed_threshold`` from params JSON, enabling hysteresis.
+
+    ``None`` if absent. Warns (and still returns) if it is not strictly above
+    ``threshold``, which would make the seed level degenerate.
+    """
+    if not params_json:
+        return None
+    with open(params_json) as f:
+        seed = json.load(f).get("seed_threshold")
+    if seed is not None and seed <= threshold:
+        logger.warning(
+            "seed_threshold (%s) <= threshold (%s); hysteresis seeds will be "
+            "degenerate. Set seed_threshold > threshold.",
+            seed,
+            threshold,
+        )
+    return seed
+
+
+def _model_threshold(params_json: Optional[str]) -> float:
+    """Read the model ``threshold`` from params JSON (default matches the model)."""
+    if not params_json:
+        return 0.1
+    with open(params_json) as f:
+        return float(json.load(f).get("threshold", 0.1))
+
+
+def _delete_s3_prefix(bucket: str, prefix: str, region: str) -> None:
+    """Delete every object under an S3 prefix (used to drop the _seed intermediate)."""
+    s3 = boto3.client("s3", region_name=region)
+    paginator = s3.get_paginator("list_objects_v2")
+    batch = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            batch.append({"Key": obj["Key"]})
+            if len(batch) == 1000:
+                s3.delete_objects(Bucket=bucket, Delete={"Objects": batch})
+                batch = []
+    if batch:
+        s3.delete_objects(Bucket=bucket, Delete={"Objects": batch})
+    logger.info("Deleted intermediate s3://%s/%s", bucket, prefix)
+
+
 def _parse_args(argv: List[str]) -> argparse.Namespace:
     """Parse command-line arguments."""
     ap = argparse.ArgumentParser(
@@ -745,6 +970,19 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "(0..L-1) by nearest-upsampling the mask so the pyramid reaches full "
         "resolution (level 0 is a large S3 write; opt-in).",
     )
+    ap.add_argument(
+        "--hysteresis-block",
+        type=int,
+        default=512,
+        help="Block size for the post-hoc hysteresis CCL pass (when params.json sets "
+        "seed_threshold). Larger blocks use more VRAM but less face-stitch memory.",
+    )
+    ap.add_argument(
+        "--keep-seed-mask",
+        action="store_true",
+        help="Keep the intermediate 2-level '_seed' mask after hysteresis (default: "
+        "delete it). Useful to re-run hysteresis with a different seed_threshold.",
+    )
     return ap.parse_args(argv)
 
 
@@ -809,9 +1047,21 @@ def main(argv: Optional[List[str]] = None) -> None:
     # "<out-prefix>/Tile_X_0002_Y_0006_Z_0000_ch_488.ome.zarr/".
     tile_name = group_path.rstrip("/").rsplit("/", 1)[-1]
     base_path = f"{args.out_prefix.rstrip('/')}/{tile_name}/"
-    seg_path = f"{base_path}{level}/"
+
+    # Hysteresis (dual-threshold) is enabled when params.json sets seed_threshold. The
+    # streaming pass then writes a 2-level mask {0,1,2} to an intermediate "_seed" path;
+    # a seam-correct connected-components pass collapses it to the final binary level.
+    seed_thr = _seed_threshold(args.params_json, _model_threshold(args.params_json))
+    hysteresis = seed_thr is not None
+    seg_level = f"{level}_seed" if hysteresis else level
+    seg_path = f"{base_path}{seg_level}/"
     chunks = (1, 1, min(128, z), min(128, y), min(128, x))
-    logger.info("Creating segmented level: s3://%s/%s", args.out_bucket, seg_path)
+    logger.info(
+        "Creating %s level: s3://%s/%s",
+        "intermediate 2-level" if hysteresis else "segmented",
+        args.out_bucket,
+        seg_path,
+    )
     output_store = _open_or_create_s3_mask_zarr(
         args.out_bucket, seg_path, (1, 1, z, y, x), chunks, args.aws_region
     )
@@ -858,6 +1108,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     _summarize_metrics(args.metrics_json)
 
+    # --- Hysteresis: collapse the 2-level mask into the final binary at {level}/ ---
+    if hysteresis:
+        _run_hysteresis(args, base_path, level, seg_path)
+
     if args.no_pyramid:
         logger.info(
             "Done (single level %s). Skipped pyramid + OME metadata (--no-pyramid).",
@@ -865,22 +1119,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         )
         return
 
-    # --- Coarser levels L+1..N + OME-NGFF metadata mirroring the source ---
-    _build_mask_pyramid(args.out_bucket, base_path, datasets_from_l, args.aws_region)
-
-    # --- Optionally fill the finer levels (0..L-1) by upsampling the level-L mask ---
-    fill_finer = args.fill_finer_levels and start > 0
-    if args.fill_finer_levels and start == 0:
-        logger.info("--fill-finer-levels: segmented level is already finest; nothing.")
-    if fill_finer:
-        _upsample_mask_pyramid(
-            args.out_bucket, base_path, spec, datasets[: start + 1], args.aws_region
-        )
-
-    # Metadata lists every level when the finer levels were filled, else L..N only.
-    meta_datasets = datasets if fill_finer else datasets_from_l
-    _write_output_group_metadata(
-        args.out_bucket, base_path, source_ms, meta_datasets, omero, args.aws_region
+    _finalize_pyramid(
+        args, base_path, spec, start, datasets, datasets_from_l, source_ms, omero
     )
     logger.info("Done. OME-Zarr mask written to s3://%s/%s", args.out_bucket, base_path)
 
