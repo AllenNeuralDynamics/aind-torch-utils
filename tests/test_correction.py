@@ -4,6 +4,7 @@ import numpy as np
 from aind_torch_utils.correction import (
     BackgroundField,
     apply_flatfield,
+    fill_no_data,
     normalize_global,
     sample_background,
     scale_params,
@@ -154,3 +155,40 @@ def test_subtract_flattens_shading_for_uniform_threshold():
 
     # Residual is the constant contrast everywhere -> one threshold catches it all.
     np.testing.assert_allclose(out, signal_contrast, rtol=0, atol=1e-3)
+
+
+def _min_filter_1d(a, size=3):
+    """A tiny 1-D grey erosion (min filter) with edge padding, for the test below."""
+    r = size // 2
+    pad = np.pad(a, r, mode="edge")
+    out = []
+    for i in range(len(a)):
+        end = i + size
+        out.append(pad[i:end].min())
+    return np.array(out)
+
+
+def test_fill_no_data_fills_with_valid_median():
+    v = np.array([0, 0, 10, 20, 30, 40], dtype=np.float32)  # the 0s are no-data
+    out = fill_no_data(v, 0.0)
+    med = np.median([10, 20, 30, 40])  # 25
+    assert out[0] == med and out[1] == med
+    assert np.array_equal(out[2:], v[2:])  # valid voxels untouched
+
+
+def test_fill_no_data_is_noop_when_all_or_none_valid():
+    v = np.array([1, 2, 3], dtype=np.float32)
+    assert fill_no_data(v, 0.0) is v  # all valid -> same object
+    z = np.zeros(3, dtype=np.float32)
+    assert fill_no_data(z, 0.0) is z  # none valid -> same object
+
+
+def test_fill_no_data_prevents_background_underestimate_at_interface():
+    # Empty (0) abutting tissue (~100): a grey-opening's erosion drags the tissue-side
+    # background to 0 at the interface (-> white top-hat leaves a bright rim). Filling
+    # the no-data region with the valid median keeps the estimate flat across it.
+    raw = np.array([0, 0, 0, 100, 100, 100, 100], dtype=np.float32)
+    filled = fill_no_data(raw, 0.0)
+    assert np.allclose(filled, 100.0)  # zeros -> median of the 100s
+    assert _min_filter_1d(raw, 3)[3] == 0.0  # tissue voxel next to empty: under-est.
+    assert _min_filter_1d(filled, 3)[3] == 100.0  # fixed after fill

@@ -105,6 +105,40 @@ def normalize_global(block, lower: float, upper: float, eps: float = 1e-6):
     return (block.clip(lower, upper) - lower) / scale
 
 
+def fill_no_data(volume, empty_threshold: float = 0.0):
+    """Replace no-data voxels with the valid-voxel median (for background estimation).
+
+    Empty/zero regions of a fused volume (value ``<= empty_threshold``) otherwise drag a
+    morphological background estimate *down* near the empty/tissue interface -- a
+    grey-opening's erosion reaches into the zeros -- so a white top-hat (``subtract``)
+    correction leaves a bright residual rim exactly at the tissue boundary. Replacing
+    the no-data voxels with a representative tissue-background level (the median of the
+    valid voxels) before the opening/smoothing keeps the estimate flat across it.
+    The empty region still corrects to ~0 (raw 0 minus a positive background, clamped).
+
+    Parameters
+    ----------
+    volume : np.ndarray
+        Raw-intensity array (e.g. the coarse flat-field level).
+    empty_threshold : float
+        Voxels ``<= empty_threshold`` are treated as no-data. ``0.0`` treats only
+        exactly-zero (the typical fused fill) as empty.
+
+    Returns
+    -------
+    np.ndarray
+        A copy with no-data voxels filled, or ``volume`` unchanged when every voxel is
+        valid or none are.
+    """
+    valid = volume > empty_threshold
+    n_valid = int(valid.sum())
+    if n_valid == 0 or n_valid == volume.size:
+        return volume
+    out = volume.copy()
+    out[~valid] = np.median(volume[valid])
+    return out
+
+
 def scale_params(
     smooth_sigma: Tuple[float, float, float],
     open_iterations: int,

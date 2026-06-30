@@ -38,6 +38,7 @@ PIPELINE_PARAM_KEYS = (
     "flatfield_level",
     "flatfield_opening_radius",
     "flatfield_sigma",
+    "flatfield_empty_threshold",
 )
 
 

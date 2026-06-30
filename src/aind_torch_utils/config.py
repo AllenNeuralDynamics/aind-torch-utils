@@ -119,6 +119,15 @@ class InferenceConfig(BaseModel):
         default=0.0,
         description="Gaussian smoothing sigma (coarse-level voxels) for the estimate.",
     )
+    flatfield_empty_threshold: float = Field(
+        default=0.0,
+        description=(
+            "Voxels <= this raw intensity are treated as no-data (empty fused regions) "
+            "and filled with the valid-voxel median before the background estimate, so "
+            "the empty/tissue interface doesn't bias the flat-field and leave a bright "
+            "rim there. 0.0 treats only exactly-zero as empty."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate(self):

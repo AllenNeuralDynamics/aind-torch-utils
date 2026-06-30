@@ -68,6 +68,16 @@ is the coarse level the background is estimated from; ``flatfield_opening_radius
 (coarse voxels) strips sparse cells from the estimate; ``flatfield_mode`` may be
 ``"subtract"`` (default, white top-hat) or ``"divide"`` (multiplicative shading).
 
+If a fused volume has empty (zero) regions, the background estimate's grey-opening
+reaches across the empty/tissue interface into the zeros and under-estimates the
+background on the tissue side, so ``subtract`` leaves a bright false-positive rim
+*at the tissue boundary* (not the volume edge). ``flatfield_empty_threshold`` (default
+``0.0``) fixes this: voxels ``<=`` it are treated as no-data and filled with the
+valid-voxel median before the estimate, keeping it flat across the interface. ``0.0``
+catches exactly-zero fill; raise it to the empty region's intensity ceiling if the
+"empty" area is faintly non-zero (e.g. ``"flatfield_empty_threshold": 5.0``). The run
+logs how many no-data voxels were filled.
+
 Performance
 -----------
 The gfp-mask "model" is a classical cupy routine, not a deep net. Its
@@ -100,7 +110,7 @@ import numpy as np
 import tensorstore as ts
 
 from aind_torch_utils.config import InferenceConfig
-from aind_torch_utils.correction import BackgroundField
+from aind_torch_utils.correction import BackgroundField, fill_no_data
 from aind_torch_utils.labeling import UnionFind, block_ranges, union_faces
 from aind_torch_utils.postprocessing import read_pipeline_params
 from aind_torch_utils.run import load_model, run
@@ -288,6 +298,19 @@ def _estimate_background(spec, cfg, processing_shape: Tuple[int, int, int]):
             coarse.shape,
             step,
         )
+
+    # Fill no-data (empty fused regions) with the valid-voxel median before the
+    # morphology, so the empty/tissue interface doesn't drag the background down and
+    # leave a bright rim there under subtract correction.
+    filled = fill_no_data(coarse, cfg.flatfield_empty_threshold)
+    if filled is not coarse:
+        n_empty = int((coarse <= cfg.flatfield_empty_threshold).sum())
+        logger.info(
+            "Flat-field: filled %d no-data voxels (<= %g) with the valid median.",
+            n_empty,
+            cfg.flatfield_empty_threshold,
+        )
+        coarse = filled
 
     cg = cp.asarray(coarse).astype(cp.float32)
     radius = int(round(cfg.flatfield_opening_radius / step))
@@ -1027,6 +1050,7 @@ _FLATFIELD_KEYS = (
     "flatfield_level",
     "flatfield_opening_radius",
     "flatfield_sigma",
+    "flatfield_empty_threshold",
 )
 
 
