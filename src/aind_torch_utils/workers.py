@@ -487,6 +487,14 @@ class GpuWorker:
                 host_out.copy_(out, non_blocking=True)
                 evt.record()  # marks completion of the D2H on copy_stream
 
+            # out is produced on the compute stream but consumed by copy_stream.
+            # The caching allocator only tracks the producing stream, so without
+            # this it could hand out's memory to a later compute-stream
+            # allocation while this async D2H is still reading it (a
+            # write-after-read hazard). record_stream makes the allocator also
+            # wait for copy_stream before recycling the block.
+            out.record_stream(self.copy_stream)
+
             preds = Preds(
                 block_idx=batch.block_idx,
                 block_bbox=batch.block_bbox,

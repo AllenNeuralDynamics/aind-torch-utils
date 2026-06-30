@@ -37,16 +37,24 @@ def test_precision_performance_config_overrides(field):
         ("max-autotune", "max-autotune-no-cudagraphs"),
     ],
 )
-def test_compile_cudagraph_modes_are_downgraded_for_multi_cuda(
-    requested_mode, expected_mode
+@pytest.mark.parametrize(
+    "devices",
+    [["cuda:0"], ["cuda:0", "cuda:1"]],
+    ids=["single_cuda", "multi_cuda"],
+)
+def test_compile_cudagraph_modes_are_downgraded_for_cuda(
+    devices, requested_mode, expected_mode
 ):
-    with pytest.warns(RuntimeWarning, match="threaded multi-GPU"):
+    # Threaded capture fails on a single GPU too (capture runs on a worker
+    # thread, separate from warmup), so the downgrade applies whenever any
+    # CUDA device is present, not just multi-GPU.
+    with pytest.warns(RuntimeWarning, match="threaded"):
         cfg = InferenceConfig(
             patch=(16, 16, 16),
             overlap=4,
             trim_voxels=2,
             block=(32, 32, 32),
-            devices=["cuda:0", "cuda:1"],
+            devices=devices,
             use_compile=True,
             compile_mode=requested_mode,
         )
@@ -54,7 +62,7 @@ def test_compile_cudagraph_modes_are_downgraded_for_multi_cuda(
     assert cfg.compile_mode == expected_mode
 
 
-def test_compile_cudagraph_mode_allowed_for_single_cuda():
+def test_non_cudagraph_compile_mode_is_left_unchanged_for_cuda():
     cfg = InferenceConfig(
         patch=(16, 16, 16),
         overlap=4,
@@ -62,7 +70,7 @@ def test_compile_cudagraph_mode_allowed_for_single_cuda():
         block=(32, 32, 32),
         devices=["cuda:0"],
         use_compile=True,
-        compile_mode="reduce-overhead",
+        compile_mode="max-autotune-no-cudagraphs",
     )
 
-    assert cfg.compile_mode == "reduce-overhead"
+    assert cfg.compile_mode == "max-autotune-no-cudagraphs"

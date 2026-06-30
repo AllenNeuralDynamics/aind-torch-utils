@@ -242,7 +242,15 @@ class InferenceConfig(BaseModel):
         cuda_device_count = sum(
             str(device).lower().startswith("cuda") for device in self.devices
         )
-        if self.use_compile and cuda_device_count > 1:
+        # CUDA-graph compile modes are unsafe under this pipeline's threaded
+        # execution, on a single GPU as well as multi-GPU. torch.compile
+        # captures the graph lazily on the *second* forward, which runs inside
+        # GpuWorker.run on a worker thread, while the warmup forward ran on the
+        # main thread during worker construction. CUDA graph capture cannot
+        # span that thread boundary and aborts with
+        # cudaErrorStreamCaptureInvalidated. Downgrade to the equivalent
+        # non-cudagraph mode whenever any CUDA device is in play.
+        if self.use_compile and cuda_device_count > 0:
             safe_compile_modes = {
                 "reduce-overhead": "default",
                 "max-autotune": "max-autotune-no-cudagraphs",
@@ -252,9 +260,9 @@ class InferenceConfig(BaseModel):
                 warnings.warn(
                     (
                         f"torch.compile mode '{self.compile_mode}' enables "
-                        "CUDA graphs, "
-                        "which can fail in threaded multi-GPU runs; using "
-                        f"'{safe_mode}' instead."
+                        "CUDA graphs, which fail in this pipeline's threaded "
+                        "GPU workers (capture runs on a worker thread, separate "
+                        f"from warmup); using '{safe_mode}' instead."
                     ),
                     RuntimeWarning,
                 )
