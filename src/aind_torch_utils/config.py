@@ -4,6 +4,14 @@ from typing import List, Literal, Optional, Tuple, Union
 from pydantic import BaseModel, Field, model_validator
 
 
+CompileMode = Literal[
+    "default",
+    "reduce-overhead",
+    "max-autotune",
+    "max-autotune-no-cudagraphs",
+]
+
+
 class InferenceConfig(BaseModel):
     # Geometry
     patch: Tuple[int, int, int] = Field(
@@ -32,13 +40,20 @@ class InferenceConfig(BaseModel):
         default=False, description="Enable cuDNN benchmarking"
     )
     use_compile: bool = Field(default=False, description="Use torch.compile")
-    compile_mode: str = Field(
-        default="reduce-overhead",
-        description="Torch.compile mode",  # or "max-autotune" if you want extra tuning time
+    compile_mode: CompileMode = Field(
+        default="default",
+        description="Torch.compile mode",
     )
-    compile_dynamic: bool = Field(
-        default=True, description="Torch.compile with dynamic shapes"
-    )  # tolerate last-batch size changes
+    compile_dynamic: Optional[bool] = Field(
+        default=None,
+        description=(
+            "torch.compile dynamic shapes: None (auto) compiles static and "
+            "promotes to dynamic on a shape change; True forces dynamic; "
+            "False recompiles per shape. Input shapes are constant (tail "
+            "batches are padded), so auto yields one static-specialized "
+            "graph."
+        ),
+    )
 
     # Concurrency / queues
     max_inflight_batches: int = Field(default=64, description="Max in-flight batches")
@@ -224,5 +239,33 @@ class InferenceConfig(BaseModel):
         # Devices
         if not self.devices:
             raise ValueError("devices list must not be empty")
+        cuda_device_count = sum(
+            str(device).lower().startswith("cuda") for device in self.devices
+        )
+        # CUDA-graph compile modes are unsafe under this pipeline's threaded
+        # execution, on a single GPU as well as multi-GPU. torch.compile
+        # captures the graph lazily on the *second* forward, which runs inside
+        # GpuWorker.run on a worker thread, while the warmup forward ran on the
+        # main thread during worker construction. CUDA graph capture cannot
+        # span that thread boundary and aborts with
+        # cudaErrorStreamCaptureInvalidated. Downgrade to the equivalent
+        # non-cudagraph mode whenever any CUDA device is in play.
+        if self.use_compile and cuda_device_count > 0:
+            safe_compile_modes = {
+                "reduce-overhead": "default",
+                "max-autotune": "max-autotune-no-cudagraphs",
+            }
+            safe_mode = safe_compile_modes.get(self.compile_mode)
+            if safe_mode:
+                warnings.warn(
+                    (
+                        f"torch.compile mode '{self.compile_mode}' enables "
+                        "CUDA graphs, which fail in this pipeline's threaded "
+                        "GPU workers (capture runs on a worker thread, separate "
+                        f"from warmup); using '{safe_mode}' instead."
+                    ),
+                    RuntimeWarning,
+                )
+                self.compile_mode = safe_mode
 
         return self
