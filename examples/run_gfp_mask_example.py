@@ -134,7 +134,6 @@ DOWNSAMPLE_METHOD = "max"  # keeps coarser mask levels strictly binary
 # Max per-axis size for the (low-frequency) flat-field estimate; larger coarse levels
 # are stride-subsampled to this before the GPU morphology, to avoid OOM.
 FLATFIELD_MAX_DIM = 256
-MAX_INFLIGHT = 8  # concurrent downsample chunks (peak RAM ~ MAX_INFLIGHT x chunk)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -329,12 +328,34 @@ def _estimate_background(spec, cfg, processing_shape: Tuple[int, int, int]):
     return BackgroundField(field=field, scale=scale)
 
 
+async def _gather_bounded(ranges, make_coro, limit: int) -> None:
+    """Run ``make_coro(*r)`` for each range, keeping at most ``limit`` tasks in flight.
+
+    A sliding window rather than a per-batch barrier: a new task starts as soon as any
+    finishes, so slow S3 round-trips don't stall the rest (this step is latency-bound,
+    so a high ``limit`` is what hides the per-request latency). Exceptions propagate.
+    """
+    pending: set = set()
+    for r in ranges:
+        if len(pending) >= limit:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for d in done:
+                d.result()  # surface any exception immediately
+        pending.add(asyncio.create_task(make_coro(*r)))
+    if pending:
+        await asyncio.gather(*pending)
+
+
 def _build_mask_pyramid(
     bucket: str,
     base_path: str,
     datasets_from_l: list,
     region: str,
     chunk: int = 128,
+    concurrency: int = 64,
+    copy_concurrency: int = 16,
 ) -> None:
     """Generate coarser mask levels by downsampling the segmented level.
 
@@ -351,8 +372,7 @@ def _build_mask_pyramid(
         return [max(1, round(s_cur[a] / s_prev[a])) for a in range(3)]
 
     async def _build_levels():
-        sem = asyncio.Semaphore(MAX_INFLIGHT)
-        ctx = ts.Context({"data_copy_concurrency": {"limit": 4}})
+        ctx = ts.Context({"data_copy_concurrency": {"limit": copy_concurrency}})
 
         for i in range(1, len(datasets_from_l)):
             prev_ds, ds = datasets_from_l[i - 1], datasets_from_l[i]
@@ -401,10 +421,9 @@ def _build_mask_pyramid(
             )
 
             async def _copy(z0, z1, y0, y1, x0, x1):
-                async with sem:
-                    data = await downsampled[:, :, z0:z1, y0:y1, x0:x1].read()
-                    await output[:, :, z0:z1, y0:y1, x0:x1].write(data)
-                    del data
+                data = await downsampled[:, :, z0:z1, y0:y1, x0:x1].read()
+                await output[:, :, z0:z1, y0:y1, x0:x1].write(data)
+                del data
 
             ranges = [
                 (z0, min(z0 + cz, nz), y0, min(y0 + cy, ny), x0, min(x0 + cx, nx))
@@ -412,9 +431,7 @@ def _build_mask_pyramid(
                 for y0 in range(0, ny, cy)
                 for x0 in range(0, nx, cx)
             ]
-            for j in range(0, len(ranges), 64):
-                end = j + 64
-                await asyncio.gather(*[_copy(*r) for r in ranges[j:end]])
+            await _gather_bounded(ranges, _copy, concurrency)
             logger.info("[pyramid] wrote level %s shape=%s", ds["path"], new_shape)
 
     asyncio.run(_build_levels())
@@ -427,6 +444,8 @@ def _upsample_mask_pyramid(
     datasets_upto_l: list,
     region: str,
     chunk: int = 128,
+    concurrency: int = 64,
+    copy_concurrency: int = 16,
 ) -> None:
     """Fill finer pyramid levels (0..L-1) by nearest-upsampling the segmented level.
 
@@ -446,8 +465,7 @@ def _upsample_mask_pyramid(
         return [max(1, round(s_coarse[a] / s_fine[a])) for a in range(3)]
 
     async def _build_levels():
-        sem = asyncio.Semaphore(MAX_INFLIGHT)
-        ctx = ts.Context({"data_copy_concurrency": {"limit": 4}})
+        ctx = ts.Context({"data_copy_concurrency": {"limit": copy_concurrency}})
 
         # Walk from level L (last) toward level 0; each finer level reads the previous.
         for i in range(len(datasets_upto_l) - 2, -1, -1):
@@ -495,19 +513,18 @@ def _upsample_mask_pyramid(
             )
 
             async def _copy(z0, z1, y0, y1, x0, x1):
-                async with sem:
-                    # Per-axis nearest source indices (floor-div, clamped to end).
-                    iz = np.minimum(np.arange(z0, z1) // fz, clen[2] - 1)
-                    iy = np.minimum(np.arange(y0, y1) // fy, clen[3] - 1)
-                    ix = np.minimum(np.arange(x0, x1) // fx, clen[4] - 1)
-                    sz0, sz1 = int(iz[0]), int(iz[-1]) + 1
-                    sy0, sy1 = int(iy[0]), int(iy[-1]) + 1
-                    sx0, sx1 = int(ix[0]), int(ix[-1]) + 1
-                    sub = await coarse[:, :, sz0:sz1, sy0:sy1, sx0:sx1].read()
-                    # Gather nearest voxels onto the fine grid (exact, edge-clamped).
-                    up = sub[np.ix_([0], [0], iz - sz0, iy - sy0, ix - sx0)]
-                    await output[:, :, z0:z1, y0:y1, x0:x1].write(up)
-                    del sub, up
+                # Per-axis nearest source indices (floor-div, clamped to end).
+                iz = np.minimum(np.arange(z0, z1) // fz, clen[2] - 1)
+                iy = np.minimum(np.arange(y0, y1) // fy, clen[3] - 1)
+                ix = np.minimum(np.arange(x0, x1) // fx, clen[4] - 1)
+                sz0, sz1 = int(iz[0]), int(iz[-1]) + 1
+                sy0, sy1 = int(iy[0]), int(iy[-1]) + 1
+                sx0, sx1 = int(ix[0]), int(ix[-1]) + 1
+                sub = await coarse[:, :, sz0:sz1, sy0:sy1, sx0:sx1].read()
+                # Gather nearest voxels onto the fine grid (exact, edge-clamped).
+                up = sub[np.ix_([0], [0], iz - sz0, iy - sy0, ix - sx0)]
+                await output[:, :, z0:z1, y0:y1, x0:x1].write(up)
+                del sub, up
 
             ranges = [
                 (z0, min(z0 + cz, nz), y0, min(y0 + cy, ny), x0, min(x0 + cx, nx))
@@ -515,9 +532,7 @@ def _upsample_mask_pyramid(
                 for y0 in range(0, ny, cy)
                 for x0 in range(0, nx, cx)
             ]
-            for j in range(0, len(ranges), 64):
-                end = j + 64
-                await asyncio.gather(*[_copy(*r) for r in ranges[j:end]])
+            await _gather_bounded(ranges, _copy, concurrency)
             logger.info(
                 "[upsample] wrote level %s shape=%s",
                 fine_ds["path"],
@@ -954,14 +969,27 @@ def _finalize_pyramid(
     args, base_path, spec, start, datasets, datasets_from_l, source_ms, omero
 ) -> None:
     """Build coarser levels (+ optional finer upsample) and write OME group metadata."""
-    _build_mask_pyramid(args.out_bucket, base_path, datasets_from_l, args.aws_region)
+    _build_mask_pyramid(
+        args.out_bucket,
+        base_path,
+        datasets_from_l,
+        args.aws_region,
+        concurrency=args.pyramid_concurrency,
+        copy_concurrency=args.pyramid_copy_concurrency,
+    )
 
     fill_finer = args.fill_finer_levels and start > 0
     if args.fill_finer_levels and start == 0:
         logger.info("--fill-finer-levels: segmented level is already finest; nothing.")
     if fill_finer:
         _upsample_mask_pyramid(
-            args.out_bucket, base_path, spec, datasets[: start + 1], args.aws_region
+            args.out_bucket,
+            base_path,
+            spec,
+            datasets[: start + 1],
+            args.aws_region,
+            concurrency=args.pyramid_concurrency,
+            copy_concurrency=args.pyramid_copy_concurrency,
         )
 
     # Metadata lists every level when finer levels were filled, else L..N only.
@@ -1203,6 +1231,20 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         help="When segmenting a downsampled level L>0, also write the finer levels "
         "(0..L-1) by nearest-upsampling the mask so the pyramid reaches full "
         "resolution (level 0 is a large S3 write; opt-in).",
+    )
+    ap.add_argument(
+        "--pyramid-concurrency",
+        type=int,
+        default=64,
+        help="Max concurrent chunk read+write round-trips in the pyramid build and "
+        "upsample passes. These are S3-latency-bound, so raise this (e.g. 128) to go "
+        "faster; peak RAM ~ this x chunk^3 x dtype.",
+    )
+    ap.add_argument(
+        "--pyramid-copy-concurrency",
+        type=int,
+        default=16,
+        help="TensorStore data_copy_concurrency for the pyramid passes.",
     )
     ap.add_argument(
         "--ccl-block",
