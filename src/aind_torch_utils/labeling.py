@@ -5,7 +5,7 @@ their per-block labels are made globally unique via offsets; these helpers union
 that touch across block faces (26-connectivity) and resolve the equivalence classes.
 Kept dependency-light so the seam-stitching logic can be unit-tested without a GPU.
 """
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -52,23 +52,31 @@ class UnionFind:
         return p
 
 
-def union_faces(uf: UnionFind, g_a: np.ndarray, g_b: np.ndarray) -> None:
-    """Union global labels across a shared block face with 26-connectivity.
+def union_faces(
+    uf: UnionFind,
+    g_a: np.ndarray,
+    g_b: np.ndarray,
+    shifts: Optional[List[Tuple[int, int]]] = None,
+) -> None:
+    """Union global labels across a shared block face.
 
     ``g_a`` and ``g_b`` are the two same-shape, globally-labeled face planes one voxel
-    apart along the seam axis (0 = background). Two voxels are connected if they fall
-    within the 3x3 in-plane neighbourhood across the seam (full 26-connectivity over the
-    seam).
+    apart along the seam axis (0 = background). ``shifts`` is the list of in-plane
+    ``(dy, dx)`` offsets defining connectivity across the seam: the default 3x3
+    neighbourhood gives full 26-connectivity (use for foreground), while ``[(0, 0)]``
+    gives 6-connectivity (only the aligned voxel; use for the background flood in
+    hole-filling, complementary to 26-connected foreground).
     """
+    if shifts is None:
+        shifts = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1)]
     p, q = g_a.shape
-    for dy in (-1, 0, 1):
-        for dx in (-1, 0, 1):
-            ay0, ay1 = max(0, -dy), p - max(0, dy)
-            ax0, ax1 = max(0, -dx), q - max(0, dx)
-            by0, by1 = max(0, dy), p - max(0, -dy)
-            bx0, bx1 = max(0, dx), q - max(0, -dx)
-            a = g_a[ay0:ay1, ax0:ax1]
-            b = g_b[by0:by1, bx0:bx1]
-            both = (a > 0) & (b > 0)
-            for u, v in zip(a[both].tolist(), b[both].tolist()):
-                uf.union(u, v)
+    for dy, dx in shifts:
+        ay0, ay1 = max(0, -dy), p - max(0, dy)
+        ax0, ax1 = max(0, -dx), q - max(0, dx)
+        by0, by1 = max(0, dy), p - max(0, -dy)
+        bx0, bx1 = max(0, dx), q - max(0, -dx)
+        a = g_a[ay0:ay1, ax0:ax1]
+        b = g_b[by0:by1, bx0:bx1]
+        both = (a > 0) & (b > 0)
+        for u, v in zip(a[both].tolist(), b[both].tolist()):
+            uf.union(u, v)

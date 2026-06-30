@@ -504,6 +504,73 @@ def _upsample_mask_pyramid(
     asyncio.run(_build_levels())
 
 
+def _face_planes(labels, cp) -> dict:
+    """The 6 boundary planes of a labeled block as host arrays (for seam stitching)."""
+    return {
+        "zlo": cp.asnumpy(labels[0]),
+        "zhi": cp.asnumpy(labels[-1]),
+        "ylo": cp.asnumpy(labels[:, 0]),
+        "yhi": cp.asnumpy(labels[:, -1]),
+        "xlo": cp.asnumpy(labels[:, :, 0]),
+        "xhi": cp.asnumpy(labels[:, :, -1]),
+    }
+
+
+def _stitch_faces(uf, blocks, metas, shifts=None) -> None:
+    """Union global labels across shared block faces (each block's +Z/+Y/+X neighbour).
+
+    ``shifts`` selects the seam connectivity (passed through to ``union_faces``): the
+    default 3x3 neighbourhood is 26-connectivity (foreground); ``[(0, 0)]`` is
+    6-connectivity (background hole-fill).
+    """
+
+    def _glob(face, off):
+        g = face.astype(np.int64)
+        return np.where(g > 0, g + off, 0)
+
+    by_coord = {(b[0], b[2], b[4]): b for b in blocks}
+    for blk in blocks:
+        z0, z1, y0, y1, x0, x1 = blk
+        off_a = metas[blk]["off"]
+        for hi, lo, nbr in (
+            ("zhi", "zlo", (z1, y0, x0)),
+            ("yhi", "ylo", (z0, y1, x0)),
+            ("xhi", "xlo", (z0, y0, x1)),
+        ):
+            nb = by_coord.get(nbr)
+            if nb is None:
+                continue
+            union_faces(
+                uf,
+                _glob(metas[blk][hi], off_a),
+                _glob(metas[nb][lo], metas[nb]["off"]),
+                shifts=shifts,
+            )
+
+
+def _border_locals(blk, labels, shape, cp) -> np.ndarray:
+    """Local labels on block faces that coincide with the volume's outer border."""
+    nz, ny, nx = shape
+    z0, z1, y0, y1, x0, x1 = blk
+    planes = []
+    if z0 == 0:
+        planes.append(labels[0])
+    if z1 == nz:
+        planes.append(labels[-1])
+    if y0 == 0:
+        planes.append(labels[:, 0])
+    if y1 == ny:
+        planes.append(labels[:, -1])
+    if x0 == 0:
+        planes.append(labels[:, :, 0])
+    if x1 == nx:
+        planes.append(labels[:, :, -1])
+    if not planes:
+        return np.empty(0, dtype=np.int64)
+    u = cp.unique(cp.concatenate([p.ravel() for p in planes]))
+    return cp.asnumpy(u[u > 0]).astype(np.int64)
+
+
 def _hysteresis_connect(
     bucket: str,
     base_path: str,
@@ -561,12 +628,7 @@ def _hysteresis_connect(
         metas[blk] = {
             "off": offset,
             "seed": cp.asnumpy(seed),
-            "zlo": cp.asnumpy(labels[0]),
-            "zhi": cp.asnumpy(labels[-1]),
-            "ylo": cp.asnumpy(labels[:, 0]),
-            "yhi": cp.asnumpy(labels[:, -1]),
-            "xlo": cp.asnumpy(labels[:, :, 0]),
-            "xhi": cp.asnumpy(labels[:, :, -1]),
+            **_face_planes(labels, cp),
         }
         offset += k
         del m, labels
@@ -579,30 +641,7 @@ def _hysteresis_connect(
     for meta in metas.values():
         seeded[meta["seed"].astype(np.int64) + meta["off"]] = True
 
-    def _glob(face, off):
-        g = face.astype(np.int64)
-        g = np.where(g > 0, g + off, 0)
-        return g
-
-    by_coord = {}  # (z0,y0,x0) -> blk for neighbour lookup
-    for blk in blocks:
-        by_coord[(blk[0], blk[2], blk[4])] = blk
-    for blk in blocks:
-        z0, z1, y0, y1, x0, x1 = blk
-        off_a = metas[blk]["off"]
-        for hi, lo, nbr in (
-            ("zhi", "zlo", (z1, y0, x0)),
-            ("yhi", "ylo", (z0, y1, x0)),
-            ("xhi", "xlo", (z0, y0, x1)),
-        ):
-            nb = by_coord.get(nbr)
-            if nb is None:
-                continue
-            union_faces(
-                uf,
-                _glob(metas[blk][hi], off_a),
-                _glob(metas[nb][lo], metas[nb]["off"]),
-            )
+    _stitch_faces(uf, blocks, metas)
 
     roots = uf.flatten_roots()
     root_seeded = np.zeros(total + 1, dtype=bool)
@@ -648,19 +687,190 @@ def _hysteresis_connect(
     )
 
 
-def _run_hysteresis(args, base_path: str, level: str, seg_path: str) -> None:
-    """Collapse the 2-level mask into the final binary level, then clean up."""
-    logger.info("Hysteresis: %s -> %s%s/", seg_path, base_path, level)
-    _hysteresis_connect(
-        args.out_bucket,
+def _fill_holes_connect(
+    bucket: str,
+    base_path: str,
+    src_path: str,
+    final_path: str,
+    region: str,
+    block: int = 512,
+    chunk: int = 128,
+    max_hole_size: Optional[int] = None,
+) -> None:
+    """Fill enclosed cavities in a binary mask, seam-correct across block faces.
+
+    A "hole" is a 6-connected background component (``m == 0``) that does **not** reach
+    the volume's outer border. Background is labeled per block on the GPU, labels are
+    stitched across faces with a union-find (6-connectivity, the topological complement
+    of the 26-connected foreground), and any background component whose root never
+    touches the volume boundary -- and (when ``max_hole_size`` is set) is no larger than
+    ``max_hole_size`` voxels -- is filled to foreground. Streamed block-by-block (no
+    full int32 label volume is materialized).
+    """
+    import cupy as cp
+    from cucim.skimage.measure import label as cucim_label
+
+    ctx = ts.Context({"data_copy_concurrency": {"limit": 4}})
+    src = ts.open(
+        {
+            "driver": "zarr",
+            "kvstore": {
+                "driver": "s3",
+                "bucket": bucket,
+                "path": f"{base_path}{src_path}",
+                "aws_region": region,
+            },
+        },
+        context=ctx,
+    ).result()
+    nz, ny, nx = (int(s) for s in src.domain.shape[-3:])
+
+    blocks = [
+        (z0, z1, y0, y1, x0, x1)
+        for (z0, z1) in block_ranges(nz, block)
+        for (y0, y1) in block_ranges(ny, block)
+        for (x0, x1) in block_ranges(nx, block)
+    ]
+
+    def _label_block(z0, z1, y0, y1, x0, x1):
+        m = cp.asarray(src[0, 0, z0:z1, y0:y1, x0:x1].read().result())
+        labels, k = cucim_label(m == 0, return_num=True, connectivity=1)
+        return m, labels.astype(cp.int64), int(k)
+
+    # Pass A: label background per block; record offsets, sizes, border + face labels.
+    shape = (nz, ny, nx)
+    metas = {}
+    offset = 0
+    for blk in blocks:
+        m, labels, k = _label_block(*blk)
+        counts = cp.asnumpy(cp.bincount(labels.ravel(), minlength=k + 1))
+        k1 = k + 1
+        metas[blk] = {
+            "off": offset,
+            "k": k,
+            "counts": counts[1:k1].astype(np.int64),  # sizes of local labels 1..k
+            "border": _border_locals(blk, labels, shape, cp),
+            **_face_planes(labels, cp),
+        }
+        offset += k
+        del m, labels
+    total = offset
+    logger.info("[fill-holes] %d blocks, %d background components", len(blocks), total)
+
+    # Per-global-label sizes and which labels touch the volume boundary.
+    sizes = np.zeros(total + 1, dtype=np.int64)
+    border = np.zeros(total + 1, dtype=bool)
+    for meta in metas.values():
+        off, k = meta["off"], meta["k"]
+        lo = off + 1
+        hi = lo + k
+        sizes[lo:hi] = meta["counts"]
+        if meta["border"].size:
+            border[meta["border"] + off] = True
+
+    # Union-find over global labels, stitching across faces with 6-connectivity.
+    uf = UnionFind(total + 1)
+    _stitch_faces(uf, blocks, metas, shifts=[(0, 0)])
+
+    roots = uf.flatten_roots()
+    root_border = np.zeros(total + 1, dtype=bool)
+    np.logical_or.at(root_border, roots, border)
+    root_size = np.zeros(total + 1, dtype=np.int64)
+    np.add.at(root_size, roots, sizes)
+    fillable_root = ~root_border
+    if max_hole_size:
+        fillable_root &= root_size <= max_hole_size
+    fill = fillable_root[roots]
+    fill[0] = False  # label 0 = foreground in the background labeling; never a hole
+
+    # Pass B: re-label background, map to root, write (foreground OR filled-hole).
+    cz, cy, cx = min(chunk, nz), min(chunk, ny), min(chunk, nx)
+    out = ts.open(
+        {
+            "driver": "zarr",
+            "kvstore": {
+                "driver": "s3",
+                "bucket": bucket,
+                "path": f"{base_path}{final_path}",
+                "aws_region": region,
+            },
+            "metadata": {
+                "shape": [1, 1, nz, ny, nx],
+                "chunks": [1, 1, cz, cy, cx],
+                "dtype": "|u1",
+                "dimension_separator": "/",
+            },
+            "create": True,
+            "delete_existing": True,
+        },
+        context=ctx,
+    ).result()
+    fill_gpu = cp.asarray(fill)
+    for blk in blocks:
+        z0, z1, y0, y1, x0, x1 = blk
+        m, labels, _ = _label_block(*blk)
+        gl = cp.where(labels > 0, labels + metas[blk]["off"], 0)
+        out_block = ((m >= 1) | fill_gpu[gl]).astype(cp.uint8)
+        out[0, 0, z0:z1, y0:y1, x0:x1].write(cp.asnumpy(out_block)).result()
+        del m, labels, gl, out_block
+    logger.info(
+        "[fill-holes] wrote binary mask to %s%s (%d holes filled)",
         base_path,
-        f"{level}_seed/",
-        f"{level}/",
-        args.aws_region,
-        block=args.hysteresis_block,
+        final_path,
+        int(fillable_root[1:].sum()),
     )
-    if not args.keep_seed_mask:
-        _delete_s3_prefix(args.out_bucket, seg_path, args.aws_region)
+
+
+def _mask_stages(level: str, hysteresis: bool, fill_holes: bool):
+    """Ordered ``(name, path)`` post-seg stages; the last writes the canonical level.
+
+    Earlier stages write ``{level}_<suffix>`` intermediates. The segmentation output is
+    the 2-level "seed" mask when hysteresis is on, otherwise a binary "raw" mask.
+    """
+    chain = [("seg", "seed" if hysteresis else "raw")]
+    if hysteresis:
+        chain.append(("hyst", "hyst"))
+    if fill_holes:
+        chain.append(("fill", "fill"))
+    last = len(chain) - 1
+    return [
+        (name, level if i == last else f"{level}_{suffix}")
+        for i, (name, suffix) in enumerate(chain)
+    ]
+
+
+def _run_postprocess(args, base_path: str, stages) -> None:
+    """Run the post-seg connectivity passes in order, then drop intermediates."""
+    paths = dict(stages)
+    max_hole = args.max_hole_size if args.max_hole_size > 0 else None
+    prev = paths["seg"]
+    if "hyst" in paths:
+        logger.info("Hysteresis: %s -> %s%s/", prev, base_path, paths["hyst"])
+        _hysteresis_connect(
+            args.out_bucket,
+            base_path,
+            f"{prev}/",
+            f"{paths['hyst']}/",
+            args.aws_region,
+            block=args.ccl_block,
+        )
+        prev = paths["hyst"]
+    if "fill" in paths:
+        logger.info("Fill holes: %s -> %s%s/", prev, base_path, paths["fill"])
+        _fill_holes_connect(
+            args.out_bucket,
+            base_path,
+            f"{prev}/",
+            f"{paths['fill']}/",
+            args.aws_region,
+            block=args.ccl_block,
+            max_hole_size=max_hole,
+        )
+    # Drop every non-final intermediate (the "seed" mask only if not kept).
+    for name, path in stages[:-1]:
+        if name == "seg" and args.keep_seed_mask:
+            continue
+        _delete_s3_prefix(args.out_bucket, f"{base_path}{path}/", args.aws_region)
 
 
 def _write_output_group_metadata(
@@ -971,17 +1181,33 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "resolution (level 0 is a large S3 write; opt-in).",
     )
     ap.add_argument(
+        "--ccl-block",
         "--hysteresis-block",
+        dest="ccl_block",
         type=int,
         default=512,
-        help="Block size for the post-hoc hysteresis CCL pass (when params.json sets "
-        "seed_threshold). Larger blocks use more VRAM but less face-stitch memory.",
+        help="Block size for the post-hoc connected-components passes (hysteresis and "
+        "hole-fill). Larger blocks use more VRAM but less face-stitch memory.",
     )
     ap.add_argument(
         "--keep-seed-mask",
         action="store_true",
         help="Keep the intermediate 2-level '_seed' mask after hysteresis (default: "
         "delete it). Useful to re-run hysteresis with a different seed_threshold.",
+    )
+    ap.add_argument(
+        "--fill-holes",
+        action="store_true",
+        help="Fill enclosed cavities (3D background not reaching the volume border) "
+        "in the final binary mask via a seam-correct connected-components pass. Runs "
+        "after hysteresis when both are enabled.",
+    )
+    ap.add_argument(
+        "--max-hole-size",
+        type=int,
+        default=0,
+        help="With --fill-holes, only fill cavities of at most this many voxels (0 = "
+        "no cap = fill every enclosed cavity, including genuine large lumens).",
     )
     return ap.parse_args(argv)
 
@@ -1053,7 +1279,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     # a seam-correct connected-components pass collapses it to the final binary level.
     seed_thr = _seed_threshold(args.params_json, _model_threshold(args.params_json))
     hysteresis = seed_thr is not None
-    seg_level = f"{level}_seed" if hysteresis else level
+    stages = _mask_stages(level, hysteresis, args.fill_holes)
+    seg_level = dict(stages)["seg"]
     seg_path = f"{base_path}{seg_level}/"
     chunks = (1, 1, min(128, z), min(128, y), min(128, x))
     logger.info(
@@ -1108,9 +1335,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     _summarize_metrics(args.metrics_json)
 
-    # --- Hysteresis: collapse the 2-level mask into the final binary at {level}/ ---
-    if hysteresis:
-        _run_hysteresis(args, base_path, level, seg_path)
+    # --- Post-processing: hysteresis and/or hole-fill -> final binary at {level}/ ---
+    if hysteresis or args.fill_holes:
+        _run_postprocess(args, base_path, stages)
 
     if args.no_pyramid:
         logger.info(
