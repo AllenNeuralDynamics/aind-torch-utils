@@ -96,6 +96,7 @@ from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
 import boto3
+import numpy as np
 import tensorstore as ts
 
 from aind_torch_utils.config import InferenceConfig
@@ -395,6 +396,113 @@ def _build_mask_pyramid(
     asyncio.run(_build_levels())
 
 
+def _upsample_mask_pyramid(
+    bucket: str,
+    base_path: str,
+    spec,
+    datasets_upto_l: list,
+    region: str,
+    chunk: int = 128,
+) -> None:
+    """Fill finer pyramid levels (0..L-1) by nearest-upsampling the segmented level.
+
+    ``datasets_upto_l`` is the source multiscales datasets for levels 0..L (index 0 is
+    the finest, index -1 is the already-written segmented level L). Each finer level is
+    produced from the previous (just-written) coarser one by nearest-neighbour
+    upsampling (the mask is binary, so never interpolate). Output shapes are taken from
+    the *source* arrays at each level so the mask aligns with the data. TensorStore has
+    no upsample driver, so this reads the coarse level, gathers nearest voxels, and
+    writes the fine level, streamed chunk-by-chunk (numpy only, no GPU).
+    """
+
+    def _up_factors(coarse_ds: dict, fine_ds: dict) -> List[int]:
+        s_coarse, s_fine = _scale_zyx(coarse_ds), _scale_zyx(fine_ds)
+        if s_coarse is None or s_fine is None:
+            raise ValueError("Source datasets are missing scale transforms.")
+        return [max(1, round(s_coarse[a] / s_fine[a])) for a in range(3)]
+
+    async def _build_levels():
+        sem = asyncio.Semaphore(MAX_INFLIGHT)
+        ctx = ts.Context({"data_copy_concurrency": {"limit": 4}})
+
+        # Walk from level L (last) toward level 0; each finer level reads the previous.
+        for i in range(len(datasets_upto_l) - 2, -1, -1):
+            coarse_ds, fine_ds = datasets_upto_l[i + 1], datasets_upto_l[i]
+            fz, fy, fx = _up_factors(coarse_ds, fine_ds)
+
+            coarse = await ts.open(
+                {
+                    "driver": "zarr",
+                    "kvstore": {
+                        "driver": "s3",
+                        "bucket": bucket,
+                        "path": f"{base_path}{coarse_ds['path']}/",
+                        "aws_region": region,
+                    },
+                },
+                context=ctx,
+            )
+            clen = coarse.shape  # (1, 1, Cz, Cy, Cx)
+
+            # Target shape from the *source* fine level so the mask aligns w/ data.
+            src_fine = open_ts_spec(_spec_with_level(spec, fine_ds["path"]))
+            nz, ny, nx = tuple(src_fine.domain.shape[-3:])
+            cz, cy, cx = min(chunk, nz), min(chunk, ny), min(chunk, nx)
+
+            output = await ts.open(
+                {
+                    "driver": "zarr",
+                    "kvstore": {
+                        "driver": "s3",
+                        "bucket": bucket,
+                        "path": f"{base_path}{fine_ds['path']}/",
+                        "aws_region": region,
+                    },
+                    "metadata": {
+                        "shape": [1, 1, nz, ny, nx],
+                        "chunks": [1, 1, cz, cy, cx],
+                        "dtype": "|u1",
+                        "dimension_separator": "/",
+                    },
+                    "create": True,
+                    "delete_existing": True,
+                },
+                context=ctx,
+            )
+
+            async def _copy(z0, z1, y0, y1, x0, x1):
+                async with sem:
+                    # Per-axis nearest source indices (floor-div, clamped to end).
+                    iz = np.minimum(np.arange(z0, z1) // fz, clen[2] - 1)
+                    iy = np.minimum(np.arange(y0, y1) // fy, clen[3] - 1)
+                    ix = np.minimum(np.arange(x0, x1) // fx, clen[4] - 1)
+                    sz0, sz1 = int(iz[0]), int(iz[-1]) + 1
+                    sy0, sy1 = int(iy[0]), int(iy[-1]) + 1
+                    sx0, sx1 = int(ix[0]), int(ix[-1]) + 1
+                    sub = await coarse[:, :, sz0:sz1, sy0:sy1, sx0:sx1].read()
+                    # Gather nearest voxels onto the fine grid (exact, edge-clamped).
+                    up = sub[np.ix_([0], [0], iz - sz0, iy - sy0, ix - sx0)]
+                    await output[:, :, z0:z1, y0:y1, x0:x1].write(up)
+                    del sub, up
+
+            ranges = [
+                (z0, min(z0 + cz, nz), y0, min(y0 + cy, ny), x0, min(x0 + cx, nx))
+                for z0 in range(0, nz, cz)
+                for y0 in range(0, ny, cy)
+                for x0 in range(0, nx, cx)
+            ]
+            for j in range(0, len(ranges), 64):
+                end = j + 64
+                await asyncio.gather(*[_copy(*r) for r in ranges[j:end]])
+            logger.info(
+                "[upsample] wrote level %s shape=%s",
+                fine_ds["path"],
+                [1, 1, nz, ny, nx],
+            )
+
+    asyncio.run(_build_levels())
+
+
 def _write_output_group_metadata(
     bucket: str,
     base_path: str,
@@ -630,6 +738,13 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         action="store_true",
         help="Write only the segmented level (no coarser levels, no OME metadata).",
     )
+    ap.add_argument(
+        "--fill-finer-levels",
+        action="store_true",
+        help="When segmenting a downsampled level L>0, also write the finer levels "
+        "(0..L-1) by nearest-upsampling the mask so the pyramid reaches full "
+        "resolution (level 0 is a large S3 write; opt-in).",
+    )
     return ap.parse_args(argv)
 
 
@@ -752,8 +867,20 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     # --- Coarser levels L+1..N + OME-NGFF metadata mirroring the source ---
     _build_mask_pyramid(args.out_bucket, base_path, datasets_from_l, args.aws_region)
+
+    # --- Optionally fill the finer levels (0..L-1) by upsampling the level-L mask ---
+    fill_finer = args.fill_finer_levels and start > 0
+    if args.fill_finer_levels and start == 0:
+        logger.info("--fill-finer-levels: segmented level is already finest; nothing.")
+    if fill_finer:
+        _upsample_mask_pyramid(
+            args.out_bucket, base_path, spec, datasets[: start + 1], args.aws_region
+        )
+
+    # Metadata lists every level when the finer levels were filled, else L..N only.
+    meta_datasets = datasets if fill_finer else datasets_from_l
     _write_output_group_metadata(
-        args.out_bucket, base_path, source_ms, datasets_from_l, omero, args.aws_region
+        args.out_bucket, base_path, source_ms, meta_datasets, omero, args.aws_region
     )
     logger.info("Done. OME-Zarr mask written to s3://%s/%s", args.out_bucket, base_path)
 
