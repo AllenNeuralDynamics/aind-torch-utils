@@ -3,7 +3,10 @@
 Runs the *exact same* GPU mask chain as the pipeline (``create_gfp_mask_gpu``: smooth +
 threshold + opening, optionally preceded by flat-field correction + global
 normalization) over a small coarse pyramid level, sweeping ``threshold`` x
-``smooth_sigma`` x ``open_iterations``. Each parameter combination gets its own output
+``smooth_sigma`` x ``open_iterations`` x optional ``seed_threshold``. When a
+``--seed-thresholds`` value is given, the preview applies hysteresis (keep only grow
+components containing a seed) exactly as the at-scale run would, so you can tune the
+rim/seam discriminator visually. Each parameter combination gets its own output
 folder containing a single high-res PNG with the XY / ZX / ZY orthogonal MIP overlays
 (the mask depth-coded by the depth of its brightest voxel along each view axis -- turbo,
 near->far, with a per-panel colorbar; use ``--flat-mask`` for plain red) and a
@@ -23,7 +26,8 @@ Example::
     python examples/tune_gfp_mask.py \\
         --in-spec /scratch/seg_tile_spec.json --params-json /scratch/params.json \\
         --thresholds 0.02 0.05 0.1 --smooth-sigmas 0.5,1,1 1,2,2 1,3,3 \\
-        --open-iterations 0 1 --target-level 0 --dpi 200 --out tune
+        --open-iterations 0 1 --seed-thresholds 0.1 0.2 \\
+        --target-level 0 --dpi 200 --out tune
 
 Output layout (one folder per combo)::
 
@@ -193,8 +197,45 @@ def _overlay(
     ax.axis("off")
 
 
-def _combo_metrics(vol_cp, thr, sigma, op) -> dict:
-    """Unsupervised quality proxies for one (threshold, sigma, open) mask.
+def _hysteresis_crop(mask2):
+    """Collapse a 2-level crop mask {0,1,2} to binary by hysteresis (preview only).
+
+    Keeps 26-connected components of the grow mask (``>= 1``) that contain >=1 seed
+    (``== 2``), matching the pipeline's post-hoc hysteresis but computed locally on the
+    crop. The crop is a single block, so one labeling pass is exact here (no cross-block
+    seam stitching is needed -- that only matters at full scale).
+    """
+    from cucim.skimage.measure import label as cucim_label  # GPU only; lazy import
+
+    grow = mask2 >= 1
+    labels, n = cucim_label(grow, return_num=True, connectivity=3)
+    if n == 0:
+        return grow.astype(cp.uint8)
+    seeded = cp.unique(labels[mask2 == 2])
+    seeded = seeded[seeded > 0]
+    keep = cp.zeros(int(n) + 1, dtype=bool)
+    keep[seeded] = True
+    return keep[labels].astype(cp.uint8)
+
+
+def _combo_mask(vol_cp, thr, sigma, op, seed):
+    """Final binary mask for one combo: plain threshold, or hysteresis when seed is set.
+
+    Mirrors what the at-scale run would write, so the preview and metrics reflect the
+    real output -- including the rim/seam discriminator that ``seed_threshold`` adds.
+    """
+    mask = create_gfp_mask_gpu(
+        vol_cp,
+        threshold=thr,
+        smooth_sigma=sigma,
+        open_iterations=op,
+        seed_threshold=seed,
+    )
+    return mask if seed is None else _hysteresis_crop(mask)
+
+
+def _combo_metrics(vol_cp, thr, sigma, op, seed) -> dict:
+    """Unsupervised quality proxies for one (threshold, sigma, open, seed) mask.
 
     Returns foreground fraction, connected-component count (fragmentation), the share
     of foreground in the largest component (contiguity), and the intensity contrast
@@ -203,9 +244,7 @@ def _combo_metrics(vol_cp, thr, sigma, op) -> dict:
     """
     import cupyx.scipy.ndimage as cndi  # GPU only; lazy import
 
-    mask = create_gfp_mask_gpu(
-        vol_cp, threshold=thr, smooth_sigma=sigma, open_iterations=op
-    )
+    mask = _combo_mask(vol_cp, thr, sigma, op, seed)
     fg_frac = float(mask.mean())
     labeled, n = cndi.label(mask)
     if n > 0:
@@ -237,12 +276,12 @@ def _write_metrics_csv(path: str, rows: List[dict]) -> None:
     logger.info("Wrote %s (%d rows)", path, len(rows))
 
 
-def _combo_dirname(
-    thr: float, sigma: Tuple[float, float, float], op: int, ff_tag: str, multi_ff: bool
-) -> str:
-    """Folder name for one parameter combo, e.g. 'thr_0.05_sigma_0.5-1-1_open_1'."""
+def _combo_dirname(thr, sigma, op, seed, ff_tag: str, multi_ff: bool) -> str:
+    """Folder name for one combo, e.g. 'thr_0.05_sigma_0.5-1-1_open_1[_seed_0.15]'."""
     sig = "-".join(f"{s:g}" for s in sigma)
     name = f"thr_{thr:g}_sigma_{sig}_open_{op}"
+    if seed is not None:
+        name += f"_seed_{seed:g}"
     return f"{name}_{ff_tag}" if multi_ff else name
 
 
@@ -251,17 +290,16 @@ _VIEWS = [(0, "XY", "z"), (1, "ZX", "y"), (2, "ZY", "x")]
 
 
 def _render_triview(
-    vol_cp, thr, sigma, op, metric: dict, depth_color: bool, dpi: int, out_path: str
+    vol_cp, thr, sigma, op, seed, metric, depth_color, dpi, out_path
 ) -> None:
     """Render one combo's XY/ZX/ZY depth-coded overlays as a single high-res PNG.
 
-    The mask is computed once; each panel is a max-projection along one axis, with the
-    mask depth-coded (turbo) by the depth of its brightest voxel along that axis and its
-    own colorbar (the depth axis differs per view). ``dpi`` sets zoomable resolution.
+    The mask is computed once (with hysteresis when ``seed`` is set); each panel is a
+    max-projection along one axis, with the mask depth-coded (turbo) by the depth of its
+    brightest voxel along that axis and its own colorbar (the depth axis differs per
+    view). ``dpi`` sets zoomable resolution.
     """
-    mask = create_gfp_mask_gpu(
-        vol_cp, threshold=thr, smooth_sigma=sigma, open_iterations=op
-    )
+    mask = _combo_mask(vol_cp, thr, sigma, op, seed)
     fig, axes = plt.subplots(
         1, 3, figsize=(7 * 3, 7), squeeze=False, constrained_layout=True
     )
@@ -283,8 +321,9 @@ def _render_triview(
                 pad=0.02,
                 label=f"{depth_axis} depth: near -> far (vox)",
             )
+    seed_tag = f"  seed={seed:g}" if seed is not None else ""
     fig.suptitle(
-        f"thr={thr:g}  σ={sigma}  open={op}   "
+        f"thr={thr:g}  σ={sigma}  open={op}{seed_tag}   "
         f"fg={metric['fg_frac']:.3f} n={metric['n_components']} "
         f"top={metric['largest_frac']:.2f} contrast={metric['contrast']:.3f}",
         fontsize=12,
@@ -300,45 +339,50 @@ def _render_for_ff(
     """One folder per combo (views.png + params.txt); return the metric rows for CSV."""
     vol_cp = cp.asarray(vol)
     depth_color = not args.flat_mask
+    seeds = args.seed_thresholds or [None]  # [None] = plain binary (no hysteresis)
     rows = []
     for thr in args.thresholds:
         for sigma in args.smooth_sigmas:
             for op in args.open_iterations:
-                m = _combo_metrics(vol_cp, thr, sigma, op)
-                sig_tag = "x".join(f"{s:g}" for s in sigma)
-                rows.append(
-                    {
-                        "flatfield": ff_tag,
-                        "threshold": thr,
-                        "sigma": sig_tag,
-                        "open": op,
-                        **m,
-                    }
-                )
-                combo_dir = os.path.join(
-                    out_dir, _combo_dirname(thr, sigma, op, ff_tag, multi_ff)
-                )
-                os.makedirs(combo_dir, exist_ok=True)
-                _render_triview(
-                    vol_cp,
-                    thr,
-                    sigma,
-                    op,
-                    m,
-                    depth_color,
-                    args.dpi,
-                    os.path.join(combo_dir, "views.png"),
-                )
-                _write_combo_params(
-                    os.path.join(combo_dir, "params.txt"),
-                    thr,
-                    sigma,
-                    op,
-                    cfg,
-                    tune_level,
-                    args.target_level,
-                    factor,
-                )
+                for seed in seeds:
+                    m = _combo_metrics(vol_cp, thr, sigma, op, seed)
+                    sig_tag = "x".join(f"{s:g}" for s in sigma)
+                    rows.append(
+                        {
+                            "flatfield": ff_tag,
+                            "threshold": thr,
+                            "seed_threshold": seed if seed is not None else "",
+                            "sigma": sig_tag,
+                            "open": op,
+                            **m,
+                        }
+                    )
+                    combo_dir = os.path.join(
+                        out_dir, _combo_dirname(thr, sigma, op, seed, ff_tag, multi_ff)
+                    )
+                    os.makedirs(combo_dir, exist_ok=True)
+                    _render_triview(
+                        vol_cp,
+                        thr,
+                        sigma,
+                        op,
+                        seed,
+                        m,
+                        depth_color,
+                        args.dpi,
+                        os.path.join(combo_dir, "views.png"),
+                    )
+                    _write_combo_params(
+                        os.path.join(combo_dir, "params.txt"),
+                        thr,
+                        sigma,
+                        op,
+                        seed,
+                        cfg,
+                        tune_level,
+                        args.target_level,
+                        factor,
+                    )
     return rows
 
 
@@ -403,20 +447,23 @@ def _normalization_params(cfg) -> dict:
                 "flatfield_level": cfg.flatfield_level,
                 "flatfield_opening_radius": cfg.flatfield_opening_radius,
                 "flatfield_sigma": cfg.flatfield_sigma,
+                "flatfield_empty_threshold": cfg.flatfield_empty_threshold,
             }
         )
     return out
 
 
 def _write_combo_params(
-    path, thr, sigma, op, cfg, tune_level, target_level, factor
+    path, thr, sigma, op, seed, cfg, tune_level, target_level, factor
 ) -> None:
     """Write a per-combo params.txt + run_params.json with copy-paste run commands.
 
     ``run_params.json`` (written next to params.txt) carries the destination-resolution
-    params (scaled sigma/open if a tune->target factor is available, threshold as-is)
-    plus the normalization config, so both the crop-validation and full-scale commands
-    are runnable as-is once you fill in the spec/bucket/crop placeholders.
+    params (scaled sigma/open if a tune->target factor is available, threshold/seed
+    as-is) plus the normalization config, so both the crop-validation and full-scale
+    commands are runnable as-is once you fill in the spec/bucket/crop placeholders. When
+    ``seed`` is set, ``seed_threshold`` is included and the at-scale run does hysteresis
+    automatically.
     """
     combo_dir = os.path.dirname(path)
     # Destination-resolution params (scaled to the target level when possible).
@@ -433,20 +480,26 @@ def _write_combo_params(
         "smooth_sigma": dest_sigma,
         "open_iterations": dest_op,
     }
+    if seed is not None:
+        run_params["seed_threshold"] = seed  # threshold-domain, transfers as-is
     with open(os.path.join(combo_dir, "run_params.json"), "w") as f:
         json.dump(run_params, f, indent=2)
 
     sig_csv = ",".join(f"{s:g}" for s in dest_sigma)
+    seed_opt = f" --seed-thresholds {seed:g}" if seed is not None else ""
     spec = f"<SPEC@level{dest_level}>"  # tensorstore spec/JSON pointing at dest level
     crop_cmd = " \\\n".join(
         [
             "python examples/tune_gfp_mask.py",
             f"  --in-spec {spec} --params-json run_params.json",
             f"  --thresholds {thr:g} --smooth-sigmas {sig_csv} "
-            f"--open-iterations {dest_op}",
+            f"--open-iterations {dest_op}{seed_opt}",
             "  --crop Z0 Z1 Y0 Y1 X0 X1 --out crop_check",
         ]
     )
+    # Hysteresis runs automatically when run_params.json has seed_threshold.
+    # --fill-holes and --fill-finer-levels are optional; --ccl-block /
+    # --pyramid-concurrency tune the post-hoc passes (see run_gfp_mask_example.py --help).
     scale_cmd = " \\\n".join(
         [
             "python examples/run_gfp_mask_example.py",
@@ -454,16 +507,21 @@ def _write_combo_params(
             "  --out-bucket <OUT_BUCKET> --out-prefix <OUT_PREFIX>",
             "  --params-json run_params.json",
             "  --devices cuda:0 --prep-workers 8 --writer-workers 4 --batch 32",
+            "  --ccl-block 512 --pyramid-concurrency 128 --pyramid-copy-concurrency 16",
             "  --metrics-json run_metrics.json",
         ]
     )
 
+    seed_line = f"seed_threshold: {seed:g}" if seed is not None else (
+        "seed_threshold: (none - no hysteresis)"
+    )
     lines = [
         "# GFP-mask tuning parameters",
         f"tune_level: {tune_level}",
         "",
         "[mask params at this (tune) level]",
         f"threshold: {thr:g}",
+        seed_line,
         f"smooth_sigma: {list(sigma)}",
         f"open_iterations: {op}",
         "",
@@ -479,6 +537,7 @@ def _write_combo_params(
             f"flatfield_level: {cfg.flatfield_level}",
             f"flatfield_opening_radius: {cfg.flatfield_opening_radius}",
             f"flatfield_sigma: {cfg.flatfield_sigma}",
+            f"flatfield_empty_threshold: {cfg.flatfield_empty_threshold}",
         ]
     lines.append("")
     if factor is not None:
@@ -486,6 +545,7 @@ def _write_combo_params(
             f"[proposed params for target level {target_level}] "
             "(also in run_params.json)",
             f"threshold: {thr:g}",
+            seed_line,
             f"smooth_sigma: {dest_sigma}",
             f"open_iterations: {dest_op}",
             f"scale_factor_zyx: {tuple(round(f, 3) for f in factor)}",
@@ -546,6 +606,16 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         nargs="+",
         default=[1],
         help="open_iterations values to sweep.",
+    )
+    ap.add_argument(
+        "--seed-thresholds",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Optional seed_threshold values to sweep. Each enables a hysteresis "
+        "preview (keep only grow components containing a seed >= this value) -- the "
+        "rim/seam discriminator. Must be > --thresholds. Omit for a plain binary "
+        "preview (no hysteresis).",
     )
     ap.add_argument(
         "--crop",
