@@ -218,6 +218,22 @@ def _setup_workers(
     return prep_workers, gpu_workers, writer_workers
 
 
+def _worker_target(fn, name: str, stop_event: threading.Event, errors: list) -> None:
+    """Run a worker's loop, recording any exception instead of dying silently.
+
+    A bare ``Thread(target=worker.run)`` that raises would kill the thread while the
+    main loop only checks ``is_alive()`` -- the run would finish with an empty output
+    and no error surfaced. This wrapper logs the traceback, records ``(name, exc)`` so
+    ``run`` can re-raise it, and sets ``stop_event`` so the rest of the pipeline stops.
+    """
+    try:
+        fn(stop_event)
+    except BaseException as e:  # noqa: B036 - record everything, then re-raise in run()
+        logger.exception("Worker %s crashed", name)
+        errors.append((name, e))
+        stop_event.set()
+
+
 def _setup_worker_threads(
     model: nn.Module,
     input_store: Any,
@@ -227,6 +243,7 @@ def _setup_worker_threads(
     num_prep_workers: int,
     prep_q: queue.Queue,
     write_queues: List[queue.Queue],
+    errors: list,
     background: Optional[Any] = None,
 ) -> Tuple[List[threading.Thread], List[threading.Thread], List[threading.Thread]]:
     """Sets up the worker threads for the pipeline.
@@ -268,17 +285,30 @@ def _setup_worker_threads(
         background=background,
     )
 
-    # Threads
+    # Threads. Each target is wrapped so a worker exception is recorded (and re-raised
+    # by run()) instead of silently killing the thread and yielding an empty output.
     prep_threads = [
-        threading.Thread(target=w.run, args=(stop_event,), name=f"prep-{i}")
+        threading.Thread(
+            target=_worker_target,
+            args=(w.run, f"prep-{i}", stop_event, errors),
+            name=f"prep-{i}",
+        )
         for i, w in enumerate(prep_workers)
     ]
     gpu_threads = [
-        threading.Thread(target=worker.run, args=(stop_event,), name=f"gpu-{i}")
+        threading.Thread(
+            target=_worker_target,
+            args=(worker.run, f"gpu-{i}", stop_event, errors),
+            name=f"gpu-{i}",
+        )
         for i, worker in enumerate(gpu_workers)
     ]
     writer_threads = [
-        threading.Thread(target=w.run, args=(stop_event,), name=f"writer-{i}")
+        threading.Thread(
+            target=_worker_target,
+            args=(w.run, f"writer-{i}", stop_event, errors),
+            name=f"writer-{i}",
+        )
         for i, w in enumerate(writer_workers)
     ]
 
@@ -345,6 +375,7 @@ def run(
     )
 
     # Threads
+    worker_errors: list = []
     prep_threads, gpu_threads, writer_threads = _setup_worker_threads(
         model,
         input_store,
@@ -354,6 +385,7 @@ def run(
         num_prep_workers,
         prep_q,
         write_queues,
+        worker_errors,
         background=background,
     )
     all_threads = prep_threads + gpu_threads + writer_threads
@@ -416,6 +448,15 @@ def run(
     throughput = (Z * Y * X * input_store.dtype.numpy_dtype.itemsize) / 1e6 / (t1 - t0)
     logger.info(f"Total time: {t1-t0:.2f}s")
     logger.info(f"Throughput: {throughput:.2f}MB/s")
+
+    # A crashed worker would otherwise leave a silently-empty output; surface it loudly.
+    if worker_errors:
+        names = ", ".join(name for name, _ in worker_errors)
+        first_name, first_exc = worker_errors[0]
+        raise RuntimeError(
+            f"{len(worker_errors)} worker thread(s) failed ({names}); the output is "
+            f"incomplete. First failure in {first_name}: {first_exc!r}"
+        ) from first_exc
 
 
 def load_model(model_type: str, weights_path: Optional[str] = None) -> nn.Module:
