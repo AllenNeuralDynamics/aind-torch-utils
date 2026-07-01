@@ -499,7 +499,7 @@ def _write_combo_params(
     )
     # Hysteresis runs automatically when run_params.json has seed_threshold.
     # --fill-holes and --fill-finer-levels are optional; --ccl-block /
-    # --pyramid-concurrency tune the post-hoc passes (see run_gfp_mask_example.py --help).
+    # --pyramid-concurrency tune the post-hoc passes (see the run script --help).
     scale_cmd = " \\\n".join(
         [
             "python examples/run_gfp_mask_example.py",
@@ -512,9 +512,10 @@ def _write_combo_params(
         ]
     )
 
-    seed_line = f"seed_threshold: {seed:g}" if seed is not None else (
-        "seed_threshold: (none - no hysteresis)"
-    )
+    if seed is not None:
+        seed_line = f"seed_threshold: {seed:g}"
+    else:
+        seed_line = "seed_threshold: (none - no hysteresis)"
     lines = [
         "# GFP-mask tuning parameters",
         f"tune_level: {tune_level}",

@@ -859,6 +859,37 @@ def _fill_holes_connect(
     )
 
 
+def _mask_has_foreground(
+    bucket: str, base_path: str, path: str, region: str, block: int = 512
+) -> bool:
+    """True if the mask at ``path`` has any nonzero voxel.
+
+    Scans blocks (host reads, cheap ``max`` reduction) and returns at the first
+    foreground block, so a non-blank mask is detected quickly; a fully blank one is
+    confirmed only after a full scan (unavoidable), which still saves the far more
+    expensive post-processing + pyramid that would otherwise run on nothing.
+    """
+    src = ts.open(
+        {
+            "driver": "zarr",
+            "kvstore": {
+                "driver": "s3",
+                "bucket": bucket,
+                "path": f"{base_path}{path}",
+                "aws_region": region,
+            },
+        }
+    ).result()
+    nz, ny, nx = (int(s) for s in src.domain.shape[-3:])
+    for z0, z1 in block_ranges(nz, block):
+        for y0, y1 in block_ranges(ny, block):
+            for x0, x1 in block_ranges(nx, block):
+                blk = src[0, 0, z0:z1, y0:y1, x0:x1].read().result()
+                if blk.max() > 0:
+                    return True
+    return False
+
+
 def _mask_stages(level: str, hysteresis: bool, fill_holes: bool):
     """Ordered ``(name, path)`` post-seg stages; the last writes the canonical level.
 
@@ -1275,6 +1306,21 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         help="With --fill-holes, only fill cavities of at most this many voxels (0 = "
         "no cap = fill every enclosed cavity, including genuine large lumens).",
     )
+    ap.add_argument(
+        "--abort-if-blank",
+        dest="abort_if_blank",
+        action="store_true",
+        default=True,
+        help="After segmentation, if the mask has no foreground at all, skip "
+        "hysteresis/hole-fill/pyramid and exit (nothing to do). On by default.",
+    )
+    ap.add_argument(
+        "--no-abort-if-blank",
+        dest="abort_if_blank",
+        action="store_false",
+        help="Disable the blank check; build the (empty) pyramid even with no "
+        "foreground.",
+    )
     return ap.parse_args(argv)
 
 
@@ -1400,6 +1446,23 @@ def main(argv: Optional[List[str]] = None) -> None:
         background=background,
     )
     _summarize_metrics(args.metrics_json)
+
+    # Bail out early if the segmentation is completely blank: no foreground means there
+    # is nothing for hysteresis/hole-fill/pyramid to do, and building a full pyramid of
+    # zeros (esp. --fill-finer-levels to level 0) would waste hours of S3 writes.
+    if args.abort_if_blank and not _mask_has_foreground(
+        args.out_bucket, base_path, f"{seg_level}/", args.aws_region, args.ccl_block
+    ):
+        logger.warning(
+            "Segmentation is completely blank (no voxel above threshold in %s%s). "
+            "Nothing to post-process; skipping hysteresis/hole-fill/pyramid. Check "
+            "threshold/seed_threshold, normalization bounds, and flat-field (and that "
+            "--out-prefix is a key, not a full s3:// URL). Pass --no-abort-if-blank to "
+            "build the (empty) pyramid anyway.",
+            base_path,
+            seg_level,
+        )
+        return
 
     # --- Post-processing: hysteresis and/or hole-fill -> final binary at {level}/ ---
     if hysteresis or args.fill_holes:
