@@ -9,6 +9,7 @@ import torch
 
 from aind_torch_utils.accumulators import weighted_average_factory
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.execution import ExecutionPolicy
 from aind_torch_utils.outputs import OutputSpec, Threshold
 from aind_torch_utils.transforms import (
     GlobalNormalizer,
@@ -22,6 +23,13 @@ def _default_preprocess(cfg):
     """The same transform run() synthesizes from config."""
     return from_config(
         cfg.normalize, cfg.norm_lower, cfg.norm_upper, cfg.eps, cfg.clip_norm
+    )
+
+
+def _default_execution(cfg):
+    """The same execution policy run() synthesizes from config."""
+    return ExecutionPolicy.from_config(
+        cfg.amp, cfg.use_compile, cfg.compile_mode, cfg.compile_dynamic
     )
 
 
@@ -152,7 +160,7 @@ def test_prep_worker_pads_tail_batch_to_constant_shape_when_compiling():
     cfg = _prep_cfg(use_compile=True)
     prep_q = queue.Queue()
     PrepWorker(
-        cfg, store, prep_q, cfg.patch, _default_preprocess(cfg)
+        cfg, store, prep_q, cfg.patch, _default_preprocess(cfg), _default_execution(cfg)
     ).run(threading.Event())
 
     batches = _drain(prep_q)
@@ -186,7 +194,7 @@ def test_prep_worker_does_not_pad_in_eager_mode():
     cfg = _prep_cfg(use_compile=False)
     prep_q = queue.Queue()
     PrepWorker(
-        cfg, store, prep_q, cfg.patch, _default_preprocess(cfg)
+        cfg, store, prep_q, cfg.patch, _default_preprocess(cfg), _default_execution(cfg)
     ).run(threading.Event())
 
     batches = _drain(prep_q)
@@ -200,6 +208,24 @@ def test_prep_worker_does_not_pad_in_eager_mode():
         if n_real < cfg.batch_size:
             saw_partial = True
     assert saw_partial, "geometry should produce a partial tail batch"
+
+
+def test_prep_worker_uses_execution_input_dtype():
+    """Host patch dtype comes from the ExecutionPolicy, not cfg.amp (decoupled)."""
+    store = _make_input_store((1, 1, 32, 32, 32))
+    cfg = _prep_cfg(use_compile=False)  # cfg.amp is False
+    prep_q = queue.Queue()
+    # Policy asks for float16 even though cfg.amp is False.
+    execution = ExecutionPolicy.from_config(
+        amp=True, use_compile=False, compile_mode="default", compile_dynamic=None
+    )
+    PrepWorker(
+        cfg, store, prep_q, cfg.patch, _default_preprocess(cfg), execution
+    ).run(threading.Event())
+
+    batches = _drain(prep_q)
+    assert batches
+    assert all(b.host_in.dtype == torch.float16 for b in batches)
 
 
 def test_writer_raises_on_mismatched_output_channels_and_writers():
@@ -345,9 +371,11 @@ def _make_compile_worker():
     """Build a GpuWorker shell without running __init__ (which needs CUDA),
     wired with just the attributes _compile_model touches."""
     worker = object.__new__(GpuWorker)
-    worker.cfg = InferenceConfig(devices=["cpu"], use_compile=True)
+    cfg = InferenceConfig(devices=["cpu"], use_compile=True)
+    worker.cfg = cfg
     worker.device = torch.device("cpu")
     worker.model = torch.nn.Identity()
+    worker.execution = _default_execution(cfg)
     return worker
 
 
