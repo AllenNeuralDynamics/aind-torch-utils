@@ -10,7 +10,7 @@ import tensorstore as ts
 import torch
 from torch import nn
 
-from aind_torch_utils.accumulators import BlockAccumulator
+from aind_torch_utils.accumulators import BlockAccumulator, BlockAccumulatorFactory
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.context import BlockContext
 from aind_torch_utils.transforms import BlockPreprocessor, is_invertible
@@ -537,6 +537,7 @@ class WriterWorker:
         write_q: "queue.Queue[Optional[Preds]]",
         preprocess: BlockPreprocessor,
         full_shape: Tuple[int, int, int],
+        accumulator_factory: BlockAccumulatorFactory,
     ):
         """
         Initializes the WriterWorker.
@@ -558,6 +559,10 @@ class WriterWorker:
         full_shape : Tuple[int, int, int]
             Full volume spatial shape ``(Z, Y, X)``; used to rebuild the
             :class:`BlockContext` for the inverse.
+        accumulator_factory : BlockAccumulatorFactory
+            Builds one accumulator per block per output. Determines how
+            overlapping patches merge (average / max / majority / ...). Defaults,
+            when synthesized from config, reproduce the historical trim/blend merge.
         """
         self.cfg = cfg
         self.writers: List["ts.TensorStore"] = (
@@ -566,21 +571,14 @@ class WriterWorker:
         self.write_q = write_q
         self.preprocess = preprocess
         self.full_shape = full_shape
+        self.accumulator_factory = accumulator_factory
         # maps block_idx → list of BlockAccumulator, one per output channel
         self.blocks: Dict[Tuple[int, int, int], List[BlockAccumulator]] = {}
 
-    def _make_accumulators(self, acc_shape: Tuple[int, int, int]) -> List[BlockAccumulator]:
-        return [
-            BlockAccumulator(
-                acc_shape,
-                self.cfg.eps,
-                overlap=self.cfg.overlap,
-                seam_mode=self.cfg.seam_mode,
-                trim_voxels=self.cfg.trim_voxels,
-                min_blend_weight=self.cfg.min_blend_weight,
-            )
-            for _ in self.writers
-        ]
+    def _make_accumulators(
+        self, acc_shape: Tuple[int, int, int], ctx: "BlockContext"
+    ) -> List[BlockAccumulator]:
+        return [self.accumulator_factory(acc_shape, ctx) for _ in self.writers]
 
     def run(self, stop_event: threading.Event) -> None:
         """
@@ -613,9 +611,15 @@ class WriterWorker:
                 xsl.stop - xsl.start,
             )
 
+            # Block placement is identical for every Preds of this block; build it
+            # once for both accumulator construction and the inverse below.
+            ctx = BlockContext.from_preds(
+                preds, self.full_shape, self.cfg.t_idx, self.cfg.c_idx
+            )
+
             accs = self.blocks.get(preds.block_idx)
             if accs is None:
-                accs = self._make_accumulators(preds.acc_shape)
+                accs = self._make_accumulators(preds.acc_shape, ctx)
                 for acc in accs:
                     acc.total = preds.total_patches_in_block
                 self.blocks[preds.block_idx] = accs
@@ -651,13 +655,10 @@ class WriterWorker:
 
             if accs[0].count >= accs[0].total:
                 lz, ly, lx = preds.halo_left
-                # Rebuild the block context for the inverse. Apply the transform's
-                # inverse once per block (after_finalize) when the transform is
-                # invertible and denormalization is requested. before_accumulate
-                # (invert per patch) is handled in the per-output pipeline (PR4).
-                ctx = BlockContext.from_preds(
-                    preds, self.full_shape, self.cfg.t_idx, self.cfg.c_idx
-                )
+                # Apply the transform's inverse once per block (after_finalize) when
+                # the transform is invertible and denormalization is requested.
+                # before_accumulate (invert per patch) is handled by the per-output
+                # pipeline (PR4).
                 invert = self.cfg.output_denormalize and is_invertible(self.preprocess)
                 if invert and self.preprocess.inverse_stage != "after_finalize":
                     raise NotImplementedError(

@@ -19,6 +19,10 @@ from torch import nn
 
 import aind_torch_utils.models  # This registers all models when imported
 from aind_torch_utils import transforms
+from aind_torch_utils.accumulators import (
+    BlockAccumulatorFactory,
+    weighted_average_factory,
+)
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.model_registry import ModelRegistry
 from aind_torch_utils.monitoring import QueueMonitor, SystemMonitor
@@ -170,6 +174,7 @@ def _setup_workers(
     write_queues: List[queue.Queue],
     preprocess: BlockPreprocessor,
     full_shape: Tuple[int, int, int],
+    accumulator_factory: BlockAccumulatorFactory,
 ) -> Tuple[List[PrepWorker], List[GpuWorker], List[WriterWorker]]:
     """Sets up the workers for the pipeline.
 
@@ -193,6 +198,8 @@ def _setup_workers(
         The injected block transform shared by prep (forward) and writer (inverse).
     full_shape : Tuple[int, int, int]
         Full volume spatial shape ``(Z, Y, X)``.
+    accumulator_factory : BlockAccumulatorFactory
+        Builds the per-block merge accumulators in each writer.
 
     Returns
     -------
@@ -216,7 +223,14 @@ def _setup_workers(
         for device in cfg.devices
     ]
     writer_workers = [
-        WriterWorker(cfg, output_stores, write_queues[i], preprocess, full_shape)
+        WriterWorker(
+            cfg,
+            output_stores,
+            write_queues[i],
+            preprocess,
+            full_shape,
+            accumulator_factory,
+        )
         for i in range(len(write_queues))
     ]
     return prep_workers, gpu_workers, writer_workers
@@ -233,6 +247,7 @@ def _setup_worker_threads(
     write_queues: List[queue.Queue],
     preprocess: BlockPreprocessor,
     full_shape: Tuple[int, int, int],
+    accumulator_factory: BlockAccumulatorFactory,
 ) -> Tuple[List[threading.Thread], List[threading.Thread], List[threading.Thread]]:
     """Sets up the worker threads for the pipeline.
 
@@ -272,6 +287,7 @@ def _setup_worker_threads(
         write_queues,
         preprocess,
         full_shape,
+        accumulator_factory,
     )
 
     # Threads
@@ -350,6 +366,15 @@ def run(
             cfg.clip_norm,
         )
 
+    # Default merge factory reproduces the historical trim/blend accumulator.
+    accumulator_factory = weighted_average_factory(
+        cfg.eps,
+        cfg.overlap,
+        cfg.seam_mode,
+        cfg.trim_voxels,
+        cfg.min_blend_weight,
+    )
+
     # Queues
     prep_q, write_queues = _setup_queues(
         num_writer_workers, maxsize=cfg.max_inflight_batches
@@ -374,6 +399,7 @@ def run(
         write_queues,
         preprocess,
         (Z, Y, X),
+        accumulator_factory,
     )
     all_threads = prep_threads + gpu_threads + writer_threads
 
