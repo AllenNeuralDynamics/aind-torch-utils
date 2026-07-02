@@ -21,6 +21,7 @@ import aind_torch_utils.models  # This registers all models when imported
 from aind_torch_utils import transforms
 from aind_torch_utils.accumulators import weighted_average_factory
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.execution import ExecutionPolicy
 from aind_torch_utils.model_registry import ModelRegistry
 from aind_torch_utils.monitoring import QueueMonitor, SystemMonitor
 from aind_torch_utils.outputs import OutputSpec
@@ -172,6 +173,7 @@ def _setup_workers(
     write_queues: List[queue.Queue],
     preprocess: BlockPreprocessor,
     full_shape: Tuple[int, int, int],
+    execution: ExecutionPolicy,
 ) -> Tuple[List[PrepWorker], List[GpuWorker], List[WriterWorker]]:
     """Sets up the workers for the pipeline.
 
@@ -195,6 +197,8 @@ def _setup_workers(
         The injected block transform shared by prep (forward) and writer (inverse).
     full_shape : Tuple[int, int, int]
         Full volume spatial shape ``(Z, Y, X)``.
+    execution : ExecutionPolicy
+        How the GPU processor runs (dtype/autocast/compile/channels_last).
 
     Returns
     -------
@@ -208,13 +212,14 @@ def _setup_workers(
             prep_q,
             cfg.patch,
             preprocess,
+            execution,
             worker_id=i,
             num_workers=num_prep_workers,
         )
         for i in range(max(1, num_prep_workers))
     ]
     gpu_workers = [
-        GpuWorker(cfg, deepcopy(model), device, prep_q, write_queues)
+        GpuWorker(cfg, deepcopy(model), device, prep_q, write_queues, execution)
         for device in cfg.devices
     ]
     writer_workers = [
@@ -241,6 +246,7 @@ def _setup_worker_threads(
     write_queues: List[queue.Queue],
     preprocess: BlockPreprocessor,
     full_shape: Tuple[int, int, int],
+    execution: ExecutionPolicy,
 ) -> Tuple[List[threading.Thread], List[threading.Thread], List[threading.Thread]]:
     """Sets up the worker threads for the pipeline.
 
@@ -284,6 +290,7 @@ def _setup_worker_threads(
         write_queues,
         preprocess,
         full_shape,
+        execution,
     )
 
     # Threads
@@ -356,6 +363,7 @@ def run(
     num_writer_workers: int = 1,
     preprocess: Optional[BlockPreprocessor] = None,
     outputs: Optional[List[OutputSpec]] = None,
+    execution: Optional[ExecutionPolicy] = None,
 ) -> None:
     """Runs the inference pipeline.
 
@@ -392,6 +400,11 @@ def run(
         the default trim/blend merge and ``invert=cfg.output_denormalize`` for
         every output, preserving existing behavior. Provide this for per-output
         merge/post/dtype control; ``output_store`` is then optional.
+    execution : Optional[ExecutionPolicy], optional
+        How the GPU processor runs (input dtype / autocast / inference_mode /
+        compile / channels_last). When ``None`` (default), synthesized from cfg
+        (``amp``/``use_compile``/``compile_mode``/``compile_dynamic``), so AMP-on
+        stays the legacy default.
     """
     # Validate shapes
     T, C, Z, Y, X = tuple(input_store.domain.shape)
@@ -412,6 +425,12 @@ def run(
     # one spec per store with the default trim/blend merge and a per-output invert
     # flag driven by cfg.output_denormalize -- byte-identical to the old writer.
     output_specs = _resolve_output_specs(output_store, outputs, cfg)
+
+    # Default execution policy from cfg keeps AMP/compile behavior identical.
+    if execution is None:
+        execution = ExecutionPolicy.from_config(
+            cfg.amp, cfg.use_compile, cfg.compile_mode, cfg.compile_dynamic
+        )
 
     # Queues
     prep_q, write_queues = _setup_queues(
@@ -437,6 +456,7 @@ def run(
         write_queues,
         preprocess,
         (Z, Y, X),
+        execution,
     )
     all_threads = prep_threads + gpu_threads + writer_threads
 

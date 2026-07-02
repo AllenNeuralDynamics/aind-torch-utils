@@ -13,6 +13,7 @@ from torch import nn
 from aind_torch_utils.accumulators import BlockAccumulator
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.context import BlockContext
+from aind_torch_utils.execution import ExecutionPolicy
 from aind_torch_utils.outputs import OutputSpec
 from aind_torch_utils.transforms import BlockPreprocessor, is_invertible
 from aind_torch_utils.utils import iter_blocks_zyx, iter_patch_starts
@@ -38,7 +39,7 @@ class Batch:
         relative to the expanded block.
     host_in : torch.Tensor
         The input tensor of patches, pinned to host memory. When compiling
-        (cfg.use_compile), tail batches are zero-padded up to batch_size so
+        (execution.compile), tail batches are zero-padded up to batch_size so
         the model sees a constant input shape, and rows beyond
         len(starts_in_block) are padding. In eager mode it has exactly
         len(starts_in_block) rows.
@@ -152,6 +153,7 @@ class PrepWorker:
         prep_q: "queue.Queue[Batch]",
         model_patch: Tuple[int, int, int],
         preprocess: BlockPreprocessor,
+        execution: ExecutionPolicy,
         worker_id: int = 0,
         num_workers: int = 1,
     ):
@@ -174,6 +176,10 @@ class PrepWorker:
             per-block ``transform_state`` carried to the writer. The prep stage
             no longer branches on normalization mode; that logic lives in the
             transform object (see :mod:`aind_torch_utils.transforms`).
+        execution : ExecutionPolicy
+            Supplies the host ``input_dtype`` for allocated patches and whether
+            the processor is compiled (tail batches are padded to a constant
+            shape only when compiling).
         worker_id : int, optional
             The ID of this worker, by default 0.
         num_workers : int, optional
@@ -184,6 +190,7 @@ class PrepWorker:
         self.prep_q = prep_q
         self.patch = model_patch
         self.preprocess = preprocess
+        self.execution = execution
         self.full_zyx = self.reader.shape[-3:]
         self.worker_id = worker_id
         self.num_workers = max(1, num_workers)
@@ -276,10 +283,10 @@ class PrepWorker:
                 # only index rows in starts_in_block. In eager mode there is
                 # no shape constraint, so allocate exactly n_real rows and
                 # avoid wasting compute and copy bandwidth on padding.
-                n_rows = self.cfg.batch_size if self.cfg.use_compile else n_real
+                n_rows = self.cfg.batch_size if self.execution.compile else n_real
                 host_in = torch.zeros(
                     (n_rows, 1, pz, py, px),
-                    dtype=torch.float16 if self.cfg.amp else torch.float32,
+                    dtype=self.execution.input_dtype,
                     pin_memory=pin_memory,
                 )
                 valid_sizes = []
@@ -331,6 +338,7 @@ class GpuWorker:
         device: str,
         prep_q: "queue.Queue[Optional[Batch]]",
         write_queues: "List[queue.Queue[Optional[Preds]]]",
+        execution: ExecutionPolicy,
     ):
         """
         Initializes the GpuWorker.
@@ -347,6 +355,10 @@ class GpuWorker:
             The queue from which to get prepared batches.
         write_queues : List[queue.Queue[Optional[Preds]]]
             A list of queues to send predictions to, one for each writer worker.
+        execution : ExecutionPolicy
+            How to execute the processor: autocast, inference_mode, compile,
+            channels_last. Detaches these from global config so a processor's
+            constraints travel with it.
         """
         self.cfg = cfg
         self.model = model
@@ -354,24 +366,32 @@ class GpuWorker:
         self.prep_q = prep_q
         self.write_queues = write_queues
         self.num_writers = len(write_queues)
+        self.execution = execution
 
         torch.backends.cuda.matmul.allow_tf32 = self.cfg.use_tf32
         torch.backends.cudnn.benchmark = self.cfg.cudnn_benchmark
 
         self.model.to(self.device)
+        if self.execution.channels_last:
+            self.model = self.model.to(memory_format=torch.channels_last_3d)
         self.model.eval()
 
         self.copy_stream = torch.cuda.Stream(device=self.device)
 
-        if getattr(torch, "compile", None) and self.cfg.use_compile:
+        if getattr(torch, "compile", None) and self.execution.compile:
             self._compile_model()
 
     def _autocast_context(self):
         return (
             torch.autocast(device_type="cuda", dtype=torch.float16)
-            if self.cfg.amp
+            if self.execution.autocast
             else nullcontext()
         )
+
+    def _inference_context(self):
+        if self.execution.inference_mode:
+            return torch.inference_mode()
+        return nullcontext()
 
     def _compile_model(self) -> None:
         # Keep a handle to the original module so we can fall back to eager
@@ -385,13 +405,15 @@ class GpuWorker:
                 # regardless of the `dynamic` setting.
                 self.model = torch.compile(
                     self.model,
-                    mode=self.cfg.compile_mode,
-                    dynamic=self.cfg.compile_dynamic,
+                    mode=self.execution.compile_mode,
+                    dynamic=self.execution.compile_dynamic,
                 )
                 logger.info("Compiled model on %s.", self.device)
             except TypeError:
                 # older PyTorch without `dynamic` kwarg
-                self.model = torch.compile(self.model, mode=self.cfg.compile_mode)
+                self.model = torch.compile(
+                    self.model, mode=self.execution.compile_mode
+                )
                 logger.info("Compiled model on %s (older pytorch).", self.device)
 
             # Compilation is lazy: the graph is traced on the first forward,
@@ -413,14 +435,16 @@ class GpuWorker:
 
     def _warmup_compiled_model(self) -> None:
         torch.cuda.set_device(self.device)
-        dtype = torch.float16 if self.cfg.amp else torch.float32
+        dtype = self.execution.input_dtype
         shape = (self.cfg.batch_size, 1, *self.cfg.patch)
         warmup_in = torch.zeros(shape, dtype=dtype, device=self.device)
+        if self.execution.channels_last:
+            warmup_in = warmup_in.contiguous(memory_format=torch.channels_last_3d)
 
         logger.info(
             "Warming compiled model on %s with shape %s.", self.device, shape
         )
-        with torch.inference_mode():
+        with self._inference_context():
             with self._autocast_context():
                 warmup_out = self.model(warmup_in)
         torch.cuda.synchronize(self.device)
@@ -461,9 +485,11 @@ class GpuWorker:
 
             # H2D
             dev_in.copy_(batch.host_in, non_blocking=True)
+            if self.execution.channels_last:
+                dev_in = dev_in.contiguous(memory_format=torch.channels_last_3d)
 
             # Inference
-            with torch.inference_mode():
+            with self._inference_context():
                 with autocast_ctx:
                     out = self.model(dev_in)
 
