@@ -42,8 +42,12 @@ class Batch:
     valid_sizes : List[Tuple[int, int, int]]
         List of (dz, dy, dx) valid dimensions for each patch, handling
         boundary conditions.
-    per_block_minmax : List[Tuple[float, float]]
-        List of (min, max) percentile values for each patch used for normalization.
+    transform_state : Any
+        Opaque, **per-block** state produced by the preprocessing/normalization step
+        and consumed (only) by its inverse in the writer. The runtime never inspects
+        it. Today it holds the affine ``(mn, mx)`` used for inverse normalization; a
+        future preprocessor may store anything its paired inverse needs (or ``None``
+        when no inversion is required).
     total_patches_in_block : int
         The total number of patches in the entire block.
     acc_shape : Tuple[int, int, int]
@@ -58,7 +62,7 @@ class Batch:
     starts_in_block: List[Tuple[int, int, int]]
     host_in: torch.Tensor
     valid_sizes: List[Tuple[int, int, int]]
-    per_block_minmax: List[Tuple[float, float]]  # per-patch (mn, mx)
+    transform_state: Any  # opaque, per-block (today: affine (mn, mx))
     total_patches_in_block: int
     acc_shape: Tuple[int, int, int]  # shape of expanded (core+halo) accumulator
     halo_left: Tuple[int, int, int]  # halo size on the -Z/-Y/-X sides
@@ -84,8 +88,10 @@ class Preds:
         The output tensor of predictions, pinned to host memory.
     valid_sizes : List[Tuple[int, int, int]]
         List of (dz, dy, dx) valid dimensions for each patch.
-    per_block_minmax : List[Tuple[float, float]]
-        List of (min, max) percentile values for each patch for denormalization.
+    transform_state : Any
+        Opaque, **per-block** state passed through from the matching :class:`Batch`
+        (the GPU stage does not touch it) and consumed by the preprocessing inverse
+        in the writer. Today it holds the affine ``(mn, mx)`` for denormalization.
     total_patches_in_block : int
         The total number of patches in the entire block.
     acc_shape : Tuple[int, int, int]
@@ -102,7 +108,7 @@ class Preds:
     starts_in_block: List[Tuple[int, int, int]]
     host_out: torch.Tensor
     valid_sizes: List[Tuple[int, int, int]]
-    per_block_minmax: List[Tuple[float, float]]
+    transform_state: Any
     total_patches_in_block: int
     acc_shape: Tuple[int, int, int]
     halo_left: Tuple[int, int, int]
@@ -261,6 +267,11 @@ class PrepWorker:
             starts = starts_cache[(bz, by, bx)]
             total_patches = len(starts)
 
+            # Opaque per-block state for the writer's inverse normalization. The whole
+            # block shares one (mn, mx), so it is computed once here rather than per
+            # patch. Future preprocessors can store any inverse state (or None).
+            transform_state = (float(block_mn), float(block_mx))
+
             # batch over those starts
             for i in range(0, total_patches, self.cfg.batch_size):
                 batch_starts = starts[i : i + self.cfg.batch_size]
@@ -279,7 +290,7 @@ class PrepWorker:
                     dtype=torch.float16 if self.cfg.amp else torch.float32,
                     pin_memory=pin_memory,
                 )
-                valid_sizes, per_block_minmax = [], []
+                valid_sizes = []
 
                 for bi, (sz, sy, sx) in enumerate(batch_starts):
                     ez, ey, ex = (
@@ -295,8 +306,6 @@ class PrepWorker:
                     host_in[bi, 0, :dz, :dy, :dx].copy_(torch.from_numpy(norm))
 
                     valid_sizes.append((dz, dy, dx))
-                    # Every patch in the block uses the same (mn, mx)
-                    per_block_minmax.append((float(block_mn), float(block_mx)))
 
                 batch = Batch(
                     block_idx=block_idx,
@@ -305,7 +314,7 @@ class PrepWorker:
                     starts_in_block=batch_starts,  # coords are in expanded space
                     host_in=host_in,
                     valid_sizes=valid_sizes,
-                    per_block_minmax=per_block_minmax,
+                    transform_state=transform_state,
                     total_patches_in_block=total_patches,
                     acc_shape=acc_shape,
                     halo_left=halo_left,
@@ -502,7 +511,7 @@ class GpuWorker:
                 starts_in_block=batch.starts_in_block,
                 host_out=host_out,
                 valid_sizes=batch.valid_sizes,
-                per_block_minmax=batch.per_block_minmax,  # pass-through
+                transform_state=batch.transform_state,  # opaque pass-through
                 total_patches_in_block=batch.total_patches_in_block,
                 acc_shape=batch.acc_shape,
                 halo_left=batch.halo_left,
@@ -627,20 +636,25 @@ class WriterWorker:
                     f"writer(s) for block {preds.block_idx}."
                 )
 
+            # Inverse normalization is the same affine map for every patch in the
+            # block, so resolve it once from the per-block transform_state. This is
+            # useful whenever the model output maps back to the original data range;
+            # disabled (e.g. for a segmentation model) via output_denormalize=False.
+            denorm: Optional[Tuple[np.float32, np.float32]] = None
+            if self.cfg.output_denormalize:
+                mn, mx = preds.transform_state
+                scale = max(mx - mn, self.cfg.eps)
+                denorm = (np.float32(scale), np.float32(mn))
+
             for bi, (sz, sy, sx) in enumerate(preds.starts_in_block):
                 dz, dy, dx = preds.valid_sizes[bi]
                 for n, acc in enumerate(accs):
                     patch_pred = out_np[bi, n]
                     pp = patch_pred.astype(np.float32, copy=False)
 
-                    # This is useful for whenever the model does not need
-                    # to map to the original data range (e.g. a segmentation model)
-                    if self.cfg.output_denormalize:
-                        mn, mx = preds.per_block_minmax[bi]
-                        scale = max(mx - mn, self.cfg.eps)
-                        pp = (pp * np.float32(scale) + np.float32(mn)).astype(
-                            np.float32, copy=False
-                        )
+                    if denorm is not None:
+                        scale, mn = denorm
+                        pp = (pp * scale + mn).astype(np.float32, copy=False)
                     acc.add(pp, (sz, sy, sx), (dz, dy, dx))
 
             if accs[0].count >= accs[0].total:
