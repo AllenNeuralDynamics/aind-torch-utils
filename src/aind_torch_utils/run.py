@@ -18,9 +18,11 @@ from typing import Any, List, Optional, Tuple, Union
 from torch import nn
 
 import aind_torch_utils.models  # This registers all models when imported
+from aind_torch_utils import transforms
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.model_registry import ModelRegistry
 from aind_torch_utils.monitoring import QueueMonitor, SystemMonitor
+from aind_torch_utils.transforms import BlockPreprocessor
 from aind_torch_utils.utils import open_ts_spec
 from aind_torch_utils.workers import GpuWorker, PrepWorker, WriterWorker
 
@@ -166,6 +168,8 @@ def _setup_workers(
     num_prep_workers: int,
     prep_q: queue.Queue,
     write_queues: List[queue.Queue],
+    preprocess: BlockPreprocessor,
+    full_shape: Tuple[int, int, int],
 ) -> Tuple[List[PrepWorker], List[GpuWorker], List[WriterWorker]]:
     """Sets up the workers for the pipeline.
 
@@ -185,6 +189,10 @@ def _setup_workers(
         The prep queue.
     write_queues : List[queue.Queue]
         A list of writer queues.
+    preprocess : BlockPreprocessor
+        The injected block transform shared by prep (forward) and writer (inverse).
+    full_shape : Tuple[int, int, int]
+        Full volume spatial shape ``(Z, Y, X)``.
 
     Returns
     -------
@@ -197,6 +205,7 @@ def _setup_workers(
             input_store,
             prep_q,
             cfg.patch,
+            preprocess,
             worker_id=i,
             num_workers=num_prep_workers,
         )
@@ -207,7 +216,7 @@ def _setup_workers(
         for device in cfg.devices
     ]
     writer_workers = [
-        WriterWorker(cfg, output_stores, write_queues[i])
+        WriterWorker(cfg, output_stores, write_queues[i], preprocess, full_shape)
         for i in range(len(write_queues))
     ]
     return prep_workers, gpu_workers, writer_workers
@@ -222,6 +231,8 @@ def _setup_worker_threads(
     num_prep_workers: int,
     prep_q: queue.Queue,
     write_queues: List[queue.Queue],
+    preprocess: BlockPreprocessor,
+    full_shape: Tuple[int, int, int],
 ) -> Tuple[List[threading.Thread], List[threading.Thread], List[threading.Thread]]:
     """Sets up the worker threads for the pipeline.
 
@@ -259,6 +270,8 @@ def _setup_worker_threads(
         num_prep_workers,
         prep_q,
         write_queues,
+        preprocess,
+        full_shape,
     )
 
     # Threads
@@ -287,6 +300,7 @@ def run(
     metrics_interval: float = 0.5,
     num_prep_workers: int = 1,
     num_writer_workers: int = 1,
+    preprocess: Optional[BlockPreprocessor] = None,
 ) -> None:
     """Runs the inference pipeline.
 
@@ -311,6 +325,11 @@ def run(
         The number of prep workers to use, by default 1.
     num_writer_workers : int, optional
         The number of writer workers to use, by default 1.
+    preprocess : Optional[BlockPreprocessor], optional
+        Injected input-domain transform applied per block (its inverse runs in
+        the writer). When ``None`` (default), one is synthesized from the legacy
+        config fields (``normalize``/``norm_lower``/``norm_upper``/``clip_norm``),
+        preserving existing behavior.
     """
     output_stores: List[Any] = (
         output_store if isinstance(output_store, list) else [output_store]
@@ -319,6 +338,17 @@ def run(
     # Validate shapes
     T, C, Z, Y, X = tuple(input_store.domain.shape)
     assert 0 <= cfg.t_idx < T and 0 <= cfg.c_idx < C, "Invalid t/c indices"
+
+    # Synthesize the default block transform from config when none is injected,
+    # so existing callers keep their current normalization behavior.
+    if preprocess is None:
+        preprocess = transforms.from_config(
+            cfg.normalize,
+            cfg.norm_lower,
+            cfg.norm_upper,
+            cfg.eps,
+            cfg.clip_norm,
+        )
 
     # Queues
     prep_q, write_queues = _setup_queues(
@@ -342,6 +372,8 @@ def run(
         num_prep_workers,
         prep_q,
         write_queues,
+        preprocess,
+        (Z, Y, X),
     )
     all_threads = prep_threads + gpu_threads + writer_threads
 
