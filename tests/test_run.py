@@ -7,9 +7,11 @@ import torch
 from torch import nn
 
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.execution import ExecutionPolicy
 from aind_torch_utils.models import SharedEncoderModel
 from aind_torch_utils.outputs import OutputSpec
-from aind_torch_utils.run import _resolve_output_specs, run
+from aind_torch_utils.run import _resolve_output_specs, run, run_workflow
+from aind_torch_utils.workflow import Workflow, WorkflowRegistry
 
 
 class DummyModel(nn.Module):
@@ -246,6 +248,53 @@ def test_resolve_output_specs_rejects_both_and_neither():
         _resolve_output_specs(None, None, cfg)
     with pytest.raises(ValueError, match="non-empty"):
         _resolve_output_specs(None, [], cfg)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for GPU pipeline"
+)
+def test_run_workflow_end_to_end(temp_dir, dummy_data):
+    """A registered Workflow (identity processor, no normalization) runs through
+    run_workflow and reproduces the input."""
+    input_store, output_store = dummy_data
+
+    @WorkflowRegistry.register("test-identity-workflow")
+    def _build(params):
+        return Workflow(
+            processor=DummyModel(),
+            preprocess=None,  # run() synthesizes from cfg (normalize=False)
+            execution=ExecutionPolicy.from_config(
+                amp=False, use_compile=False, compile_mode="default",
+                compile_dynamic=None,
+            ),
+        )
+
+    cfg = InferenceConfig(
+        patch=(16, 16, 16),
+        overlap=4,
+        trim_voxels=2,
+        seam_mode="trim",
+        block=(32, 32, 32),
+        batch_size=4,
+        devices=["cuda:0"],
+        amp=False,
+        max_inflight_batches=10,
+        normalize=False,
+    )
+
+    workflow = WorkflowRegistry.build("test-identity-workflow")
+    run_workflow(
+        workflow,
+        input_store,
+        output_store,
+        cfg,
+        metrics_json=str(temp_dir / "wf_metrics.json"),
+        metrics_interval=0.1,
+    )
+
+    np.testing.assert_array_equal(
+        input_store.read().result(), output_store.read().result()
+    )
 
 
 def test_shared_encoder_model_forward():

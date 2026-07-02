@@ -18,6 +18,7 @@ from typing import Any, List, Optional, Tuple, Union
 from torch import nn
 
 import aind_torch_utils.models  # This registers all models when imported
+import aind_torch_utils.recipes  # This registers all workflow recipes when imported
 from aind_torch_utils import transforms
 from aind_torch_utils.accumulators import weighted_average_factory
 from aind_torch_utils.config import InferenceConfig
@@ -28,6 +29,7 @@ from aind_torch_utils.outputs import OutputSpec
 from aind_torch_utils.transforms import BlockPreprocessor
 from aind_torch_utils.utils import open_ts_spec
 from aind_torch_utils.workers import GpuWorker, PrepWorker, WriterWorker
+from aind_torch_utils.workflow import Workflow, WorkflowRegistry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -520,6 +522,48 @@ def run(
     logger.info(f"Throughput: {throughput:.2f}MB/s")
 
 
+def run_workflow(
+    workflow: Workflow,
+    input_store: Any,
+    output_store: Union[Any, List[Any], None],
+    cfg: InferenceConfig,
+    **run_kwargs: Any,
+) -> None:
+    """Run a :class:`Workflow` by unpacking its injected objects into :func:`run`.
+
+    The workflow supplies the processor, preprocessing, per-output specs, and
+    execution policy; everything else (metrics, worker counts) is forwarded via
+    ``run_kwargs``.
+
+    Parameters
+    ----------
+    workflow : Workflow
+        The recipe to run.
+    input_store : Any
+        The input data store.
+    output_store : Any or list of Any or None
+        Output store(s). Ignored when the workflow supplies its own ``outputs``.
+    cfg : InferenceConfig
+        The runtime configuration.
+    **run_kwargs : Any
+        Forwarded to :func:`run` (e.g. ``metrics_json``, ``num_prep_workers``).
+    """
+    output_stores = (
+        output_store if isinstance(output_store, list) else [output_store]
+    )
+    outputs = workflow.resolve_outputs(output_stores)
+    run(
+        workflow.processor,
+        input_store,
+        None if outputs is not None else output_store,
+        cfg,
+        preprocess=workflow.preprocess,
+        outputs=outputs,
+        execution=workflow.execution,
+        **run_kwargs,
+    )
+
+
 def load_model(model_type: str, weights_path: Optional[str] = None) -> nn.Module:
     """Loads a model from the registry.
 
@@ -573,10 +617,25 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     ap.add_argument(
         "--model-type",
         type=str,
-        required=True,
-        help="Type of model to use (must be registered)",
+        default=None,
+        help="Type of model to use (must be registered). Alternative to --workflow.",
     )
     ap.add_argument("--weights", type=str, help="Model weights path")
+    ap.add_argument(
+        "--workflow",
+        type=str,
+        default=None,
+        help=(
+            "Named workflow recipe to run (registered in aind_torch_utils.recipes). "
+            "Alternative to --model-type; brings its own preprocessing/outputs."
+        ),
+    )
+    ap.add_argument(
+        "--workflow-params",
+        type=str,
+        default=None,
+        help="Path to a JSON file of parameters passed to the workflow builder.",
+    )
     ap.add_argument("--t", type=int, default=0)
     ap.add_argument("--c", type=int, default=0)
     ap.add_argument("--patch", type=int, nargs=3, default=(64, 64, 64))
@@ -735,7 +794,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     """
     args = _parse_args(sys.argv[1:] if argv is None else argv)
 
-    model = load_model(args.model_type, args.weights)
+    if bool(args.model_type) == bool(args.workflow):
+        raise SystemExit("Provide exactly one of --model-type or --workflow.")
 
     in_arr = open_ts_spec(args.in_spec)
     out_arr = [open_ts_spec(s) for s in args.out_spec]
@@ -774,16 +834,23 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     logger.info(f"Inference config:\n{cfg}")
 
-    run(
-        model,
-        in_arr,
-        out_arr,
-        cfg,
-        args.metrics_json,
-        args.metrics_interval,
+    run_kwargs = dict(
+        metrics_json=args.metrics_json,
+        metrics_interval=args.metrics_interval,
         num_prep_workers=max(1, args.prep_workers),
         num_writer_workers=max(1, args.writer_workers),
     )
+
+    if args.workflow:
+        params: dict = {}
+        if args.workflow_params:
+            with open(args.workflow_params) as f:
+                params = json.load(f)
+        workflow = WorkflowRegistry.build(args.workflow, params)
+        run_workflow(workflow, in_arr, out_arr, cfg, **run_kwargs)
+    else:
+        model = load_model(args.model_type, args.weights)
+        run(model, in_arr, out_arr, cfg, **run_kwargs)
 
 
 if __name__ == "__main__":  # pragma: no cover
