@@ -7,12 +7,11 @@ strategy is a first-class, injectable choice (issue #25 §3.3), supplied as a
 **factory** because one accumulator is created per block per output.
 
 All accumulators expose the same tiny contract (:class:`BlockAccumulator`): ``add`` a
-patch, then ``finalize`` to the **expanded** (core + halo) block; ``count``/``total``
-let the writer detect block completion.
+patch, then ``finalize`` to the **expanded** (core + halo) block. Block completion is
+tracked by the writer itself, so accumulators only merge.
 """
 from typing import (
     TYPE_CHECKING,
-    Any,
     Dict,
     Optional,
     Protocol,
@@ -29,9 +28,6 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 @runtime_checkable
 class BlockAccumulator(Protocol):
     """Merges patches for one block/output. Created once per block per output."""
-
-    total: int
-    count: int
 
     def add(
         self,
@@ -95,8 +91,6 @@ class WeightedAverageAccumulator:
         self.acc = np.zeros(block_shape, dtype=np.float32)
         self.wacc = np.zeros(block_shape, dtype=np.float32)
         self.eps = eps
-        self.count = 0
-        self.total = 0
         self.overlap = overlap
         self.seam_mode = seam_mode
         self.trim_voxels = (
@@ -226,8 +220,6 @@ class WeightedAverageAccumulator:
             self.acc[sz : sz + dz, sy : sy + dy, sx : sx + dx] += pp[:dz, :dy, :dx] * W
             self.wacc[sz : sz + dz, sy : sy + dy, sx : sx + dx] += W
 
-        self.count += 1
-
     def finalize(self) -> np.ndarray:
         out = self.acc / np.maximum(self.wacc, self.eps)
         return out
@@ -239,8 +231,6 @@ class _RegionAccumulator:
     def __init__(self, block_shape: Tuple[int, int, int], fill: float = 0.0):
         self.block_shape = block_shape
         self.acc = np.full(block_shape, fill, dtype=np.float32)
-        self.count = 0
-        self.total = 0
 
     def _region(self, start, valid):
         sz, sy, sx = start
@@ -264,7 +254,6 @@ class LastWriteAccumulator(_RegionAccumulator):
     def add(self, pred_patch, start, valid):
         block_sl, patch_sl = self._region(start, valid)
         self.acc[block_sl] = np.asarray(pred_patch[patch_sl], dtype=np.float32)
-        self.count += 1
 
 
 class MaxAccumulator(_RegionAccumulator):
@@ -283,7 +272,6 @@ class MaxAccumulator(_RegionAccumulator):
         np.maximum(
             region, np.asarray(pred_patch[patch_sl], dtype=np.float32), out=region
         )
-        self.count += 1
 
     def finalize(self) -> np.ndarray:
         self.acc[np.isneginf(self.acc)] = 0.0
@@ -296,7 +284,6 @@ class SumAccumulator(_RegionAccumulator):
     def add(self, pred_patch, start, valid):
         block_sl, patch_sl = self._region(start, valid)
         self.acc[block_sl] += np.asarray(pred_patch[patch_sl], dtype=np.float32)
-        self.count += 1
 
 
 class MajorityVoteAccumulator:
@@ -304,14 +291,18 @@ class MajorityVoteAccumulator:
 
     Averaging discrete labels is meaningless; this counts votes per label and
     finalizes to the most-voted label (ties broken toward the smaller label).
-    Memory scales with the number of distinct labels seen in the block.
+    Voxels that receive no votes finalize to 0 (background), matching
+    :class:`MaxAccumulator`. Memory scales with the number of distinct labels
+    seen in the block.
+
+    Labels are matched by exact float value: the runtime carries predictions as
+    float16/float32, so integer instance IDs survive only up to 2**24 in float32
+    (2048 in float16 under AMP) — keep label ranges within those bounds.
     """
 
     def __init__(self, block_shape: Tuple[int, int, int]):
         self.block_shape = block_shape
-        self.votes: Dict[Any, np.ndarray] = {}
-        self.count = 0
-        self.total = 0
+        self.votes: Dict[float, np.ndarray] = {}
 
     def add(self, pred_patch, start, valid):
         sz, sy, sx = start
@@ -319,20 +310,28 @@ class MajorityVoteAccumulator:
         patch = np.asarray(pred_patch[:dz, :dy, :dx])
         region = (slice(sz, sz + dz), slice(sy, sy + dy), slice(sx, sx + dx))
         for label in np.unique(patch):
-            arr = self.votes.get(label)
+            if np.isnan(label):
+                # NaN is not a label: NaN != NaN would miss the dict lookup
+                # and allocate a fresh block-sized vote plane on every add,
+                # and `patch == NaN` is all-False so it can never win a vote.
+                continue
+            key = float(label)
+            arr = self.votes.get(key)
             if arr is None:
                 arr = np.zeros(self.block_shape, dtype=np.float32)
-                self.votes[label] = arr
+                self.votes[key] = arr
             arr[region] += patch == label
-        self.count += 1
 
     def finalize(self) -> np.ndarray:
         if not self.votes:
             return np.zeros(self.block_shape, dtype=np.float32)
         labels = sorted(self.votes.keys())
         stack = np.stack([self.votes[label] for label in labels], axis=0)
-        winner = np.asarray(labels)[np.argmax(stack, axis=0)]
-        return winner.astype(np.float32)
+        winner = np.asarray(labels, dtype=np.float32)[np.argmax(stack, axis=0)]
+        # argmax over an all-zero column returns index 0, which would hand
+        # zero-vote voxels the smallest label seen in the block; force them
+        # to background instead.
+        return np.where(stack.max(axis=0) > 0, winner, np.float32(0.0))
 
 
 def weighted_average_factory(

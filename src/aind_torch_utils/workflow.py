@@ -9,7 +9,7 @@ Scope note (issue #25 §3.7): the registry is intentionally the *last* piece and
 deliberately small. It is provisional until a second real workflow has exercised these
 contracts; concrete recipes live under :mod:`aind_torch_utils.recipes`.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -62,16 +62,18 @@ class Workflow:
     output_spec_factory : OutputSpecFactory, optional
         Builds the specs from the opened output stores, when they are needed to
         construct the specs. Mutually exclusive with ``outputs``.
-    execution : ExecutionPolicy
-        How the processor runs. Defaults to the plain policy (float32, no AMP); a
-        recipe overrides it to declare its processor's constraints.
+    execution : ExecutionPolicy, optional
+        How the processor runs. ``None`` (default) lets the runtime synthesize
+        the policy from config — the same rule as ``preprocess`` — so CLI/config
+        AMP and compile flags keep working; a recipe sets it to declare its
+        processor's constraints, which then override config.
     """
 
     processor: BlockProcessor
     preprocess: Optional[BlockPreprocessor] = None
     outputs: Optional[List[OutputSpec]] = None
     output_spec_factory: Optional[OutputSpecFactory] = None
-    execution: ExecutionPolicy = field(default_factory=ExecutionPolicy)
+    execution: Optional[ExecutionPolicy] = None
 
     def __post_init__(self):
         if self.outputs is not None and self.output_spec_factory is not None:

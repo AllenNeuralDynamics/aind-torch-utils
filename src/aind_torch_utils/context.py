@@ -1,9 +1,9 @@
 """Per-block context passed to injected pre/post-processing hooks.
 
-A :class:`BlockContext` describes *where* a block lives in the full volume. It is the
-information an injected ``BlockPreprocessor`` / ``BlockPostProcessor`` needs but the
-runtime carriers (:class:`~aind_torch_utils.workers.Batch` /
-:class:`~aind_torch_utils.workers.Preds`) do not otherwise expose in one place.
+A :class:`BlockContext` describes *where* a block lives in the full volume. It is
+built once per block in the prep stage and carried on the runtime carriers
+(:class:`~aind_torch_utils.workers.Batch` / :class:`~aind_torch_utils.workers.Preds`)
+so every stage shares the same derivation.
 
 The **absolute** ``expanded_bbox`` is load-bearing: corrections that sample a coarse
 *global* field (flat-field background, adaptive local statistics) must index that
@@ -18,10 +18,7 @@ in torch / tensorstore.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Tuple
-
-if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
-    from aind_torch_utils.workers import Preds
+from typing import Tuple
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,42 +78,6 @@ class BlockContext:
             core_bbox=core_bbox,
             expanded_bbox=expanded_bbox,
             halo_left=halo_left,
-            full_shape=full_shape,
-            t_idx=t_idx,
-            c_idx=c_idx,
-        )
-
-    @classmethod
-    def from_preds(
-        cls,
-        preds: "Preds",
-        full_shape: Tuple[int, int, int],
-        t_idx: int,
-        c_idx: int,
-    ) -> "BlockContext":
-        """Reconstruct the context in the writer stage from a :class:`Preds`.
-
-        ``Preds`` carries the core bbox, the left-halo widths, and the expanded
-        ``acc_shape`` but not the expanded bbox itself; recover it as
-        ``expanded_start = core_start - halo_left`` and
-        ``expanded_stop = expanded_start + acc_shape``. ``full_shape`` is a
-        volume-level constant supplied by the caller (it does not ride on every
-        per-block carrier).
-        """
-        (zsl, ysl, xsl) = preds.block_bbox
-        lz, ly, lx = preds.halo_left
-        bz, by, bx = preds.acc_shape
-        z0e, y0e, x0e = zsl.start - lz, ysl.start - ly, xsl.start - lx
-        expanded_bbox = (
-            slice(z0e, z0e + bz),
-            slice(y0e, y0e + by),
-            slice(x0e, x0e + bx),
-        )
-        return cls(
-            block_idx=preds.block_idx,
-            core_bbox=preds.block_bbox,
-            expanded_bbox=expanded_bbox,
-            halo_left=preds.halo_left,
             full_shape=full_shape,
             t_idx=t_idx,
             c_idx=c_idx,

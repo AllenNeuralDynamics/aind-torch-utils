@@ -14,6 +14,22 @@ from typing import Optional
 
 import torch
 
+# CUDA-graph-capturing compile modes fail under this pipeline's threaded GPU
+# workers: torch.compile captures the graph lazily on the second forward, which
+# runs on a worker thread while warmup ran on the main thread, aborting with
+# cudaErrorStreamCaptureInvalidated. InferenceConfig._validate applies the same
+# downgrade for config-synthesized policies; GpuWorker consults this map so
+# directly-injected policies get identical protection.
+CUDA_SAFE_COMPILE_MODES = {
+    "reduce-overhead": "default",
+    "max-autotune": "max-autotune-no-cudagraphs",
+}
+
+
+def cuda_safe_compile_mode(mode: str) -> str:
+    """Return ``mode``, downgraded if it would capture CUDA graphs."""
+    return CUDA_SAFE_COMPILE_MODES.get(mode, mode)
+
 
 @dataclass
 class ExecutionPolicy:

@@ -49,3 +49,16 @@ def test_main_requires_exactly_one_of_model_or_workflow():
                 "--workflow", "w",
             ]
         )
+
+
+def test_main_rejects_weights_with_workflow():
+    """--weights would be silently ignored in workflow mode; refuse it instead."""
+    with pytest.raises(SystemExit, match="--weights only applies"):
+        main(
+            [
+                "--in-spec", "in.json",
+                "--out-spec", "out.json",
+                "--workflow", "w",
+                "--weights", "w.pt",
+            ]
+        )

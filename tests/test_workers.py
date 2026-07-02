@@ -9,6 +9,7 @@ import torch
 
 from aind_torch_utils.accumulators import weighted_average_factory
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.context import BlockContext
 from aind_torch_utils.execution import ExecutionPolicy
 from aind_torch_utils.outputs import OutputSpec, Threshold
 from aind_torch_utils.transforms import (
@@ -112,6 +113,19 @@ class _FakeStore:
         return _FakeSlice(self)
 
 
+def _block_ctx(extent=2, full_shape=(2, 2, 2)):
+    """A no-halo BlockContext for a block spanning [0, extent) on each axis."""
+    bbox = (slice(0, extent),) * 3
+    return BlockContext.from_block(
+        block_idx=(0, 0, 0),
+        core_bbox=bbox,
+        expanded_bbox=bbox,
+        full_shape=full_shape,
+        t_idx=0,
+        c_idx=0,
+    )
+
+
 def _single_patch_preds(host_out, transform_state):
     """A Preds for a 2x2x2 single-patch block that completes on arrival."""
     return Preds(
@@ -125,6 +139,7 @@ def _single_patch_preds(host_out, transform_state):
         total_patches_in_block=1,
         acc_shape=(2, 2, 2),
         halo_left=(0, 0, 0),
+        ctx=_block_ctx(),
         ready_event=None,
     )
 
@@ -139,7 +154,7 @@ def _spec(cfg, store, postprocess=None, accumulator_factory=None):
     )
 
 
-def _run_writer_once(cfg, store, preds, preprocess, full_shape=(2, 2, 2)):
+def _run_writer_once(cfg, store, preds, preprocess):
     write_q: "queue.Queue[Optional[Preds]]" = queue.Queue()
     write_q.put(preds)
     write_q.put(None)  # sentinel closes the writer loop
@@ -148,7 +163,6 @@ def _run_writer_once(cfg, store, preds, preprocess, full_shape=(2, 2, 2)):
         outputs=[_spec(cfg, store)],
         write_q=write_q,
         preprocess=preprocess,
-        full_shape=full_shape,
     ).run(threading.Event())
 
 
@@ -238,7 +252,6 @@ def test_writer_raises_on_mismatched_output_channels_and_writers():
         outputs=[_spec(cfg, object())],
         write_q=write_q,
         preprocess=IdentityTransform(),
-        full_shape=(2, 2, 2),
     )
 
     preds = Preds(
@@ -252,6 +265,7 @@ def test_writer_raises_on_mismatched_output_channels_and_writers():
         total_patches_in_block=1,
         acc_shape=(2, 2, 2),
         halo_left=(0, 0, 0),
+        ctx=_block_ctx(),
         ready_event=None,
     )
 
@@ -343,6 +357,7 @@ def test_writer_per_output_merge_post_and_dtype():
         total_patches_in_block=1,
         acc_shape=(2, 2, 2),
         halo_left=(0, 0, 0),
+        ctx=_block_ctx(),
         ready_event=None,
     )
 
@@ -354,7 +369,6 @@ def test_writer_per_output_merge_post_and_dtype():
         outputs=[mask_spec, field_spec],
         write_q=write_q,
         preprocess=IdentityTransform(),
-        full_shape=(2, 2, 2),
     ).run(threading.Event())
 
     # Mask: threshold(logit > 0) -> uint8 binary.

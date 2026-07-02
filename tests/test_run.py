@@ -10,7 +10,12 @@ from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.execution import ExecutionPolicy
 from aind_torch_utils.models import SharedEncoderModel
 from aind_torch_utils.outputs import OutputSpec
-from aind_torch_utils.run import _resolve_output_specs, run, run_workflow
+from aind_torch_utils.run import (
+    _resolve_output_specs,
+    _validate_inversion,
+    run,
+    run_workflow,
+)
 from aind_torch_utils.workflow import Workflow, WorkflowRegistry
 
 
@@ -248,6 +253,69 @@ def test_resolve_output_specs_rejects_both_and_neither():
         _resolve_output_specs(None, None, cfg)
     with pytest.raises(ValueError, match="non-empty"):
         _resolve_output_specs(None, [], cfg)
+
+
+def test_resolve_output_specs_rejects_none_store():
+    """A None store must fail here, not as an AttributeError in a writer thread."""
+    cfg = InferenceConfig(devices=["cpu"])
+    specs = [OutputSpec(store=None, accumulator_factory=object())]
+    with pytest.raises(ValueError, match="store=None"):
+        _resolve_output_specs(None, specs, cfg)
+
+
+def test_validate_inversion_rejects_invert_without_inverse():
+    """invert=True + forward-only preprocess must error, not silently skip."""
+
+    class _ForwardOnly:
+        def forward(self, block, ctx):
+            return block, None
+
+    specs = [
+        OutputSpec(store=object(), accumulator_factory=object(), invert=True)
+    ]
+    with pytest.raises(ValueError, match="defines no inverse"):
+        _validate_inversion(_ForwardOnly(), specs)
+    # invert=False everywhere -> a forward-only preprocess is fine.
+    _validate_inversion(
+        _ForwardOnly(),
+        [OutputSpec(store=object(), accumulator_factory=object(), invert=False)],
+    )
+
+
+def test_validate_inversion_rejects_unknown_stage():
+    """A typo'd inverse_stage must error, not silently disable inversion."""
+
+    class _TypoStage:
+        inverse_stage = "after-finalize"  # hyphen typo
+
+        def forward(self, block, ctx):
+            return block, None
+
+        def inverse(self, block, state, ctx):
+            return block
+
+    specs = [
+        OutputSpec(store=object(), accumulator_factory=object(), invert=True)
+    ]
+    with pytest.raises(ValueError, match="Unknown inverse_stage"):
+        _validate_inversion(_TypoStage(), specs)
+
+
+def test_validate_inversion_defaults_missing_stage():
+    """A duck-typed invertible transform without inverse_stage is accepted
+    (the writer defaults it to after_finalize)."""
+
+    class _NoStage:
+        def forward(self, block, ctx):
+            return block, None
+
+        def inverse(self, block, state, ctx):
+            return block
+
+    specs = [
+        OutputSpec(store=object(), accumulator_factory=object(), invert=True)
+    ]
+    _validate_inversion(_NoStage(), specs)  # must not raise
 
 
 @pytest.mark.skipif(

@@ -65,9 +65,11 @@ class Threshold:
         self.below = float(below)
 
     def __call__(self, block: np.ndarray, ctx: "BlockContext") -> np.ndarray:
-        return np.where(block > self.thresh, self.above, self.below).astype(
-            np.float32, copy=False
-        )
+        # float32 branch scalars keep np.where from promoting the whole block
+        # to float64 (Python-float branches would double the allocation).
+        return np.where(
+            block > self.thresh, np.float32(self.above), np.float32(self.below)
+        ).astype(np.float32, copy=False)
 
 
 class ThresholdThenOpen:

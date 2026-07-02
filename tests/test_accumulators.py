@@ -61,11 +61,22 @@ def test_majority_vote_empty_block_is_zeros():
     np.testing.assert_array_equal(acc.finalize().ravel(), [0, 0])
 
 
-def test_accumulators_track_count():
-    acc = SumAccumulator((1, 1, 2))
-    assert acc.count == 0
-    acc.add(_patch([1, 1]), (0, 0, 0), (1, 1, 2))
-    assert acc.count == 1
+def test_majority_vote_uncovered_voxels_are_background():
+    """Voxels no patch votes on finalize to 0, not the smallest seen label."""
+    acc = MajorityVoteAccumulator((1, 1, 4))
+    # Only x0..x1 covered, with foreground labels {3, 5} (no 0 anywhere).
+    acc.add(_patch([3, 5]), (0, 0, 0), (1, 1, 2))
+    np.testing.assert_array_equal(acc.finalize().ravel(), [3, 5, 0, 0])
+
+
+def test_majority_vote_ignores_nan_and_shares_vote_planes():
+    """NaN is skipped (not a label), and repeated adds of the same label reuse
+    one vote plane instead of allocating a new one per add."""
+    acc = MajorityVoteAccumulator((1, 1, 2))
+    acc.add(_patch([np.nan, 7]), (0, 0, 0), (1, 1, 2))
+    acc.add(_patch([np.nan, 7]), (0, 0, 0), (1, 1, 2))
+    assert len(acc.votes) == 1  # one plane for label 7, none for NaN
+    np.testing.assert_array_equal(acc.finalize().ravel(), [0, 7])
 
 
 def test_weighted_average_factory_builds_default_accumulator():
@@ -76,7 +87,6 @@ def test_weighted_average_factory_builds_default_accumulator():
     assert isinstance(acc, WeightedAverageAccumulator)
     # a single block-sized patch (no trim at borders) round-trips through finalize
     patch = np.arange(8, dtype=np.float32).reshape(2, 2, 2)
-    acc.total = 1
     acc.add(patch, (0, 0, 0), (2, 2, 2))
     np.testing.assert_allclose(acc.finalize(), patch)
 

@@ -13,7 +13,7 @@ from torch import nn
 from aind_torch_utils.accumulators import BlockAccumulator
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.context import BlockContext
-from aind_torch_utils.execution import ExecutionPolicy
+from aind_torch_utils.execution import ExecutionPolicy, cuda_safe_compile_mode
 from aind_torch_utils.outputs import OutputSpec
 from aind_torch_utils.transforms import BlockPreprocessor, is_invertible
 from aind_torch_utils.utils import iter_blocks_zyx, iter_patch_starts
@@ -58,6 +58,9 @@ class Batch:
         The shape of the expanded (core + halo) accumulator for this block.
     halo_left : Tuple[int, int, int]
         The size of the halo on the (-z, -y, -x) sides of the block.
+    ctx : BlockContext
+        Absolute placement of the block, built once in the prep stage and
+        carried through to the writer so both stages share one derivation.
     """
 
     block_idx: Tuple[int, int, int]
@@ -70,6 +73,7 @@ class Batch:
     total_patches_in_block: int
     acc_shape: Tuple[int, int, int]  # shape of expanded (core+halo) accumulator
     halo_left: Tuple[int, int, int]  # halo size on the -Z/-Y/-X sides
+    ctx: BlockContext
 
 
 @dataclass(slots=True)
@@ -102,6 +106,9 @@ class Preds:
         The shape of the expanded (core + halo) accumulator for this block.
     halo_left : Tuple[int, int, int]
         The size of the halo on the (-z, -y, -x) sides of the block.
+    ctx : BlockContext
+        Absolute placement of the block, passed through unchanged from the
+        matching :class:`Batch` (the GPU stage does not touch it).
     ready_event : Optional[torch.cuda.Event]
         A CUDA event that signals when the D2H copy of `host_out` is complete.
     """
@@ -116,6 +123,7 @@ class Preds:
     total_patches_in_block: int
     acc_shape: Tuple[int, int, int]
     halo_left: Tuple[int, int, int]
+    ctx: BlockContext
     # CUDA event to signal the D2H copy completed
     ready_event: Optional["torch.cuda.Event"] = field(
         default=None, repr=False, compare=False
@@ -235,8 +243,6 @@ class PrepWorker:
             y0e, y1e = max(y0 - halo, 0), min(y1 + halo, Y)
             x0e, x1e = max(x0 - halo, 0), min(x1 + halo, X)
 
-            # how much halo was actually added on the - sides
-            halo_left = (z0 - z0e, y0 - y0e, x0 - x0e)
             acc_shape = (z1e - z0e, y1e - y0e, x1e - x0e)
 
             # absolute expanded bbox: used to read the block and to place it in the
@@ -250,6 +256,8 @@ class PrepWorker:
                 t_idx=t,
                 c_idx=c,
             )
+            # how much halo was actually added on the - sides (derived once, in ctx)
+            halo_left = ctx.halo_left
 
             # read expanded block and cast to float32 for the injected transform
             ez_sl, ey_sl, ex_sl = expanded_bbox
@@ -317,6 +325,7 @@ class PrepWorker:
                     total_patches_in_block=total_patches,
                     acc_shape=acc_shape,
                     halo_left=halo_left,
+                    ctx=ctx,
                 )
                 while not stop_event.is_set():
                     try:
@@ -347,8 +356,11 @@ class GpuWorker:
         ----------
         cfg : InferenceConfig
             The denoising configuration.
-        model : nn.Module
-            The PyTorch model to run.
+        model : nn.Module or callable
+            The processor to run. An ``nn.Module`` is moved to the device and
+            put in eval mode; any other tensor-in/tensor-out callable (see
+            :class:`~aind_torch_utils.workflow.BlockProcessor`) is used as-is
+            and manages its own device placement.
         device : str
             The CUDA device to use (e.g., "cuda:0").
         prep_q : queue.Queue[Optional[Batch]]
@@ -371,10 +383,15 @@ class GpuWorker:
         torch.backends.cuda.matmul.allow_tf32 = self.cfg.use_tf32
         torch.backends.cudnn.benchmark = self.cfg.cudnn_benchmark
 
-        self.model.to(self.device)
-        if self.execution.channels_last:
-            self.model = self.model.to(memory_format=torch.channels_last_3d)
-        self.model.eval()
+        # BlockProcessor promises "any callable" works: only nn.Modules get
+        # device placement / eval; plain callables manage their own state.
+        if isinstance(self.model, nn.Module):
+            self.model.to(self.device)
+            if self.execution.channels_last:
+                self.model = self.model.to(
+                    memory_format=torch.channels_last_3d
+                )
+            self.model.eval()
 
         self.copy_stream = torch.cuda.Stream(device=self.device)
 
@@ -398,6 +415,22 @@ class GpuWorker:
         # execution if compilation fails. torch.compile returns a new wrapper
         # and does not mutate the original, so this reference stays valid.
         eager_model = self.model
+        # InferenceConfig._validate applies the same downgrade for the default
+        # (config-synthesized) policy; a directly-injected ExecutionPolicy
+        # bypasses that validator, so guard here too: CUDA-graph capture runs
+        # lazily on a worker thread and aborts with
+        # cudaErrorStreamCaptureInvalidated.
+        compile_mode = self.execution.compile_mode
+        if self.device.type == "cuda":
+            safe_mode = cuda_safe_compile_mode(compile_mode)
+            if safe_mode != compile_mode:
+                logger.warning(
+                    "torch.compile mode %r enables CUDA graphs, which fail in "
+                    "this pipeline's threaded GPU workers; using %r instead.",
+                    compile_mode,
+                    safe_mode,
+                )
+                compile_mode = safe_mode
         try:
             try:
                 # PrepWorker pads tail batches to batch_size, so input shapes
@@ -405,15 +438,13 @@ class GpuWorker:
                 # regardless of the `dynamic` setting.
                 self.model = torch.compile(
                     self.model,
-                    mode=self.execution.compile_mode,
+                    mode=compile_mode,
                     dynamic=self.execution.compile_dynamic,
                 )
                 logger.info("Compiled model on %s.", self.device)
             except TypeError:
                 # older PyTorch without `dynamic` kwarg
-                self.model = torch.compile(
-                    self.model, mode=self.execution.compile_mode
-                )
+                self.model = torch.compile(self.model, mode=compile_mode)
                 logger.info("Compiled model on %s (older pytorch).", self.device)
 
             # Compilation is lazy: the graph is traced on the first forward,
@@ -533,6 +564,7 @@ class GpuWorker:
                 total_patches_in_block=batch.total_patches_in_block,
                 acc_shape=batch.acc_shape,
                 halo_left=batch.halo_left,
+                ctx=batch.ctx,
                 ready_event=evt,  # <-- writer will synchronize this
             )
 
@@ -546,6 +578,19 @@ class GpuWorker:
                     break
                 except queue.Full:
                     continue
+
+
+@dataclass
+class _BlockState:
+    """Writer-side bookkeeping for one in-flight block.
+
+    The writer counts merged patches itself (``seen``), so accumulators only
+    merge; an accumulator cannot silently stall block completion by forgetting
+    counter plumbing.
+    """
+
+    accs: List[BlockAccumulator]
+    seen: int = 0
 
 
 class WriterWorker:
@@ -568,7 +613,6 @@ class WriterWorker:
         outputs: List[OutputSpec],
         write_q: "queue.Queue[Optional[Preds]]",
         preprocess: BlockPreprocessor,
-        full_shape: Tuple[int, int, int],
     ):
         """
         Initializes the WriterWorker.
@@ -589,17 +633,13 @@ class WriterWorker:
             ``Preds``. The transform's ``inverse_stage`` decides whether inversion
             happens per patch (``before_accumulate``) or once per finalized block
             (``after_finalize``).
-        full_shape : Tuple[int, int, int]
-            Full volume spatial shape ``(Z, Y, X)``; used to rebuild the
-            :class:`BlockContext` passed to hooks.
         """
         self.cfg = cfg
         self.outputs = outputs
         self.write_q = write_q
         self.preprocess = preprocess
-        self.full_shape = full_shape
-        # maps block_idx → list of BlockAccumulator, one per output channel
-        self.blocks: Dict[Tuple[int, int, int], List[BlockAccumulator]] = {}
+        # maps block_idx → in-flight accumulation state for that block
+        self.blocks: Dict[Tuple[int, int, int], _BlockState] = {}
 
     def _make_accumulators(
         self, acc_shape: Tuple[int, int, int], ctx: BlockContext
@@ -626,7 +666,14 @@ class WriterWorker:
             An event that signals the worker to stop.
         """
         invertible = is_invertible(self.preprocess)
-        inverse_stage = self.preprocess.inverse_stage if invertible else None
+        # Duck-typed invertible transforms may omit inverse_stage; default to
+        # the common linear case (matching Sequential's fallback) instead of
+        # dying with AttributeError. run() validates the value up front.
+        inverse_stage = (
+            getattr(self.preprocess, "inverse_stage", "after_finalize")
+            if invertible
+            else None
+        )
 
         while not stop_event.is_set():
             try:
@@ -647,18 +694,17 @@ class WriterWorker:
                 xsl.stop - xsl.start,
             )
 
-            # Block placement is identical for every Preds of this block; build it
-            # once for accumulator construction, per-patch inversion, and finalize.
-            ctx = BlockContext.from_preds(
-                preds, self.full_shape, self.cfg.t_idx, self.cfg.c_idx
-            )
+            # Block placement is identical for every Preds of this block; it was
+            # built once in the prep stage and rides on the carrier.
+            ctx = preds.ctx
 
-            accs = self.blocks.get(preds.block_idx)
-            if accs is None:
-                accs = self._make_accumulators(preds.acc_shape, ctx)
-                for acc in accs:
-                    acc.total = preds.total_patches_in_block
-                self.blocks[preds.block_idx] = accs
+            state = self.blocks.get(preds.block_idx)
+            if state is None:
+                state = _BlockState(
+                    accs=self._make_accumulators(preds.acc_shape, ctx)
+                )
+                self.blocks[preds.block_idx] = state
+            accs = state.accs
 
             out_np = preds.host_out.numpy()  # (B, N, pz, py, px) or (B, 1, pz, py, px)
             # Ensure the tensor has a channel dimension that matches the outputs
@@ -690,8 +736,9 @@ class WriterWorker:
                     if spec.invert and inverse_stage == "before_accumulate":
                         pp = self.preprocess.inverse(pp, preds.transform_state, ctx)
                     acc.add(pp, (sz, sy, sx), (dz, dy, dx))
+            state.seen += len(preds.starts_in_block)
 
-            if accs[0].count >= accs[0].total:
+            if state.seen >= preds.total_patches_in_block:
                 lz, ly, lx = preds.halo_left
                 for spec, acc in zip(self.outputs, accs):
                     ext = acc.finalize()  # expanded (core + halo)

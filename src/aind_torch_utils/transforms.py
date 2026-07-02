@@ -43,6 +43,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # "after_finalize": invert once per block after merge (correct + fast for linear
 #   inverses; the default). "before_accumulate": invert each patch before merge
 #   (needed only when a nonlinear inverse must not commute with averaging).
+#   Limitation: the writer passes before_accumulate inverses the *block-level*
+#   context and no per-patch offset, so spatially-varying inverses that index
+#   ctx coordinates are not yet supported on that path — use after_finalize or
+#   a spatially-uniform inverse.
 InverseStage = str
 
 

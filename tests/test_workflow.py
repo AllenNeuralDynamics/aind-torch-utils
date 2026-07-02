@@ -15,7 +15,10 @@ def test_workflow_defaults():
     wf = Workflow(processor=object())
     assert wf.preprocess is None
     assert wf.outputs is None
-    assert isinstance(wf.execution, ExecutionPolicy)
+    # None means "synthesize from config" — the same rule as preprocess — so
+    # CLI/config AMP and compile flags stay live for recipes that don't pin
+    # their own policy.
+    assert wf.execution is None
     assert wf.resolve_outputs([object()]) is None
 
 
@@ -108,3 +111,24 @@ def test_run_workflow_with_fixed_outputs_passes_none_store(monkeypatch):
     # Explicit specs -> output_store must be None (run rejects both).
     assert captured["output_store"] is None
     assert captured["outputs"] is specs
+
+
+def test_run_workflow_default_execution_falls_back_to_config(monkeypatch):
+    """A recipe that leaves execution unset forwards None so run() synthesizes
+    the policy from cfg — CLI/config AMP and compile flags stay live."""
+    captured = {}
+
+    def fake_run(model, input_store, output_store, cfg, **kw):
+        captured.update(kw)
+
+    monkeypatch.setattr(run_mod, "run", fake_run)
+
+    run_mod.run_workflow(Workflow(processor=object()), "IN", "OUT", "CFG")
+    assert captured["execution"] is None
+
+
+def test_run_workflow_factory_requires_output_store():
+    """A factory-based workflow must get real stores, not a wrapped [None]."""
+    wf = Workflow(processor=object(), output_spec_factory=lambda stores: [])
+    with pytest.raises(ValueError, match="provide output_store"):
+        run_mod.run_workflow(wf, "IN", None, "CFG")
