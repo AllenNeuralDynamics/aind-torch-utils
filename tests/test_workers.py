@@ -7,6 +7,7 @@ import pytest
 import tensorstore as ts
 import torch
 
+from aind_torch_utils.accumulators import weighted_average_factory
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.transforms import (
     GlobalNormalizer,
@@ -20,6 +21,13 @@ def _default_preprocess(cfg):
     """The same transform run() synthesizes from config."""
     return from_config(
         cfg.normalize, cfg.norm_lower, cfg.norm_upper, cfg.eps, cfg.clip_norm
+    )
+
+
+def _default_factory(cfg):
+    """The same accumulator factory run() synthesizes from config."""
+    return weighted_average_factory(
+        cfg.eps, cfg.overlap, cfg.seam_mode, cfg.trim_voxels, cfg.min_blend_weight
     )
 
 
@@ -122,6 +130,7 @@ def _run_writer_once(cfg, store, preds, preprocess, full_shape=(2, 2, 2)):
         write_q=write_q,
         preprocess=preprocess,
         full_shape=full_shape,
+        accumulator_factory=_default_factory(cfg),
     ).run(threading.Event())
 
 
@@ -194,6 +203,7 @@ def test_writer_raises_on_mismatched_output_channels_and_writers():
         write_q=write_q,
         preprocess=IdentityTransform(),
         full_shape=(2, 2, 2),
+        accumulator_factory=_default_factory(cfg),
     )
 
     preds = Preds(

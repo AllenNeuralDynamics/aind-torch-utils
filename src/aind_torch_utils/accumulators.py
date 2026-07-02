@@ -1,11 +1,67 @@
-from typing import Optional, Tuple
+"""Block accumulators: how overlapping patches merge into one block.
+
+The correct merge depends on what the output *means*. Averaging is right for
+continuous intensities but wrong for masks/labels: a binary mask averaged at a seam
+yields 0.5, which floors to 0 (an eroded mask at every patch boundary). So the merge
+strategy is a first-class, injectable choice (issue #25 §3.3), supplied as a
+**factory** because one accumulator is created per block per output.
+
+All accumulators expose the same tiny contract (:class:`BlockAccumulator`): ``add`` a
+patch, then ``finalize`` to the **expanded** (core + halo) block; ``count``/``total``
+let the writer detect block completion.
+"""
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Optional,
+    Protocol,
+    Tuple,
+    runtime_checkable,
+)
 
 import numpy as np
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from aind_torch_utils.context import BlockContext
 
-class BlockAccumulator:
-    """
-    Accumulates predicted patches into a single block, handling seams.
+
+@runtime_checkable
+class BlockAccumulator(Protocol):
+    """Merges patches for one block/output. Created once per block per output."""
+
+    total: int
+    count: int
+
+    def add(
+        self,
+        pred_patch: np.ndarray,
+        start: Tuple[int, int, int],
+        valid: Tuple[int, int, int],
+    ) -> None:
+        """Merge one patch at ``start`` with ``valid`` (dz, dy, dx) extent."""
+        ...
+
+    def finalize(self) -> np.ndarray:
+        """Return the merged **expanded** (core + halo) block."""
+        ...
+
+
+class BlockAccumulatorFactory(Protocol):
+    """Builds a fresh :class:`BlockAccumulator` for a block of ``shape``."""
+
+    def __call__(
+        self, shape: Tuple[int, int, int], ctx: "BlockContext"
+    ) -> BlockAccumulator:
+        """Create an accumulator sized to the expanded block ``shape``."""
+        ...
+
+
+class WeightedAverageAccumulator:
+    """Accumulates predicted patches into a single block, handling seams.
+
+    This is the historical default merge: ``trim`` (last-write on cropped margins)
+    or ``blend`` (edge-aware weighted average). Correct for continuous intensities.
     """
 
     def __init__(
@@ -175,3 +231,133 @@ class BlockAccumulator:
     def finalize(self) -> np.ndarray:
         out = self.acc / np.maximum(self.wacc, self.eps)
         return out
+
+
+class _RegionAccumulator:
+    """Shared plumbing for accumulators that write into a single block buffer."""
+
+    def __init__(self, block_shape: Tuple[int, int, int], fill: float = 0.0):
+        self.block_shape = block_shape
+        self.acc = np.full(block_shape, fill, dtype=np.float32)
+        self.count = 0
+        self.total = 0
+
+    def _region(self, start, valid):
+        sz, sy, sx = start
+        dz, dy, dx = valid
+        return (
+            (slice(sz, sz + dz), slice(sy, sy + dy), slice(sx, sx + dx)),
+            (slice(0, dz), slice(0, dy), slice(0, dx)),
+        )
+
+    def finalize(self) -> np.ndarray:
+        return self.acc
+
+
+class LastWriteAccumulator(_RegionAccumulator):
+    """Overwrite each patch's full region; the last patch to cover a voxel wins.
+
+    Unlike ``trim``, no margins are cropped -- useful when patches are already
+    disjoint or a deterministic write order is acceptable.
+    """
+
+    def add(self, pred_patch, start, valid):
+        block_sl, patch_sl = self._region(start, valid)
+        self.acc[block_sl] = np.asarray(pred_patch[patch_sl], dtype=np.float32)
+        self.count += 1
+
+
+class MaxAccumulator(_RegionAccumulator):
+    """Element-wise maximum across overlapping patches (order-independent).
+
+    Good for foreground masks/logits: any patch that calls a voxel foreground wins.
+    Voxels no patch ever covers finalize to 0.
+    """
+
+    def __init__(self, block_shape: Tuple[int, int, int]):
+        super().__init__(block_shape, fill=-np.inf)
+
+    def add(self, pred_patch, start, valid):
+        block_sl, patch_sl = self._region(start, valid)
+        region = self.acc[block_sl]
+        np.maximum(
+            region, np.asarray(pred_patch[patch_sl], dtype=np.float32), out=region
+        )
+        self.count += 1
+
+    def finalize(self) -> np.ndarray:
+        self.acc[np.isneginf(self.acc)] = 0.0
+        return self.acc
+
+
+class SumAccumulator(_RegionAccumulator):
+    """Sum overlapping contributions (e.g. vote counts, densities)."""
+
+    def add(self, pred_patch, start, valid):
+        block_sl, patch_sl = self._region(start, valid)
+        self.acc[block_sl] += np.asarray(pred_patch[patch_sl], dtype=np.float32)
+        self.count += 1
+
+
+class MajorityVoteAccumulator:
+    """Per-voxel majority vote across overlapping patches (labels / instance IDs).
+
+    Averaging discrete labels is meaningless; this counts votes per label and
+    finalizes to the most-voted label (ties broken toward the smaller label).
+    Memory scales with the number of distinct labels seen in the block.
+    """
+
+    def __init__(self, block_shape: Tuple[int, int, int]):
+        self.block_shape = block_shape
+        self.votes: Dict[Any, np.ndarray] = {}
+        self.count = 0
+        self.total = 0
+
+    def add(self, pred_patch, start, valid):
+        sz, sy, sx = start
+        dz, dy, dx = valid
+        patch = np.asarray(pred_patch[:dz, :dy, :dx])
+        region = (slice(sz, sz + dz), slice(sy, sy + dy), slice(sx, sx + dx))
+        for label in np.unique(patch):
+            arr = self.votes.get(label)
+            if arr is None:
+                arr = np.zeros(self.block_shape, dtype=np.float32)
+                self.votes[label] = arr
+            arr[region] += patch == label
+        self.count += 1
+
+    def finalize(self) -> np.ndarray:
+        if not self.votes:
+            return np.zeros(self.block_shape, dtype=np.float32)
+        labels = sorted(self.votes.keys())
+        stack = np.stack([self.votes[label] for label in labels], axis=0)
+        winner = np.asarray(labels)[np.argmax(stack, axis=0)]
+        return winner.astype(np.float32)
+
+
+def weighted_average_factory(
+    eps: float,
+    overlap: int,
+    seam_mode: str,
+    trim_voxels: Optional[int],
+    min_blend_weight: float,
+) -> BlockAccumulatorFactory:
+    """Return the default factory: a :class:`WeightedAverageAccumulator` per block.
+
+    Reproduces the historical trim/blend merge from the runtime config, so a run
+    that does not inject a factory behaves exactly as before.
+    """
+
+    def factory(
+        shape: Tuple[int, int, int], ctx: "BlockContext"
+    ) -> BlockAccumulator:
+        return WeightedAverageAccumulator(
+            shape,
+            eps,
+            overlap=overlap,
+            seam_mode=seam_mode,
+            trim_voxels=trim_voxels,
+            min_blend_weight=min_blend_weight,
+        )
+
+    return factory
