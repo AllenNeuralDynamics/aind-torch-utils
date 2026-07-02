@@ -9,6 +9,7 @@ import torch
 
 from aind_torch_utils.accumulators import weighted_average_factory
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.outputs import OutputSpec, Threshold
 from aind_torch_utils.transforms import (
     GlobalNormalizer,
     IdentityTransform,
@@ -120,17 +121,26 @@ def _single_patch_preds(host_out, transform_state):
     )
 
 
+def _spec(cfg, store, postprocess=None, accumulator_factory=None):
+    """A single OutputSpec mirroring the run() default (invert=output_denormalize)."""
+    return OutputSpec(
+        store=store,
+        accumulator_factory=accumulator_factory or _default_factory(cfg),
+        postprocess=postprocess,
+        invert=cfg.output_denormalize,
+    )
+
+
 def _run_writer_once(cfg, store, preds, preprocess, full_shape=(2, 2, 2)):
     write_q: "queue.Queue[Optional[Preds]]" = queue.Queue()
     write_q.put(preds)
     write_q.put(None)  # sentinel closes the writer loop
     WriterWorker(
         cfg=cfg,
-        writers=[store],
+        outputs=[_spec(cfg, store)],
         write_q=write_q,
         preprocess=preprocess,
         full_shape=full_shape,
-        accumulator_factory=_default_factory(cfg),
     ).run(threading.Event())
 
 
@@ -199,11 +209,10 @@ def test_writer_raises_on_mismatched_output_channels_and_writers():
     # Single writer, but model output has N=2 channels.
     worker = WriterWorker(
         cfg=cfg,
-        writers=[object()],
+        outputs=[_spec(cfg, object())],
         write_q=write_q,
         preprocess=IdentityTransform(),
         full_shape=(2, 2, 2),
-        accumulator_factory=_default_factory(cfg),
     )
 
     preds = Preds(
@@ -262,6 +271,74 @@ def test_writer_ignores_transform_state_when_denorm_disabled():
     )
 
     np.testing.assert_allclose(store.written, 0.5)
+
+
+def test_writer_per_output_merge_post_and_dtype():
+    """Two outputs from one (B, 2, ...) tensor take different merge/post/dtype.
+
+    Channel 0: max-merge + threshold(0) + uint8 (a mask). Channel 1: weighted
+    average + no post + float32 (a raw field). A single block-sized patch means
+    merge is a no-op, isolating the per-output post/dtype/invert wiring.
+    """
+    from aind_torch_utils.accumulators import MaxAccumulator
+
+    cfg = InferenceConfig(devices=["cpu"], output_denormalize=False)
+    mask_store = _FakeStore(np.uint8)
+    field_store = _FakeStore(np.float32)
+
+    mask_spec = OutputSpec(
+        store=mask_store,
+        accumulator_factory=lambda shp, ctx: MaxAccumulator(shp),
+        postprocess=Threshold(thresh=0.0),
+        invert=False,
+    )
+    field_spec = OutputSpec(
+        store=field_store,
+        accumulator_factory=_default_factory(cfg),
+        postprocess=None,
+        invert=False,
+    )
+
+    # channel 0 = logits (mixed sign), channel 1 = a raw field.
+    logits = np.array([-2.0, 3.0, -1.0, 4.0, 0.5, -0.5, 9.0, -9.0], np.float32)
+    field = np.arange(8, dtype=np.float32)
+    host_out = torch.from_numpy(
+        np.stack([logits.reshape(2, 2, 2), field.reshape(2, 2, 2)])[None]
+    )  # (1, 2, 2, 2, 2)
+
+    preds = Preds(
+        block_idx=(0, 0, 0),
+        block_bbox=(slice(0, 2), slice(0, 2), slice(0, 2)),
+        linear_k=0,
+        starts_in_block=[(0, 0, 0)],
+        host_out=host_out,
+        valid_sizes=[(2, 2, 2)],
+        transform_state=None,
+        total_patches_in_block=1,
+        acc_shape=(2, 2, 2),
+        halo_left=(0, 0, 0),
+        ready_event=None,
+    )
+
+    write_q: "queue.Queue[Optional[Preds]]" = queue.Queue()
+    write_q.put(preds)
+    write_q.put(None)
+    WriterWorker(
+        cfg=cfg,
+        outputs=[mask_spec, field_spec],
+        write_q=write_q,
+        preprocess=IdentityTransform(),
+        full_shape=(2, 2, 2),
+    ).run(threading.Event())
+
+    # Mask: threshold(logit > 0) -> uint8 binary.
+    assert mask_store.written.dtype == np.uint8
+    np.testing.assert_array_equal(
+        mask_store.written.ravel(), (logits > 0).astype(np.uint8)
+    )
+    # Field: raw values as float32.
+    assert field_store.written.dtype == np.float32
+    np.testing.assert_allclose(field_store.written.ravel(), field)
 
 
 def _make_compile_worker():

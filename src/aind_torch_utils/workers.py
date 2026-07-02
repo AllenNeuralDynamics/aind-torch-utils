@@ -3,16 +3,17 @@ import queue
 import threading
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import tensorstore as ts
 import torch
 from torch import nn
 
-from aind_torch_utils.accumulators import BlockAccumulator, BlockAccumulatorFactory
+from aind_torch_utils.accumulators import BlockAccumulator
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.context import BlockContext
+from aind_torch_utils.outputs import OutputSpec
 from aind_torch_utils.transforms import BlockPreprocessor, is_invertible
 from aind_torch_utils.utils import iter_blocks_zyx, iter_patch_starts
 
@@ -525,19 +526,23 @@ class WriterWorker:
     """
     Worker that accumulates predictions for a block and writes the result.
 
-    Supports single-output models (legacy: one writer) and multi-output models
-    (N writers, one per decoder). The model output tensor is expected to have
-    shape ``(B, N, Z, Y, X)`` where N equals ``len(writers)``.
+    Each model output channel is described by an :class:`OutputSpec` carrying its
+    own merge accumulator, optional post-processor, inversion flag, and destination
+    store. The model output tensor is expected to have shape ``(B, N, Z, Y, X)``
+    where N equals ``len(outputs)``.
+
+    Per block, once complete, each output is finalized through the ordered pipeline
+    (issue #25 §4.4): ``finalize -> invert (if requested) -> postprocess -> crop
+    halo -> cast to store dtype -> write``.
     """
 
     def __init__(
         self,
         cfg: InferenceConfig,
-        writers: "Union[ts.TensorStore, List[ts.TensorStore]]",
+        outputs: List[OutputSpec],
         write_q: "queue.Queue[Optional[Preds]]",
         preprocess: BlockPreprocessor,
         full_shape: Tuple[int, int, int],
-        accumulator_factory: BlockAccumulatorFactory,
     ):
         """
         Initializes the WriterWorker.
@@ -546,39 +551,41 @@ class WriterWorker:
         ----------
         cfg : InferenceConfig
             The inference configuration.
-        writers : ts.TensorStore or list of ts.TensorStore
-            One output store per model output channel. A bare TensorStore is
-            treated as a single-element list for backwards compatibility.
+        outputs : list of OutputSpec
+            One spec per model output channel: store + merge factory + optional
+            post-processor + per-output ``invert`` flag.
         write_q : queue.Queue[Optional[Preds]]
             The queue from which to get model predictions.
         preprocess : BlockPreprocessor
-            The same transform the prep stage applied. If it is invertible and
-            ``cfg.output_denormalize`` is set, its ``inverse`` is applied to each
-            finalized (expanded) output block using the per-block
-            ``transform_state`` carried on ``Preds``.
+            The same transform the prep stage applied. Its ``inverse`` is applied
+            to the outputs whose ``OutputSpec.invert`` is set (only when it is
+            invertible), using the per-block ``transform_state`` carried on
+            ``Preds``. The transform's ``inverse_stage`` decides whether inversion
+            happens per patch (``before_accumulate``) or once per finalized block
+            (``after_finalize``).
         full_shape : Tuple[int, int, int]
             Full volume spatial shape ``(Z, Y, X)``; used to rebuild the
-            :class:`BlockContext` for the inverse.
-        accumulator_factory : BlockAccumulatorFactory
-            Builds one accumulator per block per output. Determines how
-            overlapping patches merge (average / max / majority / ...). Defaults,
-            when synthesized from config, reproduce the historical trim/blend merge.
+            :class:`BlockContext` passed to hooks.
         """
         self.cfg = cfg
-        self.writers: List["ts.TensorStore"] = (
-            writers if isinstance(writers, list) else [writers]
-        )
+        self.outputs = outputs
         self.write_q = write_q
         self.preprocess = preprocess
         self.full_shape = full_shape
-        self.accumulator_factory = accumulator_factory
         # maps block_idx → list of BlockAccumulator, one per output channel
         self.blocks: Dict[Tuple[int, int, int], List[BlockAccumulator]] = {}
 
     def _make_accumulators(
-        self, acc_shape: Tuple[int, int, int], ctx: "BlockContext"
+        self, acc_shape: Tuple[int, int, int], ctx: BlockContext
     ) -> List[BlockAccumulator]:
-        return [self.accumulator_factory(acc_shape, ctx) for _ in self.writers]
+        return [spec.accumulator_factory(acc_shape, ctx) for spec in self.outputs]
+
+    def _cast_to_store(self, core: np.ndarray, store: Any) -> np.ndarray:
+        target_dtype = store.dtype.numpy_dtype
+        if np.issubdtype(target_dtype, np.integer):
+            info = np.iinfo(target_dtype)
+            return np.clip(core, info.min, info.max).astype(target_dtype, copy=False)
+        return core.astype(target_dtype, copy=False)
 
     def run(self, stop_event: threading.Event) -> None:
         """
@@ -592,6 +599,9 @@ class WriterWorker:
         stop_event : threading.Event
             An event that signals the worker to stop.
         """
+        invertible = is_invertible(self.preprocess)
+        inverse_stage = self.preprocess.inverse_stage if invertible else None
+
         while not stop_event.is_set():
             try:
                 preds = self.write_q.get(timeout=0.1)
@@ -612,7 +622,7 @@ class WriterWorker:
             )
 
             # Block placement is identical for every Preds of this block; build it
-            # once for both accumulator construction and the inverse below.
+            # once for accumulator construction, per-patch inversion, and finalize.
             ctx = BlockContext.from_preds(
                 preds, self.full_shape, self.cfg.t_idx, self.cfg.c_idx
             )
@@ -625,7 +635,7 @@ class WriterWorker:
                 self.blocks[preds.block_idx] = accs
 
             out_np = preds.host_out.numpy()  # (B, N, pz, py, px) or (B, 1, pz, py, px)
-            # Ensure the tensor has a channel dimension that matches writers
+            # Ensure the tensor has a channel dimension that matches the outputs
             if out_np.ndim == 4:
                 # legacy single-output (B, pz, py, px) — add channel dim
                 out_np = out_np[:, np.newaxis]
@@ -636,51 +646,38 @@ class WriterWorker:
                     f"(or legacy (B, Z, Y, X)); got shape {out_np.shape}"
                 )
 
-            if out_np.shape[1] != len(self.writers):
+            if out_np.shape[1] != len(self.outputs):
                 raise ValueError(
-                    "Mismatch between model output channels and output stores: "
-                    f"got N={out_np.shape[1]} channels but {len(self.writers)} "
-                    f"writer(s) for block {preds.block_idx}."
+                    "Mismatch between model output channels and output specs: "
+                    f"got N={out_np.shape[1]} channels but {len(self.outputs)} "
+                    f"output(s) for block {preds.block_idx}."
                 )
 
-            # Patches are merged in the transform's *output* space; the invertible
-            # transform's inverse (denormalization) is applied once per block after
-            # finalize (see below), not per patch. This is correct for linear
-            # inverses and strictly cheaper than the old per-patch denorm.
+            # Merge patches in the transform's *output* space. For an output that
+            # inverts with a nonlinear transform declaring 'before_accumulate', the
+            # inverse must run per patch (it does not commute with averaging); the
+            # common linear case inverts once per block after finalize (below).
             for bi, (sz, sy, sx) in enumerate(preds.starts_in_block):
                 dz, dy, dx = preds.valid_sizes[bi]
-                for n, acc in enumerate(accs):
+                for n, (spec, acc) in enumerate(zip(self.outputs, accs)):
                     pp = out_np[bi, n].astype(np.float32, copy=False)
+                    if spec.invert and inverse_stage == "before_accumulate":
+                        pp = self.preprocess.inverse(pp, preds.transform_state, ctx)
                     acc.add(pp, (sz, sy, sx), (dz, dy, dx))
 
             if accs[0].count >= accs[0].total:
                 lz, ly, lx = preds.halo_left
-                # Apply the transform's inverse once per block (after_finalize) when
-                # the transform is invertible and denormalization is requested.
-                # before_accumulate (invert per patch) is handled by the per-output
-                # pipeline (PR4).
-                invert = self.cfg.output_denormalize and is_invertible(self.preprocess)
-                if invert and self.preprocess.inverse_stage != "after_finalize":
-                    raise NotImplementedError(
-                        "inverse_stage='before_accumulate' is not supported by the "
-                        "single-policy writer; use per-output OutputSpec (PR4)."
-                    )
-                for acc, writer in zip(accs, self.writers):
-                    ext = acc.finalize()
-                    if invert:
+                for spec, acc in zip(self.outputs, accs):
+                    ext = acc.finalize()  # expanded (core + halo)
+                    if spec.invert and inverse_stage == "after_finalize":
                         ext = self.preprocess.inverse(
                             ext, preds.transform_state, ctx
                         )
+                    if spec.postprocess is not None:
+                        ext = spec.postprocess(ext, ctx)
                     core = ext[lz : lz + core_bz, ly : ly + core_by, lx : lx + core_bx]
-                    target_dtype = writer.dtype.numpy_dtype
-                    if np.issubdtype(target_dtype, np.integer):
-                        info = np.iinfo(target_dtype)
-                        out_arr = np.clip(core, info.min, info.max).astype(
-                            target_dtype, copy=False
-                        )
-                    else:
-                        out_arr = core.astype(target_dtype, copy=False)
-                    writer[self.cfg.t_idx, self.cfg.c_idx, zsl, ysl, xsl].write(
+                    out_arr = self._cast_to_store(core, spec.store)
+                    spec.store[self.cfg.t_idx, self.cfg.c_idx, zsl, ysl, xsl].write(
                         out_arr
                     ).result()
                 del self.blocks[preds.block_idx]
