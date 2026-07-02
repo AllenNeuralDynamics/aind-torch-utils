@@ -19,13 +19,11 @@ from torch import nn
 
 import aind_torch_utils.models  # This registers all models when imported
 from aind_torch_utils import transforms
-from aind_torch_utils.accumulators import (
-    BlockAccumulatorFactory,
-    weighted_average_factory,
-)
+from aind_torch_utils.accumulators import weighted_average_factory
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.model_registry import ModelRegistry
 from aind_torch_utils.monitoring import QueueMonitor, SystemMonitor
+from aind_torch_utils.outputs import OutputSpec
 from aind_torch_utils.transforms import BlockPreprocessor
 from aind_torch_utils.utils import open_ts_spec
 from aind_torch_utils.workers import GpuWorker, PrepWorker, WriterWorker
@@ -167,14 +165,13 @@ def _setup_monitors(
 def _setup_workers(
     model: nn.Module,
     input_store: Any,
-    output_stores: List[Any],
+    output_specs: List[OutputSpec],
     cfg: InferenceConfig,
     num_prep_workers: int,
     prep_q: queue.Queue,
     write_queues: List[queue.Queue],
     preprocess: BlockPreprocessor,
     full_shape: Tuple[int, int, int],
-    accumulator_factory: BlockAccumulatorFactory,
 ) -> Tuple[List[PrepWorker], List[GpuWorker], List[WriterWorker]]:
     """Sets up the workers for the pipeline.
 
@@ -184,8 +181,8 @@ def _setup_workers(
         The model to use for inference.
     input_store : Any
         The input data store.
-    output_stores : List[Any]
-        One output data store per model output channel.
+    output_specs : List[OutputSpec]
+        One spec per model output channel (store + merge + post + invert).
     cfg : InferenceConfig
         The inference configuration.
     num_prep_workers : int
@@ -198,8 +195,6 @@ def _setup_workers(
         The injected block transform shared by prep (forward) and writer (inverse).
     full_shape : Tuple[int, int, int]
         Full volume spatial shape ``(Z, Y, X)``.
-    accumulator_factory : BlockAccumulatorFactory
-        Builds the per-block merge accumulators in each writer.
 
     Returns
     -------
@@ -225,11 +220,10 @@ def _setup_workers(
     writer_workers = [
         WriterWorker(
             cfg,
-            output_stores,
+            output_specs,
             write_queues[i],
             preprocess,
             full_shape,
-            accumulator_factory,
         )
         for i in range(len(write_queues))
     ]
@@ -239,7 +233,7 @@ def _setup_workers(
 def _setup_worker_threads(
     model: nn.Module,
     input_store: Any,
-    output_stores: List[Any],
+    output_specs: List[OutputSpec],
     cfg: InferenceConfig,
     stop_event: threading.Event,
     num_prep_workers: int,
@@ -247,7 +241,6 @@ def _setup_worker_threads(
     write_queues: List[queue.Queue],
     preprocess: BlockPreprocessor,
     full_shape: Tuple[int, int, int],
-    accumulator_factory: BlockAccumulatorFactory,
 ) -> Tuple[List[threading.Thread], List[threading.Thread], List[threading.Thread]]:
     """Sets up the worker threads for the pipeline.
 
@@ -257,8 +250,8 @@ def _setup_worker_threads(
         The model to use for inference.
     input_store : Any
         The input data store.
-    output_stores : List[Any]
-        One output data store per model output channel.
+    output_specs : List[OutputSpec]
+        One spec per model output channel.
     cfg : InferenceConfig
         The inference configuration.
     stop_event : threading.Event
@@ -269,6 +262,10 @@ def _setup_worker_threads(
         The prep queue.
     write_queues : List[queue.Queue]
         A list of writer queues.
+    preprocess : BlockPreprocessor
+        The injected block transform shared by prep and writer.
+    full_shape : Tuple[int, int, int]
+        Full volume spatial shape ``(Z, Y, X)``.
 
     Returns
     -------
@@ -280,14 +277,13 @@ def _setup_worker_threads(
     prep_workers, gpu_workers, writer_workers = _setup_workers(
         model,
         input_store,
-        output_stores,
+        output_specs,
         cfg,
         num_prep_workers,
         prep_q,
         write_queues,
         preprocess,
         full_shape,
-        accumulator_factory,
     )
 
     # Threads
@@ -307,16 +303,59 @@ def _setup_worker_threads(
     return prep_threads, gpu_threads, writer_threads
 
 
+def _resolve_output_specs(
+    output_store: Union[Any, List[Any], None],
+    outputs: Optional[List[OutputSpec]],
+    cfg: InferenceConfig,
+) -> List[OutputSpec]:
+    """Return the per-output specs, synthesizing them from ``output_store`` if needed.
+
+    Exactly one of ``output_store`` / ``outputs`` must be provided. When synthesizing,
+    each store gets the default trim/blend merge and ``invert=cfg.output_denormalize``,
+    reproducing the pre-refactor single-policy writer.
+    """
+    if outputs is not None:
+        if output_store is not None:
+            raise ValueError("Pass either output_store or outputs, not both.")
+        if not outputs:
+            raise ValueError("outputs must be a non-empty list of OutputSpec.")
+        return outputs
+
+    if output_store is None:
+        raise ValueError("Provide output_store (or outputs).")
+
+    output_stores = (
+        output_store if isinstance(output_store, list) else [output_store]
+    )
+    factory = weighted_average_factory(
+        cfg.eps,
+        cfg.overlap,
+        cfg.seam_mode,
+        cfg.trim_voxels,
+        cfg.min_blend_weight,
+    )
+    return [
+        OutputSpec(
+            store=store,
+            accumulator_factory=factory,
+            postprocess=None,
+            invert=cfg.output_denormalize,
+        )
+        for store in output_stores
+    ]
+
+
 def run(
     model: nn.Module,
     input_store: Any,
-    output_store: Union[Any, List[Any]],
+    output_store: Union[Any, List[Any], None],
     cfg: InferenceConfig,
     metrics_json: Optional[str] = None,
     metrics_interval: float = 0.5,
     num_prep_workers: int = 1,
     num_writer_workers: int = 1,
     preprocess: Optional[BlockPreprocessor] = None,
+    outputs: Optional[List[OutputSpec]] = None,
 ) -> None:
     """Runs the inference pipeline.
 
@@ -325,12 +364,13 @@ def run(
     model : nn.Module
         The model to use for inference. For multi-output models (e.g.,
         SharedEncoderModel) the forward pass must return a tensor of shape
-        ``(B, N, Z, Y, X)`` and ``output_store`` must be a list of N stores.
+        ``(B, N, Z, Y, X)`` and there must be N outputs.
     input_store : Any
         The input data store.
-    output_store : Any or list of Any
+    output_store : Any or list of Any or None
         Output TensorStore(s). Pass a single store for single-output models, or
-        a list of N stores when the model returns N output channels.
+        a list of N stores when the model returns N output channels. May be
+        ``None`` only when ``outputs`` is given.
     cfg : InferenceConfig
         The inference configuration.
     metrics_json : Optional[str], optional
@@ -346,11 +386,13 @@ def run(
         the writer). When ``None`` (default), one is synthesized from the legacy
         config fields (``normalize``/``norm_lower``/``norm_upper``/``clip_norm``),
         preserving existing behavior.
+    outputs : Optional[List[OutputSpec]], optional
+        Per-output specs (store + merge factory + post-processor + invert flag).
+        When ``None`` (default), specs are synthesized from ``output_store`` with
+        the default trim/blend merge and ``invert=cfg.output_denormalize`` for
+        every output, preserving existing behavior. Provide this for per-output
+        merge/post/dtype control; ``output_store`` is then optional.
     """
-    output_stores: List[Any] = (
-        output_store if isinstance(output_store, list) else [output_store]
-    )
-
     # Validate shapes
     T, C, Z, Y, X = tuple(input_store.domain.shape)
     assert 0 <= cfg.t_idx < T and 0 <= cfg.c_idx < C, "Invalid t/c indices"
@@ -366,14 +408,10 @@ def run(
             cfg.clip_norm,
         )
 
-    # Default merge factory reproduces the historical trim/blend accumulator.
-    accumulator_factory = weighted_average_factory(
-        cfg.eps,
-        cfg.overlap,
-        cfg.seam_mode,
-        cfg.trim_voxels,
-        cfg.min_blend_weight,
-    )
+    # Resolve the per-output specs. Explicit `outputs` win; otherwise synthesize
+    # one spec per store with the default trim/blend merge and a per-output invert
+    # flag driven by cfg.output_denormalize -- byte-identical to the old writer.
+    output_specs = _resolve_output_specs(output_store, outputs, cfg)
 
     # Queues
     prep_q, write_queues = _setup_queues(
@@ -391,7 +429,7 @@ def run(
     prep_threads, gpu_threads, writer_threads = _setup_worker_threads(
         model,
         input_store,
-        output_stores,
+        output_specs,
         cfg,
         stop_event,
         num_prep_workers,
@@ -399,7 +437,6 @@ def run(
         write_queues,
         preprocess,
         (Z, Y, X),
-        accumulator_factory,
     )
     all_threads = prep_threads + gpu_threads + writer_threads
 

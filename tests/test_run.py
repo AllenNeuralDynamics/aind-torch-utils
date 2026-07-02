@@ -8,7 +8,8 @@ from torch import nn
 
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.models import SharedEncoderModel
-from aind_torch_utils.run import run
+from aind_torch_utils.outputs import OutputSpec
+from aind_torch_utils.run import _resolve_output_specs, run
 
 
 class DummyModel(nn.Module):
@@ -212,6 +213,39 @@ def test_run_multi_output_pipeline(multi_output_data, tmp_path):
     out0 = out_stores[0].read().result().astype(np.float32)
     out1 = out_stores[1].read().result().astype(np.float32)
     np.testing.assert_allclose(out0, out1, rtol=1e-4)
+
+
+def test_resolve_output_specs_synthesizes_from_store():
+    cfg = InferenceConfig(devices=["cpu"], output_denormalize=True)
+    specs = _resolve_output_specs(object(), None, cfg)
+    assert len(specs) == 1
+    assert specs[0].invert is True  # driven by output_denormalize
+    assert specs[0].postprocess is None
+    assert specs[0].accumulator_factory is not None
+
+
+def test_resolve_output_specs_list_store():
+    cfg = InferenceConfig(devices=["cpu"], output_denormalize=False)
+    specs = _resolve_output_specs([object(), object()], None, cfg)
+    assert len(specs) == 2
+    assert all(s.invert is False for s in specs)
+
+
+def test_resolve_output_specs_passthrough_explicit():
+    cfg = InferenceConfig(devices=["cpu"])
+    factory = object()
+    explicit = [OutputSpec(store=object(), accumulator_factory=factory)]
+    assert _resolve_output_specs(None, explicit, cfg) is explicit
+
+
+def test_resolve_output_specs_rejects_both_and_neither():
+    cfg = InferenceConfig(devices=["cpu"])
+    with pytest.raises(ValueError, match="not both"):
+        _resolve_output_specs(object(), [OutputSpec(object(), object())], cfg)
+    with pytest.raises(ValueError, match="Provide output_store"):
+        _resolve_output_specs(None, None, cfg)
+    with pytest.raises(ValueError, match="non-empty"):
+        _resolve_output_specs(None, [], cfg)
 
 
 def test_shared_encoder_model_forward():
