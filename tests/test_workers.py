@@ -49,6 +49,64 @@ def _drain(prep_q):
     return batches
 
 
+class _FakeResult:
+    def result(self):
+        return None
+
+
+class _FakeSlice:
+    def __init__(self, store):
+        self._store = store
+
+    def write(self, arr):
+        self._store.written = np.asarray(arr)
+        return _FakeResult()
+
+
+class _FakeDtype:
+    def __init__(self, np_dtype):
+        self.numpy_dtype = np.dtype(np_dtype)
+
+
+class _FakeStore:
+    """Minimal TensorStore stand-in: records the last array written."""
+
+    def __init__(self, np_dtype=np.float32):
+        self._dtype = _FakeDtype(np_dtype)
+        self.written = None
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    def __getitem__(self, key):
+        return _FakeSlice(self)
+
+
+def _single_patch_preds(host_out, transform_state):
+    """A Preds for a 2x2x2 single-patch block that completes on arrival."""
+    return Preds(
+        block_idx=(0, 0, 0),
+        block_bbox=(slice(0, 2), slice(0, 2), slice(0, 2)),
+        linear_k=0,
+        starts_in_block=[(0, 0, 0)],
+        host_out=host_out,
+        valid_sizes=[(2, 2, 2)],
+        transform_state=transform_state,
+        total_patches_in_block=1,
+        acc_shape=(2, 2, 2),
+        halo_left=(0, 0, 0),
+        ready_event=None,
+    )
+
+
+def _run_writer_once(cfg, store, preds):
+    write_q: "queue.Queue[Optional[Preds]]" = queue.Queue()
+    write_q.put(preds)
+    write_q.put(None)  # sentinel closes the writer loop
+    WriterWorker(cfg=cfg, writers=[store], write_q=write_q).run(threading.Event())
+
+
 def test_prep_worker_pads_tail_batch_to_constant_shape_when_compiling():
     """With torch.compile, every batch must have exactly batch_size rows so
     the compiled model never sees a varying input shape; padded rows must be
@@ -68,7 +126,9 @@ def test_prep_worker_pads_tail_batch_to_constant_shape_when_compiling():
         n_real = len(b.starts_in_block)
         assert 0 < n_real <= cfg.batch_size
         assert len(b.valid_sizes) == n_real
-        assert len(b.per_block_minmax) == n_real
+        # transform_state is per-block (one affine pair), not per-patch. With
+        # normalize=False the identity state is (0.0, 1.0).
+        assert b.transform_state == (0.0, 1.0)
         total_real += n_real
         if n_real < cfg.batch_size:
             saw_partial = True
@@ -115,7 +175,7 @@ def test_writer_raises_on_mismatched_output_channels_and_writers():
         starts_in_block=[(0, 0, 0)],
         host_out=torch.zeros((1, 2, 2, 2, 2), dtype=torch.float32),
         valid_sizes=[(2, 2, 2)],
-        per_block_minmax=[(0.0, 1.0)],
+        transform_state=(0.0, 1.0),
         total_patches_in_block=1,
         acc_shape=(2, 2, 2),
         halo_left=(0, 0, 0),
@@ -126,6 +186,34 @@ def test_writer_raises_on_mismatched_output_channels_and_writers():
 
     with pytest.raises(ValueError, match="Mismatch between model output channels"):
         worker.run(stop_event=threading.Event())
+
+
+def test_writer_applies_block_level_transform_state_inverse():
+    """output_denormalize=True applies the affine inverse from transform_state."""
+    cfg = InferenceConfig(devices=["cpu"], output_denormalize=True)
+    store = _FakeStore(np.float32)
+
+    # Normalized output 0.5 with state (mn, mx) = (10, 20) -> 0.5 * 10 + 10 = 15.
+    host_out = torch.full((1, 1, 2, 2, 2), 0.5, dtype=torch.float32)
+    _run_writer_once(
+        cfg, store, _single_patch_preds(host_out, transform_state=(10.0, 20.0))
+    )
+
+    assert store.written is not None
+    assert store.written.shape == (2, 2, 2)
+    np.testing.assert_allclose(store.written, 15.0)
+
+
+def test_writer_ignores_transform_state_when_denorm_disabled():
+    """output_denormalize=False writes outputs as-is and never reads transform_state."""
+    cfg = InferenceConfig(devices=["cpu"], output_denormalize=False)
+    store = _FakeStore(np.float32)
+
+    host_out = torch.full((1, 1, 2, 2, 2), 0.5, dtype=torch.float32)
+    # transform_state=None proves the opaque blob is not inspected on this path.
+    _run_writer_once(cfg, store, _single_patch_preds(host_out, transform_state=None))
+
+    np.testing.assert_allclose(store.written, 0.5)
 
 
 def _make_compile_worker():
