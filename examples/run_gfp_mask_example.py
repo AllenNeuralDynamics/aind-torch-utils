@@ -99,6 +99,7 @@ import asyncio
 import copy
 import json
 import logging
+import multiprocessing
 import re
 import statistics
 import sys
@@ -437,6 +438,101 @@ def _build_mask_pyramid(
     asyncio.run(_build_levels())
 
 
+async def _upsample_run(
+    bucket,
+    base_path,
+    region,
+    coarse_path,
+    fine_path,
+    clen,
+    factors,
+    ranges,
+    concurrency,
+    copy_concurrency,
+) -> None:
+    """Nearest-upsample a set of fine-level chunk ranges on one event loop.
+
+    Reads the coarse level and writes into the *already-created* fine level (the parent
+    writes the fine level's metadata first). Shared by the single-process path and by
+    each ``--pyramid-processes`` worker, so both use the identical gather.
+    """
+    ctx = ts.Context({"data_copy_concurrency": {"limit": copy_concurrency}})
+    coarse = await ts.open(
+        {
+            "driver": "zarr",
+            "kvstore": {
+                "driver": "s3",
+                "bucket": bucket,
+                "path": f"{base_path}{coarse_path}",
+                "aws_region": region,
+            },
+        },
+        context=ctx,
+    )
+    output = await ts.open(
+        {
+            "driver": "zarr",
+            "kvstore": {
+                "driver": "s3",
+                "bucket": bucket,
+                "path": f"{base_path}{fine_path}",
+                "aws_region": region,
+            },
+        },
+        context=ctx,
+    )
+    fz, fy, fx = factors
+
+    async def _copy(z0, z1, y0, y1, x0, x1):
+        # Per-axis nearest source indices (floor-div, clamped to end).
+        iz = np.minimum(np.arange(z0, z1) // fz, clen[2] - 1)
+        iy = np.minimum(np.arange(y0, y1) // fy, clen[3] - 1)
+        ix = np.minimum(np.arange(x0, x1) // fx, clen[4] - 1)
+        sz0, sz1 = int(iz[0]), int(iz[-1]) + 1
+        sy0, sy1 = int(iy[0]), int(iy[-1]) + 1
+        sx0, sx1 = int(ix[0]), int(ix[-1]) + 1
+        sub = await coarse[:, :, sz0:sz1, sy0:sy1, sx0:sx1].read()
+        # Gather nearest voxels onto the fine grid (exact, edge-clamped).
+        up = sub[np.ix_([0], [0], iz - sz0, iy - sy0, ix - sx0)]
+        await output[:, :, z0:z1, y0:y1, x0:x1].write(up)
+        del sub, up
+
+    await _gather_bounded(ranges, _copy, concurrency)
+
+
+def _upsample_shard(task) -> None:
+    """multiprocessing entry point: upsample one shard of a level's chunk ranges.
+
+    A separate process (spawn) gives its own TensorStore context + event loop, so the
+    S3 request streams are genuinely independent -> N processes ~= N x the aggregate
+    request rate, which is what saturates this latency-bound step across CPU cores.
+    """
+    asyncio.run(_upsample_run(*task))
+
+
+def _open_fine_level(bucket, base_path, fine_path, region, nz, ny, nx, cz, cy, cx):
+    """Create (or reset) the fine level's zarr metadata; workers reopen it to write."""
+    ts.open(
+        {
+            "driver": "zarr",
+            "kvstore": {
+                "driver": "s3",
+                "bucket": bucket,
+                "path": f"{base_path}{fine_path}",
+                "aws_region": region,
+            },
+            "metadata": {
+                "shape": [1, 1, nz, ny, nx],
+                "chunks": [1, 1, cz, cy, cx],
+                "dtype": "|u1",
+                "dimension_separator": "/",
+            },
+            "create": True,
+            "delete_existing": True,
+        }
+    ).result()
+
+
 def _upsample_mask_pyramid(
     bucket: str,
     base_path: str,
@@ -446,6 +542,7 @@ def _upsample_mask_pyramid(
     chunk: int = 128,
     concurrency: int = 64,
     copy_concurrency: int = 16,
+    processes: int = 1,
 ) -> None:
     """Fill finer pyramid levels (0..L-1) by nearest-upsampling the segmented level.
 
@@ -456,6 +553,11 @@ def _upsample_mask_pyramid(
     the *source* arrays at each level so the mask aligns with the data. TensorStore has
     no upsample driver, so this reads the coarse level, gathers nearest voxels, and
     writes the fine level, streamed chunk-by-chunk (numpy only, no GPU).
+
+    ``processes > 1`` shards each level's chunk ranges across that many worker processes
+    (spawned), each with its own TensorStore context/event loop, to parallelize the
+    S3-latency-bound writes across CPU cores. Total in-flight requests ~=
+    ``processes * concurrency``. Levels stay sequential (each reads the previous one).
     """
 
     def _up_factors(coarse_ds: dict, fine_ds: dict) -> List[int]:
@@ -464,82 +566,59 @@ def _upsample_mask_pyramid(
             raise ValueError("Source datasets are missing scale transforms.")
         return [max(1, round(s_coarse[a] / s_fine[a])) for a in range(3)]
 
-    async def _build_levels():
-        ctx = ts.Context({"data_copy_concurrency": {"limit": copy_concurrency}})
+    # Walk from level L (last) toward level 0; each finer level reads the previous.
+    for i in range(len(datasets_upto_l) - 2, -1, -1):
+        coarse_ds, fine_ds = datasets_upto_l[i + 1], datasets_upto_l[i]
+        factors = tuple(_up_factors(coarse_ds, fine_ds))
+        coarse_path, fine_path = f"{coarse_ds['path']}/", f"{fine_ds['path']}/"
 
-        # Walk from level L (last) toward level 0; each finer level reads the previous.
-        for i in range(len(datasets_upto_l) - 2, -1, -1):
-            coarse_ds, fine_ds = datasets_upto_l[i + 1], datasets_upto_l[i]
-            fz, fy, fx = _up_factors(coarse_ds, fine_ds)
-
-            coarse = await ts.open(
-                {
-                    "driver": "zarr",
-                    "kvstore": {
-                        "driver": "s3",
-                        "bucket": bucket,
-                        "path": f"{base_path}{coarse_ds['path']}/",
-                        "aws_region": region,
-                    },
+        coarse = ts.open(
+            {
+                "driver": "zarr",
+                "kvstore": {
+                    "driver": "s3",
+                    "bucket": bucket,
+                    "path": f"{base_path}{coarse_path}",
+                    "aws_region": region,
                 },
-                context=ctx,
-            )
-            clen = coarse.shape  # (1, 1, Cz, Cy, Cx)
+            }
+        ).result()
+        clen = tuple(int(s) for s in coarse.shape)  # (1, 1, Cz, Cy, Cx)
 
-            # Target shape from the *source* fine level so the mask aligns w/ data.
-            src_fine = open_ts_spec(_spec_with_level(spec, fine_ds["path"]))
-            nz, ny, nx = tuple(src_fine.domain.shape[-3:])
-            cz, cy, cx = min(chunk, nz), min(chunk, ny), min(chunk, nx)
+        # Target shape from the *source* fine level so the mask aligns w/ data.
+        src_fine = open_ts_spec(_spec_with_level(spec, fine_ds["path"]))
+        nz, ny, nx = (int(s) for s in src_fine.domain.shape[-3:])
+        cz, cy, cx = min(chunk, nz), min(chunk, ny), min(chunk, nx)
 
-            output = await ts.open(
-                {
-                    "driver": "zarr",
-                    "kvstore": {
-                        "driver": "s3",
-                        "bucket": bucket,
-                        "path": f"{base_path}{fine_ds['path']}/",
-                        "aws_region": region,
-                    },
-                    "metadata": {
-                        "shape": [1, 1, nz, ny, nx],
-                        "chunks": [1, 1, cz, cy, cx],
-                        "dtype": "|u1",
-                        "dimension_separator": "/",
-                    },
-                    "create": True,
-                    "delete_existing": True,
-                },
-                context=ctx,
-            )
+        # Create the fine level's metadata once in the parent; workers reopen to write.
+        _open_fine_level(bucket, base_path, fine_path, region, nz, ny, nx, cz, cy, cx)
 
-            async def _copy(z0, z1, y0, y1, x0, x1):
-                # Per-axis nearest source indices (floor-div, clamped to end).
-                iz = np.minimum(np.arange(z0, z1) // fz, clen[2] - 1)
-                iy = np.minimum(np.arange(y0, y1) // fy, clen[3] - 1)
-                ix = np.minimum(np.arange(x0, x1) // fx, clen[4] - 1)
-                sz0, sz1 = int(iz[0]), int(iz[-1]) + 1
-                sy0, sy1 = int(iy[0]), int(iy[-1]) + 1
-                sx0, sx1 = int(ix[0]), int(ix[-1]) + 1
-                sub = await coarse[:, :, sz0:sz1, sy0:sy1, sx0:sx1].read()
-                # Gather nearest voxels onto the fine grid (exact, edge-clamped).
-                up = sub[np.ix_([0], [0], iz - sz0, iy - sy0, ix - sx0)]
-                await output[:, :, z0:z1, y0:y1, x0:x1].write(up)
-                del sub, up
-
-            ranges = [
-                (z0, min(z0 + cz, nz), y0, min(y0 + cy, ny), x0, min(x0 + cx, nx))
-                for z0 in range(0, nz, cz)
-                for y0 in range(0, ny, cy)
-                for x0 in range(0, nx, cx)
+        ranges = [
+            (z0, min(z0 + cz, nz), y0, min(y0 + cy, ny), x0, min(x0 + cx, nx))
+            for z0 in range(0, nz, cz)
+            for y0 in range(0, ny, cy)
+            for x0 in range(0, nx, cx)
+        ]
+        common = (bucket, base_path, region, coarse_path, fine_path, clen, factors)
+        if processes and processes > 1:
+            shards = [ranges[p::processes] for p in range(processes)]
+            tasks = [
+                common + (shard, concurrency, copy_concurrency)
+                for shard in shards
+                if shard
             ]
-            await _gather_bounded(ranges, _copy, concurrency)
-            logger.info(
-                "[upsample] wrote level %s shape=%s",
-                fine_ds["path"],
-                [1, 1, nz, ny, nx],
-            )
-
-    asyncio.run(_build_levels())
+            ctxmp = multiprocessing.get_context("spawn")
+            with ctxmp.Pool(len(tasks)) as pool:
+                pool.map(_upsample_shard, tasks)
+        else:
+            asyncio.run(_upsample_run(*common, ranges, concurrency, copy_concurrency))
+        logger.info(
+            "[upsample] wrote level %s shape=%s (%d chunks, %d procs)",
+            fine_ds["path"],
+            [1, 1, nz, ny, nx],
+            len(ranges),
+            max(1, processes),
+        )
 
 
 def _face_planes(labels, cp) -> dict:
@@ -1021,6 +1100,7 @@ def _finalize_pyramid(
             args.aws_region,
             concurrency=args.pyramid_concurrency,
             copy_concurrency=args.pyramid_copy_concurrency,
+            processes=args.pyramid_processes,
         )
 
     # Metadata lists every level when finer levels were filled, else L..N only.
@@ -1276,6 +1356,15 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         type=int,
         default=16,
         help="TensorStore data_copy_concurrency for the pyramid passes.",
+    )
+    ap.add_argument(
+        "--pyramid-processes",
+        type=int,
+        default=1,
+        help="Shard the finer-level (--fill-finer-levels) upsample across this many "
+        "worker processes to parallelize the S3-latency-bound writes across CPU cores. "
+        "Set to your core count (e.g. 8). Total in-flight ~= this x "
+        "--pyramid-concurrency, so lower that if you raise this a lot.",
     )
     ap.add_argument(
         "--ccl-block",
