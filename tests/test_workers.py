@@ -8,7 +8,19 @@ import tensorstore as ts
 import torch
 
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.transforms import (
+    GlobalNormalizer,
+    IdentityTransform,
+    from_config,
+)
 from aind_torch_utils.workers import GpuWorker, Preds, PrepWorker, WriterWorker
+
+
+def _default_preprocess(cfg):
+    """The same transform run() synthesizes from config."""
+    return from_config(
+        cfg.normalize, cfg.norm_lower, cfg.norm_upper, cfg.eps, cfg.clip_norm
+    )
 
 
 def _make_input_store(shape):
@@ -100,11 +112,17 @@ def _single_patch_preds(host_out, transform_state):
     )
 
 
-def _run_writer_once(cfg, store, preds):
+def _run_writer_once(cfg, store, preds, preprocess, full_shape=(2, 2, 2)):
     write_q: "queue.Queue[Optional[Preds]]" = queue.Queue()
     write_q.put(preds)
     write_q.put(None)  # sentinel closes the writer loop
-    WriterWorker(cfg=cfg, writers=[store], write_q=write_q).run(threading.Event())
+    WriterWorker(
+        cfg=cfg,
+        writers=[store],
+        write_q=write_q,
+        preprocess=preprocess,
+        full_shape=full_shape,
+    ).run(threading.Event())
 
 
 def test_prep_worker_pads_tail_batch_to_constant_shape_when_compiling():
@@ -114,7 +132,9 @@ def test_prep_worker_pads_tail_batch_to_constant_shape_when_compiling():
     store = _make_input_store((1, 1, 32, 32, 32))
     cfg = _prep_cfg(use_compile=True)
     prep_q = queue.Queue()
-    PrepWorker(cfg, store, prep_q, cfg.patch).run(threading.Event())
+    PrepWorker(
+        cfg, store, prep_q, cfg.patch, _default_preprocess(cfg)
+    ).run(threading.Event())
 
     batches = _drain(prep_q)
     assert batches
@@ -126,9 +146,9 @@ def test_prep_worker_pads_tail_batch_to_constant_shape_when_compiling():
         n_real = len(b.starts_in_block)
         assert 0 < n_real <= cfg.batch_size
         assert len(b.valid_sizes) == n_real
-        # transform_state is per-block (one affine pair), not per-patch. With
-        # normalize=False the identity state is (0.0, 1.0).
-        assert b.transform_state == (0.0, 1.0)
+        # transform_state is per-block (produced by the injected transform), not
+        # per-patch. With normalize=False (IdentityTransform) there is no state.
+        assert b.transform_state is None
         total_real += n_real
         if n_real < cfg.batch_size:
             saw_partial = True
@@ -146,7 +166,9 @@ def test_prep_worker_does_not_pad_in_eager_mode():
     store = _make_input_store((1, 1, 32, 32, 32))
     cfg = _prep_cfg(use_compile=False)
     prep_q = queue.Queue()
-    PrepWorker(cfg, store, prep_q, cfg.patch).run(threading.Event())
+    PrepWorker(
+        cfg, store, prep_q, cfg.patch, _default_preprocess(cfg)
+    ).run(threading.Event())
 
     batches = _drain(prep_q)
     assert batches
@@ -166,7 +188,13 @@ def test_writer_raises_on_mismatched_output_channels_and_writers():
     write_q: "queue.Queue[Optional[Preds]]" = queue.Queue()
 
     # Single writer, but model output has N=2 channels.
-    worker = WriterWorker(cfg=cfg, writers=[object()], write_q=write_q)
+    worker = WriterWorker(
+        cfg=cfg,
+        writers=[object()],
+        write_q=write_q,
+        preprocess=IdentityTransform(),
+        full_shape=(2, 2, 2),
+    )
 
     preds = Preds(
         block_idx=(0, 0, 0),
@@ -189,14 +217,19 @@ def test_writer_raises_on_mismatched_output_channels_and_writers():
 
 
 def test_writer_applies_block_level_transform_state_inverse():
-    """output_denormalize=True applies the affine inverse from transform_state."""
+    """output_denormalize=True applies the transform's inverse from transform_state."""
     cfg = InferenceConfig(devices=["cpu"], output_denormalize=True)
     store = _FakeStore(np.float32)
 
-    # Normalized output 0.5 with state (mn, mx) = (10, 20) -> 0.5 * 10 + 10 = 15.
+    # An affine (Global) normalizer: inverse(v, (10, 20)) = v * 10 + 10.
+    # Normalized output 0.5 -> 0.5 * 10 + 10 = 15.
+    preprocess = GlobalNormalizer(10.0, 20.0, eps=cfg.eps)
     host_out = torch.full((1, 1, 2, 2, 2), 0.5, dtype=torch.float32)
     _run_writer_once(
-        cfg, store, _single_patch_preds(host_out, transform_state=(10.0, 20.0))
+        cfg,
+        store,
+        _single_patch_preds(host_out, transform_state=(10.0, 20.0)),
+        preprocess,
     )
 
     assert store.written is not None
@@ -205,13 +238,18 @@ def test_writer_applies_block_level_transform_state_inverse():
 
 
 def test_writer_ignores_transform_state_when_denorm_disabled():
-    """output_denormalize=False writes outputs as-is and never reads transform_state."""
+    """output_denormalize=False writes outputs as-is and never inverts."""
     cfg = InferenceConfig(devices=["cpu"], output_denormalize=False)
     store = _FakeStore(np.float32)
 
     host_out = torch.full((1, 1, 2, 2, 2), 0.5, dtype=torch.float32)
-    # transform_state=None proves the opaque blob is not inspected on this path.
-    _run_writer_once(cfg, store, _single_patch_preds(host_out, transform_state=None))
+    # An invertible transform is supplied, but output_denormalize=False skips it.
+    _run_writer_once(
+        cfg,
+        store,
+        _single_patch_preds(host_out, transform_state=(10.0, 20.0)),
+        GlobalNormalizer(10.0, 20.0, eps=cfg.eps),
+    )
 
     np.testing.assert_allclose(store.written, 0.5)
 

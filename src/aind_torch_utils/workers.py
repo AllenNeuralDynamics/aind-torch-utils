@@ -12,6 +12,8 @@ from torch import nn
 
 from aind_torch_utils.accumulators import BlockAccumulator
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.context import BlockContext
+from aind_torch_utils.transforms import BlockPreprocessor, is_invertible
 from aind_torch_utils.utils import iter_blocks_zyx, iter_patch_starts
 
 logger = logging.getLogger(__name__)
@@ -148,6 +150,7 @@ class PrepWorker:
         reader: "ts.TensorStore",
         prep_q: "queue.Queue[Batch]",
         model_patch: Tuple[int, int, int],
+        preprocess: BlockPreprocessor,
         worker_id: int = 0,
         num_workers: int = 1,
     ):
@@ -164,6 +167,12 @@ class PrepWorker:
             The queue to which prepared batches will be added.
         model_patch : Tuple[int, int, int]
             The (z, y, x) size of the model's input patches.
+        preprocess : BlockPreprocessor
+            Injected input-domain transform applied to each block. Its
+            ``forward(block, ctx)`` returns the processed block and an opaque
+            per-block ``transform_state`` carried to the writer. The prep stage
+            no longer branches on normalization mode; that logic lives in the
+            transform object (see :mod:`aind_torch_utils.transforms`).
         worker_id : int, optional
             The ID of this worker, by default 0.
         num_workers : int, optional
@@ -173,6 +182,7 @@ class PrepWorker:
         self.reader = reader
         self.prep_q = prep_q
         self.patch = model_patch
+        self.preprocess = preprocess
         self.full_zyx = self.reader.shape[-3:]
         self.worker_id = worker_id
         self.num_workers = max(1, num_workers)
@@ -221,43 +231,29 @@ class PrepWorker:
             halo_left = (z0 - z0e, y0 - y0e, x0 - x0e)
             acc_shape = (z1e - z0e, y1e - y0e, x1e - x0e)
 
-            # read expanded block and cast to float32 for normalization
-            view = self.reader[t, c, slice(z0e, z1e), slice(y0e, y1e), slice(x0e, x1e)]
+            # absolute expanded bbox: used to read the block and to place it in the
+            # volume for the injected transform (seam-free coordinate sampling).
+            expanded_bbox = (slice(z0e, z1e), slice(y0e, y1e), slice(x0e, x1e))
+            ctx = BlockContext.from_block(
+                block_idx=block_idx,
+                core_bbox=core_bbox,
+                expanded_bbox=expanded_bbox,
+                full_shape=(Z, Y, X),
+                t_idx=t,
+                c_idx=c,
+            )
+
+            # read expanded block and cast to float32 for the injected transform
+            ez_sl, ey_sl, ex_sl = expanded_bbox
+            view = self.reader[t, c, ez_sl, ey_sl, ex_sl]
             norm_block = view.read().result().astype(np.float32, copy=False)
             bz, by, bx = acc_shape
 
-            if self.cfg.normalize == "percentile":
-                block_mn, block_mx = np.percentile(
-                    norm_block,
-                    [
-                        self.cfg.norm_lower,
-                        self.cfg.norm_upper,
-                    ],
-                )
-                block_scale = max(block_mx - block_mn, self.cfg.eps)
-                # normalize the block in-place
-                norm_block -= block_mn
-                norm_block /= block_scale
-            elif self.cfg.normalize == "global":
-                block_mn = self.cfg.norm_lower
-                block_mx = self.cfg.norm_upper
-                block_scale = max(block_mx - block_mn, self.cfg.eps)
-                # Clip to [p_low, p_high] first, then normalize — matches
-                # PercentileNormalizationd._normalize_channel step order.
-                norm_block = np.clip(norm_block, block_mn, block_mx)
-                norm_block = (norm_block - block_mn) / block_scale
-            else:  # False
-                # Bypass normalization entirely (identity). We pretend (mn,mx)=(0,1)
-                # so the writer performs a no-op inverse transform.
-                block_mn, block_mx = 0.0, 1.0
-
-            # optional clipping
-            if self.cfg.clip_norm:
-                if self.cfg.clip_norm is True:
-                    norm_block = np.clip(norm_block, 0.0, 1.0)
-                else:
-                    lo, hi = self.cfg.clip_norm
-                    norm_block = np.clip(norm_block, lo, hi)
+            # The injected transform owns all normalization/correction math and
+            # returns opaque per-block state consumed by its inverse in the writer
+            # (None when nothing needs to travel there). The prep stage no longer
+            # branches on normalization mode.
+            norm_block, transform_state = self.preprocess.forward(norm_block, ctx)
 
             # patch starts over the expanded region (same stride/overlap)
             if (bz, by, bx) not in starts_cache:
@@ -266,11 +262,6 @@ class PrepWorker:
                 )
             starts = starts_cache[(bz, by, bx)]
             total_patches = len(starts)
-
-            # Opaque per-block state for the writer's inverse normalization. The whole
-            # block shares one (mn, mx), so it is computed once here rather than per
-            # patch. Future preprocessors can store any inverse state (or None).
-            transform_state = (float(block_mn), float(block_mx))
 
             # batch over those starts
             for i in range(0, total_patches, self.cfg.batch_size):
@@ -544,6 +535,8 @@ class WriterWorker:
         cfg: InferenceConfig,
         writers: "Union[ts.TensorStore, List[ts.TensorStore]]",
         write_q: "queue.Queue[Optional[Preds]]",
+        preprocess: BlockPreprocessor,
+        full_shape: Tuple[int, int, int],
     ):
         """
         Initializes the WriterWorker.
@@ -557,12 +550,22 @@ class WriterWorker:
             treated as a single-element list for backwards compatibility.
         write_q : queue.Queue[Optional[Preds]]
             The queue from which to get model predictions.
+        preprocess : BlockPreprocessor
+            The same transform the prep stage applied. If it is invertible and
+            ``cfg.output_denormalize`` is set, its ``inverse`` is applied to each
+            finalized (expanded) output block using the per-block
+            ``transform_state`` carried on ``Preds``.
+        full_shape : Tuple[int, int, int]
+            Full volume spatial shape ``(Z, Y, X)``; used to rebuild the
+            :class:`BlockContext` for the inverse.
         """
         self.cfg = cfg
         self.writers: List["ts.TensorStore"] = (
             writers if isinstance(writers, list) else [writers]
         )
         self.write_q = write_q
+        self.preprocess = preprocess
+        self.full_shape = full_shape
         # maps block_idx → list of BlockAccumulator, one per output channel
         self.blocks: Dict[Tuple[int, int, int], List[BlockAccumulator]] = {}
 
@@ -636,31 +639,37 @@ class WriterWorker:
                     f"writer(s) for block {preds.block_idx}."
                 )
 
-            # Inverse normalization is the same affine map for every patch in the
-            # block, so resolve it once from the per-block transform_state. This is
-            # useful whenever the model output maps back to the original data range;
-            # disabled (e.g. for a segmentation model) via output_denormalize=False.
-            denorm: Optional[Tuple[np.float32, np.float32]] = None
-            if self.cfg.output_denormalize:
-                mn, mx = preds.transform_state
-                scale = max(mx - mn, self.cfg.eps)
-                denorm = (np.float32(scale), np.float32(mn))
-
+            # Patches are merged in the transform's *output* space; the invertible
+            # transform's inverse (denormalization) is applied once per block after
+            # finalize (see below), not per patch. This is correct for linear
+            # inverses and strictly cheaper than the old per-patch denorm.
             for bi, (sz, sy, sx) in enumerate(preds.starts_in_block):
                 dz, dy, dx = preds.valid_sizes[bi]
                 for n, acc in enumerate(accs):
-                    patch_pred = out_np[bi, n]
-                    pp = patch_pred.astype(np.float32, copy=False)
-
-                    if denorm is not None:
-                        scale, mn = denorm
-                        pp = (pp * scale + mn).astype(np.float32, copy=False)
+                    pp = out_np[bi, n].astype(np.float32, copy=False)
                     acc.add(pp, (sz, sy, sx), (dz, dy, dx))
 
             if accs[0].count >= accs[0].total:
                 lz, ly, lx = preds.halo_left
+                # Rebuild the block context for the inverse. Apply the transform's
+                # inverse once per block (after_finalize) when the transform is
+                # invertible and denormalization is requested. before_accumulate
+                # (invert per patch) is handled in the per-output pipeline (PR4).
+                ctx = BlockContext.from_preds(
+                    preds, self.full_shape, self.cfg.t_idx, self.cfg.c_idx
+                )
+                invert = self.cfg.output_denormalize and is_invertible(self.preprocess)
+                if invert and self.preprocess.inverse_stage != "after_finalize":
+                    raise NotImplementedError(
+                        "inverse_stage='before_accumulate' is not supported by the "
+                        "single-policy writer; use per-output OutputSpec (PR4)."
+                    )
                 for acc, writer in zip(accs, self.writers):
                     ext = acc.finalize()
+                    if invert:
+                        ext = self.preprocess.inverse(
+                            ext, preds.transform_state, ctx
+                        )
                     core = ext[lz : lz + core_bz, ly : ly + core_by, lx : lx + core_bx]
                     target_dtype = writer.dtype.numpy_dtype
                     if np.issubdtype(target_dtype, np.integer):
