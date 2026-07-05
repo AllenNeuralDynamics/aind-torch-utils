@@ -733,7 +733,10 @@ def _hysteresis_connect(
     def _label_block(z0, z1, y0, y1, x0, x1):
         m = cp.asarray(src[0, 0, z0:z1, y0:y1, x0:x1].read().result())
         labels, k = cucim_label(m >= 1, return_num=True, connectivity=3)
-        return m, labels.astype(cp.int64), int(k)
+        # int32 labels: local labels < block^3 < 2^31, so the per-block faces stored in
+        # `metas` (all blocks held at once) use half the RAM/VRAM of int64. Global
+        # labels (local + offset) can exceed 2^31, so offset math promotes to int64.
+        return m, labels.astype(cp.int32), int(k)
 
     # Pass A: label each block, record counts/offsets, seed labels, and 6 face planes.
     metas = {}
@@ -792,7 +795,8 @@ def _hysteresis_connect(
     for blk in blocks:
         z0, z1, y0, y1, x0, x1 = blk
         _, labels, _ = _label_block(*blk)
-        gl = cp.where(labels > 0, labels + metas[blk]["off"], 0)
+        # Promote to int64 before adding the offset: global labels can exceed 2^31.
+        gl = cp.where(labels > 0, labels.astype(cp.int64) + metas[blk]["off"], 0)
         out_block = keep_gpu[gl].astype(cp.uint8)
         out[0, 0, z0:z1, y0:y1, x0:x1].write(cp.asnumpy(out_block)).result()
         del labels, gl, out_block
@@ -852,7 +856,9 @@ def _fill_holes_connect(
     def _label_block(z0, z1, y0, y1, x0, x1):
         m = cp.asarray(src[0, 0, z0:z1, y0:y1, x0:x1].read().result())
         labels, k = cucim_label(m == 0, return_num=True, connectivity=1)
-        return m, labels.astype(cp.int64), int(k)
+        # int32 labels halve the per-block face RAM/VRAM (all blocks' faces are held in
+        # `metas` at once); global labels (local + offset) are promoted to int64 below.
+        return m, labels.astype(cp.int32), int(k)
 
     # Pass A: label background per block; record offsets, sizes, border + face labels.
     shape = (nz, ny, nx)
@@ -926,7 +932,8 @@ def _fill_holes_connect(
     for blk in blocks:
         z0, z1, y0, y1, x0, x1 = blk
         m, labels, _ = _label_block(*blk)
-        gl = cp.where(labels > 0, labels + metas[blk]["off"], 0)
+        # Promote to int64 before adding the offset: global labels can exceed 2^31.
+        gl = cp.where(labels > 0, labels.astype(cp.int64) + metas[blk]["off"], 0)
         out_block = ((m >= 1) | fill_gpu[gl]).astype(cp.uint8)
         out[0, 0, z0:z1, y0:y1, x0:x1].write(cp.asnumpy(out_block)).result()
         del m, labels, gl, out_block

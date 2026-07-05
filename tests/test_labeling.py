@@ -26,6 +26,29 @@ def test_union_find_basic_and_flatten():
     assert roots[0] == 0  # untouched
 
 
+def test_union_find_uses_int32_parent_for_memory():
+    # The parent array (the dominant cost with many components) is int32 while the label
+    # space fits in 2^31, halving RAM vs int64; find/union still resolve correctly.
+    uf = UnionFind(1000)
+    assert uf.parent.dtype == np.int32
+    uf.union(10, 20)
+    uf.union(20, 30)
+    assert uf.find(10) == uf.find(30)
+    roots = uf.flatten_roots()
+    assert roots.dtype == np.int32
+    assert roots[10] == roots[20] == roots[30]
+
+
+def test_union_faces_int32_faces_stitch_across_seam():
+    # Faces are stored as int32 (globalized to int64 before union_faces in the
+    # pipeline); union_faces must handle int32 inputs identically.
+    g_a = np.array([[10, 0], [0, 0]], dtype=np.int32)
+    g_b = np.array([[0, 0], [0, 20]], dtype=np.int32)
+    uf = UnionFind(30)
+    union_faces(uf, g_a, g_b)  # 26-conn: diagonal across the seam unions
+    assert uf.find(10) == uf.find(20)
+
+
 def test_union_faces_26_connectivity_diagonal():
     # A's foreground voxel at (0,0); B's only foreground at (1,1) -> diagonal across the
     # seam, which is 26-connected, so the two labels must be unioned.

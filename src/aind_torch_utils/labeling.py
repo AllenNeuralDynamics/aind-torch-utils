@@ -19,7 +19,10 @@ class UnionFind:
     """Array-backed union-find with vectorized full-compression (numpy only)."""
 
     def __init__(self, n: int):
-        self.parent = np.arange(n, dtype=np.int64)
+        # int32 labels halve the parent array (the dominant cost when there are many
+        # components) whenever the label space fits; fall back to int64 past 2^31.
+        dtype = np.int32 if n < 2**31 else np.int64
+        self.parent = np.arange(n, dtype=dtype)
         self.rank = np.zeros(n, dtype=np.int8)
 
     def find(self, x: int) -> int:
