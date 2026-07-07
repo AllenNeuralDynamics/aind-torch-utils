@@ -122,6 +122,52 @@ def test_fill_decision_border_and_size():
     assert not fill_capped[4]
 
 
+def test_instance_ids_merge_across_seam_and_are_contiguous():
+    # Mirrors _instance_connect's ID assignment: seam-merged components share one ID,
+    # distinct components get distinct IDs, and IDs are a contiguous 1..N.
+    uf = UnionFind(6)  # global labels 1..5
+    uf.union(1, 2)  # object A spans blocks -> {1,2,3}
+    uf.union(2, 3)
+    # labels 4 and 5 are separate objects
+    roots = uf.flatten_roots()
+    keep = np.ones(6, dtype=bool)
+    keep[0] = False  # background
+    uniq = np.unique(roots[keep])
+    id_of_root = np.zeros(6, dtype=np.uint32)
+    id_of_root[uniq] = np.arange(1, uniq.size + 1, dtype=np.uint32)
+    label_to_id = id_of_root[roots]
+    label_to_id[0] = 0
+
+    assert label_to_id[1] == label_to_id[2] == label_to_id[3]  # merged -> one ID
+    assert label_to_id[4] != label_to_id[1]
+    assert label_to_id[5] not in (label_to_id[1], label_to_id[4])
+    assert set(label_to_id[1:].tolist()) == {1, 2, 3}  # 3 objects, contiguous 1..3
+    assert label_to_id[0] == 0
+    assert label_to_id.dtype == np.uint32
+
+
+def test_instance_min_size_drops_small_objects():
+    # A = {1,2} (size 70), B = {3} (size 5); min_size 10 drops B (-> 0).
+    uf = UnionFind(4)
+    uf.union(1, 2)
+    roots = uf.flatten_roots()
+    sizes = np.array([0, 30, 40, 5], dtype=np.int64)
+    root_size = np.zeros(4, dtype=np.int64)
+    np.add.at(root_size, roots, sizes)
+    keep = np.ones(4, dtype=bool)
+    keep[0] = False
+    keep &= root_size[roots] >= 10  # min_size
+    uniq = np.unique(roots[keep])
+    id_of_root = np.zeros(4, dtype=np.uint32)
+    id_of_root[uniq] = np.arange(1, uniq.size + 1, dtype=np.uint32)
+    label_to_id = id_of_root[roots]
+    label_to_id[0] = 0
+
+    assert label_to_id[1] == label_to_id[2] >= 1  # A kept
+    assert label_to_id[3] == 0  # B dropped (size 5 < 10)
+    assert uniq.size == 1
+
+
 def test_seed_propagation_to_roots():
     # Mirrors _hysteresis_connect's keep computation: a component is kept iff any of
     # its labels is seeded. {1,2,3} merged, only 3 seeded -> all kept; {4} not seeded.

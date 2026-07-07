@@ -132,6 +132,9 @@ DEFAULT_IN_SPEC = {
     },
 }
 DOWNSAMPLE_METHOD = "max"  # keeps coarser mask levels strictly binary
+# Instance-label pyramid reducer: labels must not be max/mean-reduced (invents IDs);
+# "stride" (nearest) preserves exact IDs. Paired with a uint32 output dtype.
+LABEL_DOWNSAMPLE_METHOD = "stride"
 # Max per-axis size for the (low-frequency) flat-field estimate; larger coarse levels
 # are stride-subsampled to this before the GPU morphology, to avoid OOM.
 FLATFIELD_MAX_DIM = 256
@@ -357,13 +360,16 @@ def _build_mask_pyramid(
     chunk: int = 128,
     concurrency: int = 64,
     copy_concurrency: int = 16,
+    reducer: str = DOWNSAMPLE_METHOD,
+    dtype: str = "|u1",
 ) -> None:
     """Generate coarser mask levels by downsampling the segmented level.
 
     ``datasets_from_l`` is the source multiscales datasets sliced from level L
     onward; index 0 is the already-written segmented level. Each subsequent level is
-    produced from the previous one with TensorStore's ``max`` downsample reducer and
-    written as ``uint8`` at the source's original ``path`` string.
+    produced from the previous one with the ``reducer`` downsample method and written as
+    ``dtype`` at the source's original ``path`` string. Defaults keep the binary-mask
+    behavior (``max`` reducer, ``uint8``); instance labels pass ``stride``/``|u4``.
     """
 
     def _factors(prev_ds: dict, ds: dict) -> List[int]:
@@ -383,7 +389,7 @@ def _build_mask_pyramid(
                 {
                     "driver": "downsample",
                     "downsample_factors": sf_padded,
-                    "downsample_method": DOWNSAMPLE_METHOD,
+                    "downsample_method": reducer,
                     "base": {
                         "driver": "zarr",
                         "kvstore": {
@@ -412,7 +418,7 @@ def _build_mask_pyramid(
                     "metadata": {
                         "shape": new_shape,
                         "chunks": [1, 1, cz, cy, cx],
-                        "dtype": "|u1",
+                        "dtype": dtype,
                         "dimension_separator": "/",
                     },
                     "create": True,
@@ -510,7 +516,9 @@ def _upsample_shard(task) -> None:
     asyncio.run(_upsample_run(*task))
 
 
-def _open_fine_level(bucket, base_path, fine_path, region, nz, ny, nx, cz, cy, cx):
+def _open_fine_level(
+    bucket, base_path, fine_path, region, nz, ny, nx, cz, cy, cx, dtype="|u1"
+):
     """Create (or reset) the fine level's zarr metadata; workers reopen it to write."""
     ts.open(
         {
@@ -524,7 +532,7 @@ def _open_fine_level(bucket, base_path, fine_path, region, nz, ny, nx, cz, cy, c
             "metadata": {
                 "shape": [1, 1, nz, ny, nx],
                 "chunks": [1, 1, cz, cy, cx],
-                "dtype": "|u1",
+                "dtype": dtype,
                 "dimension_separator": "/",
             },
             "create": True,
@@ -543,6 +551,7 @@ def _upsample_mask_pyramid(
     concurrency: int = 64,
     copy_concurrency: int = 16,
     processes: int = 1,
+    dtype: str = "|u1",
 ) -> None:
     """Fill finer pyramid levels (0..L-1) by nearest-upsampling the segmented level.
 
@@ -591,7 +600,9 @@ def _upsample_mask_pyramid(
         cz, cy, cx = min(chunk, nz), min(chunk, ny), min(chunk, nx)
 
         # Create the fine level's metadata once in the parent; workers reopen to write.
-        _open_fine_level(bucket, base_path, fine_path, region, nz, ny, nx, cz, cy, cx)
+        _open_fine_level(
+            bucket, base_path, fine_path, region, nz, ny, nx, cz, cy, cx, dtype=dtype
+        )
 
         ranges = [
             (z0, min(z0 + cz, nz), y0, min(y0 + cy, ny), x0, min(x0 + cx, nx))
@@ -976,17 +987,148 @@ def _mask_has_foreground(
     return False
 
 
-def _mask_stages(level: str, hysteresis: bool, fill_holes: bool):
+def _instance_connect(
+    bucket: str,
+    base_path: str,
+    src_path: str,
+    final_path: str,
+    region: str,
+    block: int = 512,
+    chunk: int = 128,
+    min_size: int = 0,
+) -> None:
+    """Label connected objects of a binary mask with unique IDs (instance segmentation).
+
+    26-connected components of the foreground (``m >= 1``) each get a unique compact ID
+    ``1..N`` in a ``uint32`` volume (background stays 0). Uses the same seam-correct
+    chunked-GPU-CCL + union-find machinery as hysteresis/hole-fill, so an object across
+    block faces gets one ID. Components smaller than ``min_size`` voxels are dropped
+    (set to 0). Streamed block-by-block; no full label volume is materialized.
+    """
+    import cupy as cp
+    from cucim.skimage.measure import label as cucim_label
+
+    ctx = ts.Context({"data_copy_concurrency": {"limit": 4}})
+    src = ts.open(
+        {
+            "driver": "zarr",
+            "kvstore": {
+                "driver": "s3",
+                "bucket": bucket,
+                "path": f"{base_path}{src_path}",
+                "aws_region": region,
+            },
+        },
+        context=ctx,
+    ).result()
+    nz, ny, nx = (int(s) for s in src.domain.shape[-3:])
+
+    blocks = [
+        (z0, z1, y0, y1, x0, x1)
+        for (z0, z1) in block_ranges(nz, block)
+        for (y0, y1) in block_ranges(ny, block)
+        for (x0, x1) in block_ranges(nx, block)
+    ]
+
+    def _label_block(z0, z1, y0, y1, x0, x1):
+        m = cp.asarray(src[0, 0, z0:z1, y0:y1, x0:x1].read().result())
+        labels, k = cucim_label(m >= 1, return_num=True, connectivity=3)
+        return labels.astype(cp.int32), int(k)
+
+    # Pass A: label each block; record offsets, faces, and (for min_size) voxel counts.
+    metas = {}
+    offset = 0
+    for blk in blocks:
+        labels, k = _label_block(*blk)
+        meta = {"off": offset, "k": k, **_face_planes(labels, cp)}
+        if min_size > 0:
+            k1 = k + 1
+            counts = cp.asnumpy(cp.bincount(labels.ravel(), minlength=k1))
+            meta["counts"] = counts[1:k1].astype(np.int64)
+        metas[blk] = meta
+        offset += k
+        del labels
+    total = offset
+    logger.info("[instances] %d blocks, %d raw components", len(blocks), total)
+
+    # Union-find over global labels, stitching across faces (26-connectivity).
+    uf = UnionFind(total + 1)
+    _stitch_faces(uf, blocks, metas)
+    roots = uf.flatten_roots()
+
+    # Keep foreground roots (optionally size-filtered) and assign compact IDs 1..N.
+    keep = np.ones(total + 1, dtype=bool)
+    keep[0] = False
+    if min_size > 0:
+        sizes = np.zeros(total + 1, dtype=np.int64)
+        for meta in metas.values():
+            lo = meta["off"] + 1
+            hi = lo + meta["k"]
+            sizes[lo:hi] = meta["counts"]
+        root_size = np.zeros(total + 1, dtype=np.int64)
+        np.add.at(root_size, roots, sizes)
+        keep &= root_size[roots] >= min_size
+    uniq = np.unique(roots[keep])
+    n_obj = int(uniq.size)
+    if n_obj >= 2**32:
+        raise ValueError(
+            f"{n_obj} objects exceed uint32 capacity; use a coarser level or uint64."
+        )
+    id_of_root = np.zeros(total + 1, dtype=np.uint32)
+    id_of_root[uniq] = np.arange(1, n_obj + 1, dtype=np.uint32)
+    label_to_id = id_of_root[roots]  # global label -> compact id (0 = bg / dropped)
+    label_to_id[0] = 0
+
+    # Pass B: re-label each block, map to the compact ID, write uint32.
+    cz, cy, cx = min(chunk, nz), min(chunk, ny), min(chunk, nx)
+    out = ts.open(
+        {
+            "driver": "zarr",
+            "kvstore": {
+                "driver": "s3",
+                "bucket": bucket,
+                "path": f"{base_path}{final_path}",
+                "aws_region": region,
+            },
+            "metadata": {
+                "shape": [1, 1, nz, ny, nx],
+                "chunks": [1, 1, cz, cy, cx],
+                "dtype": "|u4",
+                "dimension_separator": "/",
+            },
+            "create": True,
+            "delete_existing": True,
+        },
+        context=ctx,
+    ).result()
+    id_gpu = cp.asarray(label_to_id)
+    for blk in blocks:
+        z0, z1, y0, y1, x0, x1 = blk
+        labels, _ = _label_block(*blk)
+        gl = cp.where(labels > 0, labels.astype(cp.int64) + metas[blk]["off"], 0)
+        out_block = id_gpu[gl]
+        out[0, 0, z0:z1, y0:y1, x0:x1].write(cp.asnumpy(out_block)).result()
+        del labels, gl, out_block
+    logger.info(
+        "[instances] wrote %d objects to %s%s (uint32)", n_obj, base_path, final_path
+    )
+
+
+def _mask_stages(level: str, hysteresis: bool, fill_holes: bool, instance_labels: bool):
     """Ordered ``(name, path)`` post-seg stages; the last writes the canonical level.
 
     Earlier stages write ``{level}_<suffix>`` intermediates. The segmentation output is
-    the 2-level "seed" mask when hysteresis is on, otherwise a binary "raw" mask.
+    the 2-level "seed" mask when hysteresis is on, otherwise a binary "raw" mask. With
+    ``instance_labels``, an ``instances`` stage is appended last (it relabels the final
+    binary into unique uint32 IDs at the canonical level).
     """
     chain = [("seg", "seed" if hysteresis else "raw")]
     if hysteresis:
         chain.append(("hyst", "hyst"))
     if fill_holes:
         chain.append(("fill", "fill"))
+    if instance_labels:
+        chain.append(("instances", "instances"))
     last = len(chain) - 1
     return [
         (name, level if i == last else f"{level}_{suffix}")
@@ -1021,6 +1163,18 @@ def _run_postprocess(args, base_path: str, stages) -> None:
             block=args.ccl_block,
             max_hole_size=max_hole,
         )
+        prev = paths["fill"]
+    if "instances" in paths:
+        logger.info("Instance labels: %s -> %s%s/", prev, base_path, paths["instances"])
+        _instance_connect(
+            args.out_bucket,
+            base_path,
+            f"{prev}/",
+            f"{paths['instances']}/",
+            args.aws_region,
+            block=args.ccl_block,
+            min_size=args.min_instance_size,
+        )
     # Drop every non-final intermediate (the "seed" mask only if not kept).
     for name, path in stages[:-1]:
         if name == "seg" and args.keep_seed_mask:
@@ -1035,6 +1189,7 @@ def _write_output_group_metadata(
     datasets_from_l: list,
     omero: Optional[dict],
     region: str,
+    reducer: str = DOWNSAMPLE_METHOD,
 ) -> None:
     """Write the zarr v2 group markers + OME-NGFF multiscales for the output.
 
@@ -1059,8 +1214,9 @@ def _write_output_group_metadata(
     # metadata; some source zarrs omit it (they carry "type"/"metadata" instead), so
     # ensure it is present.
     ms["version"] = ms.get("version") or "0.4"
-    # We downsample the mask with "max", not the source's reducer.
-    ms["type"] = DOWNSAMPLE_METHOD
+    # We downsample the mask with our own reducer (max for binary, stride for labels),
+    # not the source's.
+    ms["type"] = reducer
 
     zattrs = {"multiscales": [ms]}
     if omero is not None:
@@ -1085,7 +1241,15 @@ def _write_output_group_metadata(
 def _finalize_pyramid(
     args, base_path, spec, start, datasets, datasets_from_l, source_ms, omero
 ) -> None:
-    """Build coarser levels (+ optional finer upsample) and write OME group metadata."""
+    """Build coarser levels (+ optional finer upsample) and write OME group metadata.
+
+    In instance-label mode the canonical level is a uint32 label volume, so the pyramid
+    uses a label-preserving reducer (``LABEL_DOWNSAMPLE_METHOD``) + uint32 and drops
+    the (intensity-only) omero metadata; else the binary-mask defaults are unchanged.
+    """
+    label_mode = args.instance_labels
+    reducer = LABEL_DOWNSAMPLE_METHOD if label_mode else DOWNSAMPLE_METHOD
+    dtype = "|u4" if label_mode else "|u1"
     _build_mask_pyramid(
         args.out_bucket,
         base_path,
@@ -1093,6 +1257,8 @@ def _finalize_pyramid(
         args.aws_region,
         concurrency=args.pyramid_concurrency,
         copy_concurrency=args.pyramid_copy_concurrency,
+        reducer=reducer,
+        dtype=dtype,
     )
 
     fill_finer = args.fill_finer_levels and start > 0
@@ -1108,12 +1274,19 @@ def _finalize_pyramid(
             concurrency=args.pyramid_concurrency,
             copy_concurrency=args.pyramid_copy_concurrency,
             processes=args.pyramid_processes,
+            dtype=dtype,
         )
 
     # Metadata lists every level when finer levels were filled, else L..N only.
     meta_datasets = datasets if fill_finer else datasets_from_l
     _write_output_group_metadata(
-        args.out_bucket, base_path, source_ms, meta_datasets, omero, args.aws_region
+        args.out_bucket,
+        base_path,
+        source_ms,
+        meta_datasets,
+        None if label_mode else omero,
+        args.aws_region,
+        reducer=reducer,
     )
 
 
@@ -1403,6 +1576,21 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "no cap = fill every enclosed cavity, including genuine large lumens).",
     )
     ap.add_argument(
+        "--instance-labels",
+        action="store_true",
+        help="Instead of a binary mask, output an instance-segmentation volume: each "
+        "26-connected object gets a unique uint32 ID (seam-correct across blocks). "
+        "Runs after hysteresis/hole-fill; the pyramid uses a label-preserving reducer. "
+        "Without this flag the output is the usual binary uint8 mask.",
+    )
+    ap.add_argument(
+        "--min-instance-size",
+        type=int,
+        default=0,
+        help="With --instance-labels, drop objects smaller than this many voxels "
+        "(set to background). 0 keeps every object.",
+    )
+    ap.add_argument(
         "--abort-if-blank",
         dest="abort_if_blank",
         action="store_true",
@@ -1487,7 +1675,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     # a seam-correct connected-components pass collapses it to the final binary level.
     seed_thr = _seed_threshold(args.params_json, _model_threshold(args.params_json))
     hysteresis = seed_thr is not None
-    stages = _mask_stages(level, hysteresis, args.fill_holes)
+    stages = _mask_stages(level, hysteresis, args.fill_holes, args.instance_labels)
     seg_level = dict(stages)["seg"]
     seg_path = f"{base_path}{seg_level}/"
     chunks = (1, 1, min(128, z), min(128, y), min(128, x))
@@ -1560,8 +1748,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         )
         return
 
-    # --- Post-processing: hysteresis and/or hole-fill -> final binary at {level}/ ---
-    if hysteresis or args.fill_holes:
+    # --- Post-processing: hysteresis / hole-fill / instance labels -> {level}/ ---
+    if hysteresis or args.fill_holes or args.instance_labels:
         _run_postprocess(args, base_path, stages)
 
     if args.no_pyramid:
