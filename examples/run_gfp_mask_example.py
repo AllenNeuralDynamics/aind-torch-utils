@@ -710,6 +710,7 @@ def _hysteresis_connect(
     region: str,
     block: int = 512,
     chunk: int = 128,
+    readahead: int = 8,
 ) -> None:
     """Collapse a 2-level mask {0,1,2} into a binary mask by seam-correct hysteresis.
 
@@ -744,8 +745,8 @@ def _hysteresis_connect(
         for (x0, x1) in block_ranges(nx, block)
     ]
 
-    def _label_block(z0, z1, y0, y1, x0, x1):
-        m = cp.asarray(src[0, 0, z0:z1, y0:y1, x0:x1].read().result())
+    def _label_host(m_host):
+        m = cp.asarray(m_host)
         labels, k = cucim_label(m >= 1, return_num=True, connectivity=3)
         # int32 labels: local labels < block^3 < 2^31, so the per-block faces stored in
         # `metas` (all blocks held at once) use half the RAM/VRAM of int64. Global
@@ -753,10 +754,11 @@ def _hysteresis_connect(
         return m, labels.astype(cp.int32), int(k)
 
     # Pass A: label each block, record counts/offsets, seed labels, and 6 face planes.
+    # Reads are prefetched (see _prefetch_blocks) to overlap S3 latency with GPU work.
     metas = {}
     offset = 0
-    for blk in blocks:
-        m, labels, k = _label_block(*blk)
+    for blk, m_host in _prefetch_blocks(src, blocks, readahead):
+        m, labels, k = _label_host(m_host)
         seed = cp.unique(labels[m == 2])
         seed = seed[seed > 0]
         metas[blk] = {
@@ -806,9 +808,9 @@ def _hysteresis_connect(
         context=ctx,
     ).result()
     keep_gpu = cp.asarray(keep)
-    for blk in blocks:
+    for blk, m_host in _prefetch_blocks(src, blocks, readahead):
         z0, z1, y0, y1, x0, x1 = blk
-        _, labels, _ = _label_block(*blk)
+        _, labels, _ = _label_host(m_host)
         # Promote to int64 before adding the offset: global labels can exceed 2^31.
         gl = cp.where(labels > 0, labels.astype(cp.int64) + metas[blk]["off"], 0)
         out_block = keep_gpu[gl].astype(cp.uint8)
@@ -831,6 +833,7 @@ def _fill_holes_connect(
     block: int = 512,
     chunk: int = 128,
     max_hole_size: Optional[int] = None,
+    readahead: int = 8,
 ) -> None:
     """Fill enclosed cavities in a binary mask, seam-correct across block faces.
 
@@ -867,19 +870,20 @@ def _fill_holes_connect(
         for (x0, x1) in block_ranges(nx, block)
     ]
 
-    def _label_block(z0, z1, y0, y1, x0, x1):
-        m = cp.asarray(src[0, 0, z0:z1, y0:y1, x0:x1].read().result())
+    def _label_host(m_host):
+        m = cp.asarray(m_host)
         labels, k = cucim_label(m == 0, return_num=True, connectivity=1)
         # int32 labels halve the per-block face RAM/VRAM (all blocks' faces are held in
         # `metas` at once); global labels (local + offset) are promoted to int64 below.
         return m, labels.astype(cp.int32), int(k)
 
     # Pass A: label background per block; record offsets, sizes, border + face labels.
+    # Reads are prefetched (see _prefetch_blocks) to overlap S3 latency with GPU work.
     shape = (nz, ny, nx)
     metas = {}
     offset = 0
-    for blk in blocks:
-        m, labels, k = _label_block(*blk)
+    for blk, m_host in _prefetch_blocks(src, blocks, readahead):
+        m, labels, k = _label_host(m_host)
         counts = cp.asnumpy(cp.bincount(labels.ravel(), minlength=k + 1))
         k1 = k + 1
         metas[blk] = {
@@ -943,9 +947,9 @@ def _fill_holes_connect(
         context=ctx,
     ).result()
     fill_gpu = cp.asarray(fill)
-    for blk in blocks:
+    for blk, m_host in _prefetch_blocks(src, blocks, readahead):
         z0, z1, y0, y1, x0, x1 = blk
-        m, labels, _ = _label_block(*blk)
+        m, labels, _ = _label_host(m_host)
         # Promote to int64 before adding the offset: global labels can exceed 2^31.
         gl = cp.where(labels > 0, labels.astype(cp.int64) + metas[blk]["off"], 0)
         out_block = ((m >= 1) | fill_gpu[gl]).astype(cp.uint8)
@@ -1183,6 +1187,7 @@ def _run_postprocess(args, base_path: str, stages) -> None:
             f"{paths['hyst']}/",
             args.aws_region,
             block=args.ccl_block,
+            readahead=args.ccl_readahead,
         )
         prev = paths["hyst"]
     if "fill" in paths:
@@ -1195,6 +1200,7 @@ def _run_postprocess(args, base_path: str, stages) -> None:
             args.aws_region,
             block=args.ccl_block,
             max_hole_size=max_hole,
+            readahead=args.ccl_readahead,
         )
         prev = paths["fill"]
     if "instances" in paths:
@@ -1593,9 +1599,9 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "--ccl-readahead",
         type=int,
         default=8,
-        help="Concurrent block reads prefetched during instance-labeling (the CCL pass "
-        "is S3-latency-bound; higher overlaps more reads with GPU work). Peak extra "
-        "RAM ~= this x block^3 x dtype.",
+        help="Concurrent block reads prefetched during the CCL passes (hysteresis, "
+        "hole-fill, instance-labeling) -- they are S3-latency-bound, so higher "
+        "overlaps more reads with GPU work. Peak extra RAM ~= this x block^3 x dtype.",
     )
     ap.add_argument(
         "--keep-seed-mask",
