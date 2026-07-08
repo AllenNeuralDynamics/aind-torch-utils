@@ -723,7 +723,7 @@ def _hysteresis_connect(
     import cupy as cp
     from cucim.skimage.measure import label as cucim_label
 
-    ctx = ts.Context({"data_copy_concurrency": {"limit": 4}})
+    ctx = ts.Context({"data_copy_concurrency": {"limit": max(4, readahead)}})
     src = ts.open(
         {
             "driver": "zarr",
@@ -848,7 +848,7 @@ def _fill_holes_connect(
     import cupy as cp
     from cucim.skimage.measure import label as cucim_label
 
-    ctx = ts.Context({"data_copy_concurrency": {"limit": 4}})
+    ctx = ts.Context({"data_copy_concurrency": {"limit": max(4, readahead)}})
     src = ts.open(
         {
             "driver": "zarr",
@@ -1043,7 +1043,7 @@ def _instance_connect(
     import cupy as cp
     from cucim.skimage.measure import label as cucim_label
 
-    ctx = ts.Context({"data_copy_concurrency": {"limit": 4}})
+    ctx = ts.Context({"data_copy_concurrency": {"limit": max(4, readahead)}})
     src = ts.open(
         {
             "driver": "zarr",
