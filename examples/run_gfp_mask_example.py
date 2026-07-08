@@ -97,12 +97,15 @@ Tips:
 import argparse
 import asyncio
 import copy
+import itertools
 import json
 import logging
 import multiprocessing
 import re
 import statistics
 import sys
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -987,6 +990,33 @@ def _mask_has_foreground(
     return False
 
 
+def _prefetch_blocks(src, blocks, readahead: int):
+    """Yield ``(blk, host_ndarray)`` with up to ``readahead`` S3 reads in flight.
+
+    The CCL passes are S3-latency-bound (sequential reads leave the GPU/CPU idle).
+    Reader threads fetch upcoming blocks while the caller's GPU work runs on the main
+    thread, overlapping the reads. Blocks are yielded in input order (offsets stable).
+    """
+
+    def _read(blk):
+        z0, z1, y0, y1, x0, x1 = blk
+        return src[0, 0, z0:z1, y0:y1, x0:x1].read().result()
+
+    with ThreadPoolExecutor(max_workers=max(1, readahead)) as ex:
+        it = iter(blocks)
+        pending = deque(
+            (blk, ex.submit(_read, blk))
+            for blk in itertools.islice(it, max(1, readahead))
+        )
+        for nxt in it:
+            blk, fut = pending.popleft()
+            pending.append((nxt, ex.submit(_read, nxt)))
+            yield blk, fut.result()
+        while pending:
+            blk, fut = pending.popleft()
+            yield blk, fut.result()
+
+
 def _instance_connect(
     bucket: str,
     base_path: str,
@@ -996,6 +1026,7 @@ def _instance_connect(
     block: int = 512,
     chunk: int = 128,
     min_size: int = 0,
+    readahead: int = 8,
 ) -> None:
     """Label connected objects of a binary mask with unique IDs (instance segmentation).
 
@@ -1030,16 +1061,18 @@ def _instance_connect(
         for (x0, x1) in block_ranges(nx, block)
     ]
 
-    def _label_block(z0, z1, y0, y1, x0, x1):
-        m = cp.asarray(src[0, 0, z0:z1, y0:y1, x0:x1].read().result())
+    def _label_host(m_host):
+        m = cp.asarray(m_host)
         labels, k = cucim_label(m >= 1, return_num=True, connectivity=3)
         return labels.astype(cp.int32), int(k)
 
     # Pass A: label each block; record offsets, faces, and (for min_size) voxel counts.
+    # Reads are prefetched so S3 latency overlaps the GPU labeling (blocks stay in
+    # order, so `offset` assignment is identical here and in Pass B).
     metas = {}
     offset = 0
-    for blk in blocks:
-        labels, k = _label_block(*blk)
+    for blk, m_host in _prefetch_blocks(src, blocks, readahead):
+        labels, k = _label_host(m_host)
         meta = {"off": offset, "k": k, **_face_planes(labels, cp)}
         if min_size > 0:
             k1 = k + 1
@@ -1102,9 +1135,9 @@ def _instance_connect(
         context=ctx,
     ).result()
     id_gpu = cp.asarray(label_to_id)
-    for blk in blocks:
+    for blk, m_host in _prefetch_blocks(src, blocks, readahead):
         z0, z1, y0, y1, x0, x1 = blk
-        labels, _ = _label_block(*blk)
+        labels, _ = _label_host(m_host)
         gl = cp.where(labels > 0, labels.astype(cp.int64) + metas[blk]["off"], 0)
         out_block = id_gpu[gl]
         out[0, 0, z0:z1, y0:y1, x0:x1].write(cp.asnumpy(out_block)).result()
@@ -1174,6 +1207,7 @@ def _run_postprocess(args, base_path: str, stages) -> None:
             args.aws_region,
             block=args.ccl_block,
             min_size=args.min_instance_size,
+            readahead=args.ccl_readahead,
         )
     # Drop every non-final intermediate (the "seed" mask only if not kept).
     for name, path in stages[:-1]:
@@ -1556,6 +1590,14 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "hole-fill). Larger blocks use more VRAM but less face-stitch memory.",
     )
     ap.add_argument(
+        "--ccl-readahead",
+        type=int,
+        default=8,
+        help="Concurrent block reads prefetched during instance-labeling (the CCL pass "
+        "is S3-latency-bound; higher overlaps more reads with GPU work). Peak extra "
+        "RAM ~= this x block^3 x dtype.",
+    )
+    ap.add_argument(
         "--keep-seed-mask",
         action="store_true",
         help="Keep the intermediate 2-level '_seed' mask after hysteresis (default: "
@@ -1675,6 +1717,7 @@ def _resume_from_binary(
             args.aws_region,
             block=args.ccl_block,
             min_size=args.min_instance_size,
+            readahead=args.ccl_readahead,
         )
     elif args.resume_from.rstrip("/") != level:
         raise SystemExit(
