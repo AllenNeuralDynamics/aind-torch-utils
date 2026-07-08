@@ -1093,7 +1093,7 @@ def _instance_connect(
             "metadata": {
                 "shape": [1, 1, nz, ny, nx],
                 "chunks": [1, 1, cz, cy, cx],
-                "dtype": "|u4",
+                "dtype": "<u4",  # little-endian uint32 (| byte-order is 1-byte only)
                 "dimension_separator": "/",
             },
             "create": True,
@@ -1249,7 +1249,7 @@ def _finalize_pyramid(
     """
     label_mode = args.instance_labels
     reducer = LABEL_DOWNSAMPLE_METHOD if label_mode else DOWNSAMPLE_METHOD
-    dtype = "|u4" if label_mode else "|u1"
+    dtype = "<u4" if label_mode else "|u1"  # <u4 = little-endian uint32
     _build_mask_pyramid(
         args.out_bucket,
         base_path,
@@ -1591,6 +1591,15 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "(set to background). 0 keeps every object.",
     )
     ap.add_argument(
+        "--resume-from",
+        default=None,
+        help="Resume from an existing binary array (a level suffix under the output "
+        "group, e.g. '0_fill') instead of recomputing: skips segmentation, hysteresis, "
+        "and hole-fill. With --instance-labels, runs only instance-labeling on it -> "
+        "{level}/ (+ pyramid). Without --instance-labels it must equal the canonical "
+        "level (rebuild the pyramid only).",
+    )
+    ap.add_argument(
         "--abort-if-blank",
         dest="abort_if_blank",
         action="store_true",
@@ -1606,6 +1615,77 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "foreground.",
     )
     return ap.parse_args(argv)
+
+
+def _should_abort_blank(args, base_path: str, seg_level: str) -> bool:
+    """True if segmentation is blank and post-processing should be skipped (logs why).
+
+    A blank mask means there is nothing for hysteresis/hole-fill/instances/pyramid to
+    do, and building a full pyramid of zeros (esp. --fill-finer-levels to level 0) would
+    waste hours of S3 writes.
+    """
+    if not args.abort_if_blank:
+        return False
+    if _mask_has_foreground(
+        args.out_bucket, base_path, f"{seg_level}/", args.aws_region, args.ccl_block
+    ):
+        return False
+    logger.warning(
+        "Segmentation is completely blank (no voxel above threshold in %s%s). "
+        "Nothing to post-process; skipping hysteresis/hole-fill/pyramid. Check "
+        "threshold/seed_threshold, normalization bounds, and flat-field (and that "
+        "--out-prefix is a key, not a full s3:// URL). Pass --no-abort-if-blank to "
+        "build the (empty) pyramid anyway.",
+        base_path,
+        seg_level,
+    )
+    return True
+
+
+def _resume_from_binary(
+    args,
+    base_path,
+    level,
+    spec,
+    start,
+    datasets,
+    datasets_from_l,
+    source_ms,
+    omero,
+) -> None:
+    """Resume from an existing binary: instance-label it (+ pyramid), no recompute.
+
+    Skips segmentation/hysteresis/hole-fill; ``args.resume_from`` is a level suffix
+    under the output group (e.g. ``0_fill``). With ``--instance-labels`` it is relabeled
+    into ``{level}/`` (uint32); otherwise it must already be the canonical level and
+    only the pyramid is rebuilt.
+    """
+    logger.info(
+        "Resume: skipping segmentation/hysteresis/hole-fill; reusing s3://%s/%s%s/",
+        args.out_bucket,
+        base_path,
+        args.resume_from,
+    )
+    if args.instance_labels:
+        _instance_connect(
+            args.out_bucket,
+            base_path,
+            f"{args.resume_from}/",
+            f"{level}/",
+            args.aws_region,
+            block=args.ccl_block,
+            min_size=args.min_instance_size,
+        )
+    elif args.resume_from.rstrip("/") != level:
+        raise SystemExit(
+            "--resume-from without --instance-labels must be the canonical level "
+            f"'{level}' (pyramid rebuild only); got '{args.resume_from}'."
+        )
+    if not args.no_pyramid:
+        _finalize_pyramid(
+            args, base_path, spec, start, datasets, datasets_from_l, source_ms, omero
+        )
+    logger.info("Done (resume). Output at s3://%s/%s", args.out_bucket, base_path)
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -1641,6 +1721,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     # --- Source multiscales metadata (for pyramid + OME output) ---
     source_ms = datasets = omero = None
     datasets_from_l: list = []
+    start = 0
     if not args.no_pyramid:
         ms_info = _read_source_multiscales(in_bucket, group_path)
         if ms_info is None:
@@ -1669,6 +1750,21 @@ def main(argv: Optional[List[str]] = None) -> None:
     # "<out-prefix>/Tile_X_0002_Y_0006_Z_0000_ch_488.ome.zarr/".
     tile_name = group_path.rstrip("/").rsplit("/", 1)[-1]
     base_path = f"{args.out_prefix.rstrip('/')}/{tile_name}/"
+
+    # --- Resume: reuse an existing binary; skip segmentation/hysteresis/hole-fill ---
+    if args.resume_from:
+        _resume_from_binary(
+            args,
+            base_path,
+            level,
+            spec,
+            start,
+            datasets,
+            datasets_from_l,
+            source_ms,
+            omero,
+        )
+        return
 
     # Hysteresis (dual-threshold) is enabled when params.json sets seed_threshold. The
     # streaming pass then writes a 2-level mask {0,1,2} to an intermediate "_seed" path;
@@ -1734,23 +1830,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     # Bail out early if the segmentation is completely blank: no foreground means there
     # is nothing for hysteresis/hole-fill/pyramid to do, and building a full pyramid of
     # zeros (esp. --fill-finer-levels to level 0) would waste hours of S3 writes.
-    if args.abort_if_blank and not _mask_has_foreground(
-        args.out_bucket, base_path, f"{seg_level}/", args.aws_region, args.ccl_block
-    ):
-        logger.warning(
-            "Segmentation is completely blank (no voxel above threshold in %s%s). "
-            "Nothing to post-process; skipping hysteresis/hole-fill/pyramid. Check "
-            "threshold/seed_threshold, normalization bounds, and flat-field (and that "
-            "--out-prefix is a key, not a full s3:// URL). Pass --no-abort-if-blank to "
-            "build the (empty) pyramid anyway.",
-            base_path,
-            seg_level,
-        )
+    if _should_abort_blank(args, base_path, seg_level):
         return
 
     # --- Post-processing: hysteresis / hole-fill / instance labels -> {level}/ ---
-    if hysteresis or args.fill_holes or args.instance_labels:
-        _run_postprocess(args, base_path, stages)
+    # No-op when there are no post-seg stages (plain binary: seg wrote {level}/ itself).
+    _run_postprocess(args, base_path, stages)
 
     if args.no_pyramid:
         logger.info(
