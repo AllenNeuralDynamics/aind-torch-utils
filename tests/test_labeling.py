@@ -1,7 +1,14 @@
 """Tests for the pure-numpy connected-components stitching helpers."""
 import numpy as np
 
-from aind_torch_utils.labeling import UnionFind, block_ranges, union_faces
+from aind_torch_utils.labeling import (
+    UnionFind,
+    block_ranges,
+    bucket_points,
+    region_seeds,
+    rescale_points,
+    union_faces,
+)
 
 
 def test_block_ranges():
@@ -182,3 +189,40 @@ def test_seed_propagation_to_roots():
     keep[0] = False
     assert keep[1] and keep[2] and keep[3]  # whole merged component kept
     assert not keep[4]  # unseeded component dropped
+
+
+def test_rescale_points_center_aligned():
+    # factor 2 (points at a 2x-coarser level): (p+0.5)*2-0.5, floored.
+    pts = np.array([[1, 2, 3], [0, 0, 0]], dtype=np.int64)
+    out = rescale_points(pts, [2.0, 2.0, 2.0])
+    assert out.tolist() == [[2, 4, 6], [0, 0, 0]]
+    assert out.dtype == np.int64
+    # anisotropic factor per axis
+    out2 = rescale_points(np.array([[1, 1, 1]]), [4.0, 2.0, 1.0])
+    assert out2.tolist() == [[5, 2, 1]]  # (1.5*4-0.5,1.5*2-0.5,1.5*1-0.5)=(5.5,2.5,1.0)
+
+
+def test_bucket_points_groups_by_cell_and_drops_out_of_bounds():
+    coords = np.array([[0, 0, 0], [0, 0, 5], [10, 10, 10], [100, 0, 0]], dtype=np.int64)
+    ids = np.array([1, 2, 3, 4], dtype=np.uint32)
+    cells = bucket_points(coords, ids, block=8, shape=(20, 20, 20))
+    assert set(cells) == {(0, 0, 0), (1, 1, 1)}  # (100,0,0) dropped (out of bounds)
+    c00, i00 = cells[(0, 0, 0)]
+    assert sorted(i00.tolist()) == [1, 2]  # both fall in cell (0,0,0)
+    _, i11 = cells[(1, 1, 1)]
+    assert i11.tolist() == [3]
+
+
+def test_region_seeds_gathers_and_filters_to_bbox():
+    coords = np.array([[0, 0, 0], [0, 0, 5], [10, 10, 10]], dtype=np.int64)
+    ids = np.array([1, 2, 3], dtype=np.uint32)
+    cells = bucket_points(coords, ids, block=8, shape=(20, 20, 20))
+    # bbox exactly around the first cell's region -> the two points at (0,0,0)/(0,0,5).
+    c, i = region_seeds(cells, block=8, bbox=(0, 8, 0, 8, 0, 8))
+    assert sorted(i.tolist()) == [1, 2]
+    # a bbox that includes (10,10,10) only.
+    c2, i2 = region_seeds(cells, block=8, bbox=(8, 16, 8, 16, 8, 16))
+    assert i2.tolist() == [3]
+    # empty region.
+    _, i3 = region_seeds(cells, block=8, bbox=(0, 4, 8, 12, 0, 4))
+    assert i3.tolist() == []

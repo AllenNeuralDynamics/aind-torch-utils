@@ -104,6 +104,7 @@ import multiprocessing
 import re
 import statistics
 import sys
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple
@@ -757,7 +758,7 @@ def _hysteresis_connect(
     # Reads are prefetched (see _prefetch_blocks) to overlap S3 latency with GPU work.
     metas = {}
     offset = 0
-    for blk, m_host in _prefetch_blocks(src, blocks, readahead):
+    for blk, m_host in _prefetch_blocks(src, blocks, readahead, "hyst/A"):
         m, labels, k = _label_host(m_host)
         seed = cp.unique(labels[m == 2])
         seed = seed[seed > 0]
@@ -808,7 +809,7 @@ def _hysteresis_connect(
         context=ctx,
     ).result()
     keep_gpu = cp.asarray(keep)
-    for blk, m_host in _prefetch_blocks(src, blocks, readahead):
+    for blk, m_host in _prefetch_blocks(src, blocks, readahead, "hyst/B"):
         z0, z1, y0, y1, x0, x1 = blk
         _, labels, _ = _label_host(m_host)
         # Promote to int64 before adding the offset: global labels can exceed 2^31.
@@ -882,7 +883,7 @@ def _fill_holes_connect(
     shape = (nz, ny, nx)
     metas = {}
     offset = 0
-    for blk, m_host in _prefetch_blocks(src, blocks, readahead):
+    for blk, m_host in _prefetch_blocks(src, blocks, readahead, "fill/A"):
         m, labels, k = _label_host(m_host)
         counts = cp.asnumpy(cp.bincount(labels.ravel(), minlength=k + 1))
         k1 = k + 1
@@ -947,7 +948,7 @@ def _fill_holes_connect(
         context=ctx,
     ).result()
     fill_gpu = cp.asarray(fill)
-    for blk, m_host in _prefetch_blocks(src, blocks, readahead):
+    for blk, m_host in _prefetch_blocks(src, blocks, readahead, "fill/B"):
         z0, z1, y0, y1, x0, x1 = blk
         m, labels, _ = _label_host(m_host)
         # Promote to int64 before adding the offset: global labels can exceed 2^31.
@@ -994,17 +995,40 @@ def _mask_has_foreground(
     return False
 
 
-def _prefetch_blocks(src, blocks, readahead: int):
+def _prefetch_blocks(src, blocks, readahead: int, label: str = "ccl"):
     """Yield ``(blk, host_ndarray)`` with up to ``readahead`` S3 reads in flight.
 
     The CCL passes are S3-latency-bound (sequential reads leave the GPU/CPU idle).
     Reader threads fetch upcoming blocks while the caller's GPU work runs on the main
     thread, overlapping the reads. Blocks are yielded in input order (offsets stable).
+
+    Logs read throughput + a bottleneck diagnostic per pass (``label``), every ~30 s and
+    at the end: MB/s, ``read-wait%`` (share of wall-clock the consumer blocked on a
+    read), and ``starved`` (blocks whose read wasn't ready when consumed). High
+    read-wait% / starvation => read-bound (network); low => GPU consumer is the limit.
     """
 
     def _read(blk):
         z0, z1, y0, y1, x0, x1 = blk
         return src[0, 0, z0:z1, y0:y1, x0:x1].read().result()
+
+    total = len(blocks)
+    t0 = time.perf_counter()
+    stats = {"n": 0, "starved": 0, "read_wait": 0.0, "bytes": 0, "last_log": t0}
+
+    def _report(final=False):
+        elapsed = max(time.perf_counter() - t0, 1e-9)
+        logger.info(
+            "[%s] %d/%d blocks, %.0f MB/s, read-wait %.0f%% (starved %d/%d)%s",
+            label,
+            stats["n"],
+            total,
+            stats["bytes"] / 1e6 / elapsed,
+            100.0 * stats["read_wait"] / elapsed,
+            stats["starved"],
+            stats["n"],
+            " [done]" if final else "",
+        )
 
     with ThreadPoolExecutor(max_workers=max(1, readahead)) as ex:
         it = iter(blocks)
@@ -1012,13 +1036,23 @@ def _prefetch_blocks(src, blocks, readahead: int):
             (blk, ex.submit(_read, blk))
             for blk in itertools.islice(it, max(1, readahead))
         )
-        for nxt in it:
-            blk, fut = pending.popleft()
-            pending.append((nxt, ex.submit(_read, nxt)))
-            yield blk, fut.result()
         while pending:
             blk, fut = pending.popleft()
-            yield blk, fut.result()
+            nxt = next(it, None)
+            if nxt is not None:
+                pending.append((nxt, ex.submit(_read, nxt)))
+            if not fut.done():
+                stats["starved"] += 1
+            tw = time.perf_counter()
+            data = fut.result()
+            stats["read_wait"] += time.perf_counter() - tw
+            stats["n"] += 1
+            stats["bytes"] += data.nbytes
+            if time.perf_counter() - stats["last_log"] >= 30.0:
+                _report()
+                stats["last_log"] = time.perf_counter()
+            yield blk, data
+    _report(final=True)
 
 
 def _instance_connect(
@@ -1075,7 +1109,7 @@ def _instance_connect(
     # order, so `offset` assignment is identical here and in Pass B).
     metas = {}
     offset = 0
-    for blk, m_host in _prefetch_blocks(src, blocks, readahead):
+    for blk, m_host in _prefetch_blocks(src, blocks, readahead, "instances/A"):
         labels, k = _label_host(m_host)
         meta = {"off": offset, "k": k, **_face_planes(labels, cp)}
         if min_size > 0:
@@ -1139,7 +1173,7 @@ def _instance_connect(
         context=ctx,
     ).result()
     id_gpu = cp.asarray(label_to_id)
-    for blk, m_host in _prefetch_blocks(src, blocks, readahead):
+    for blk, m_host in _prefetch_blocks(src, blocks, readahead, "instances/B"):
         z0, z1, y0, y1, x0, x1 = blk
         labels, _ = _label_host(m_host)
         gl = cp.where(labels > 0, labels.astype(cp.int64) + metas[blk]["off"], 0)

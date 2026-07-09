@@ -5,6 +5,7 @@ their per-block labels are made globally unique via offsets; these helpers union
 that touch across block faces (26-connectivity) and resolve the equivalence classes.
 Kept dependency-light so the seam-stitching logic can be unit-tested without a GPU.
 """
+
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -83,3 +84,82 @@ def union_faces(
         both = (a > 0) & (b > 0)
         for u, v in zip(a[both].tolist(), b[both].tolist()):
             uf.union(u, v)
+
+
+def rescale_points(points: np.ndarray, factor) -> np.ndarray:
+    """Center-aligned rescale of ``(N, 3)`` integer voxel coords by per-axis ``factor``.
+
+    Maps coordinates from one pyramid level to another with
+    ``out = floor((p + 0.5) * factor - 0.5)`` (the center-alignment convention used by
+    the flat-field sampler), where
+    ``factor[a] = voxel_size(src_level) / voxel_size(dst_level)`` per axis. Returns
+    int64 voxel coords in the destination level.
+    """
+    f = np.asarray(factor, dtype=np.float64).reshape(1, 3)
+    return np.floor((points.astype(np.float64) + 0.5) * f - 0.5).astype(np.int64)
+
+
+def bucket_points(coords: np.ndarray, ids: np.ndarray, block: int, shape) -> dict:
+    """Group voxel coords by block cell -> ``{(cz, cy, cx): (coords, ids)}``.
+
+    Coords outside ``shape`` (Z, Y, X) are dropped. Cell index is ``coords // block``.
+    Lets :func:`region_seeds` fetch the seeds in a block(+halo) region without scanning
+    the full (billion-row) array.
+    """
+    coords = np.asarray(coords)
+    ids = np.asarray(ids)
+    nz, ny, nx = shape
+    inb = (
+        (coords[:, 0] >= 0)
+        & (coords[:, 0] < nz)
+        & (coords[:, 1] >= 0)
+        & (coords[:, 1] < ny)
+        & (coords[:, 2] >= 0)
+        & (coords[:, 2] < nx)
+    )
+    coords, ids = coords[inb], ids[inb]
+    if coords.shape[0] == 0:
+        return {}
+    cells = coords // block
+    order = np.lexsort((cells[:, 2], cells[:, 1], cells[:, 0]))
+    coords, ids, cells = coords[order], ids[order], cells[order]
+    change = np.any(cells[1:] != cells[:-1], axis=1)
+    starts = np.concatenate(([0], np.nonzero(change)[0] + 1))
+    stops = np.concatenate((starts[1:], [len(cells)]))
+    out = {}
+    for s, e in zip(starts.tolist(), stops.tolist()):
+        out[(int(cells[s, 0]), int(cells[s, 1]), int(cells[s, 2]))] = (
+            coords[s:e],
+            ids[s:e],
+        )
+    return out
+
+
+def region_seeds(cell_points: dict, block: int, bbox):
+    """Return ``(coords, ids)`` of seeds inside ``bbox`` = ``(z0, z1, y0, y1, x0, x1)``.
+
+    Gathers the block cells overlapping ``bbox`` from a :func:`bucket_points` dict, then
+    filters to the exact half-open box.
+    """
+    z0, z1, y0, y1, x0, x1 = bbox
+    cc, ii = [], []
+    for cz in range(z0 // block, (z1 - 1) // block + 1):
+        for cy in range(y0 // block, (y1 - 1) // block + 1):
+            for cx in range(x0 // block, (x1 - 1) // block + 1):
+                cell = cell_points.get((cz, cy, cx))
+                if cell is not None:
+                    cc.append(cell[0])
+                    ii.append(cell[1])
+    if not cc:
+        return np.empty((0, 3), dtype=np.int64), np.empty((0,), dtype=np.uint32)
+    coords = np.concatenate(cc)
+    ids = np.concatenate(ii)
+    m = (
+        (coords[:, 0] >= z0)
+        & (coords[:, 0] < z1)
+        & (coords[:, 1] >= y0)
+        & (coords[:, 1] < y1)
+        & (coords[:, 2] >= x0)
+        & (coords[:, 2] < x1)
+    )
+    return coords[m], ids[m]
