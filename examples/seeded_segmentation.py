@@ -1,11 +1,13 @@
-"""Seeded instance segmentation from a points array (marker-controlled watershed).
+"""Seeded instance segmentation from a points array (GPU EDT nearest-seed labeling).
 
 Standalone companion to ``run_gfp_mask_example.py`` for when you already have a
 **point per object** (e.g. billions of bouton centers in a numpy ``(N, 3)`` array).
 Instead of thresholding intensity (which fails on dim/uneven objects), it grows each
-object from its seed with a per-chunk marker-controlled watershed and writes a
-``uint32`` instance-label OME-Zarr (each object's voxels carry its point's row index
-+ 1) plus a label-preserving pyramid.
+object from its seed by assigning every foreground voxel to its nearest seed via the
+Euclidean distance transform (a fully-GPU stand-in for a ``-EDT`` marker-controlled
+watershed, since cuCIM has no watershed) and writes a ``uint32`` instance-label
+OME-Zarr (each object's voxels carry its point's row index + 1) plus a label-preserving
+pyramid.
 
 Because objects are small, each block + halo is segmented **independently** — the
 seed's array index is its global instance ID, so there is no cross-block merging /
@@ -124,18 +126,19 @@ def _expand(core, halo, nz, ny, nx):
     )
 
 
-def _seeded_watershed(args, base_path, level, in_store, cell_points, bg_field, cfg):
-    """Per-chunk marker-controlled watershed from points -> uint32 instance labels.
+def _seeded_segment(args, base_path, level, in_store, cell_points, bg_field, cfg):
+    """Per-chunk GPU EDT nearest-seed labeling from points -> uint32 instance labels.
 
     For each block + halo: flat-field + normalize the intensity, build a foreground mask
     (permissive threshold OR a sphere around each seed), rasterize the chunk's seeds as
-    local markers, run watershed (``-EDT`` or ``-intensity``, masked to foreground), map
-    local labels back to the seeds' global IDs, crop to the core, and write. Halo seeds
-    give cross-boundary objects the right basin; core-crop => each object written once.
+    local markers, assign each foreground voxel to its nearest seed via the Euclidean
+    distance-transform feature map (equivalent to a ``-EDT`` marker-controlled watershed
+    for point markers) while dropping foreground blobs with no seed, map to the seeds'
+    global IDs, crop to the core, and write. Halo seeds give cross-boundary objects the
+    right basin; core-crop => each object written once.
     """
     import cupy as cp
     import cupyx.scipy.ndimage as cndi
-    from cucim.skimage.segmentation import watershed
 
     block, halo, region = args.ccl_block, args.watershed_halo, args.aws_region
     nz, ny, nx = (int(s) for s in in_store.domain.shape[-3:])
@@ -197,13 +200,23 @@ def _seeded_watershed(args, base_path, level, in_store, cell_points, bg_field, c
                 markers > 0, iterations=int(args.seed_sphere_radius)
             )
 
-        surface = (
-            -cndi.distance_transform_edt(fg)
-            if args.watershed_surface == "edt"
-            else -norm
-        )
-        ws = watershed(surface, markers=markers, mask=fg)  # local labels {0..k}
-        labels = cp.asarray(local_to_global)[ws]  # -> global uint32 IDs
+        # cuCIM has no watershed. Assign each fg voxel to its nearest seed via the
+        # Euclidean feature transform (== the -EDT watershed for point markers), but
+        # only inside a fg connected component that contains a seed -> no-seed blobs
+        # are dropped, dim seeded objects are captured whole, and touching (multi-seed)
+        # blobs split at the midplane.
+        comp, ncomp = cndi.label(fg)
+        labels = cp.zeros(norm.shape, dtype=cp.uint32)
+        if k:
+            _, inds = cndi.distance_transform_edt(
+                markers == 0, return_distances=False, return_indices=True
+            )
+            nearest = markers[inds[0], inds[1], inds[2]]  # nearest seed's local label
+            has_seed = cp.zeros(int(ncomp) + 1, dtype=bool)
+            sc = comp[markers > 0]
+            has_seed[sc[sc > 0]] = True  # comps with >=1 seed (skip bg=0)
+            g = cp.asarray(local_to_global)  # local id -> global uint32 id
+            labels = cp.where(fg & has_seed[comp], g[nearest], cp.uint32(0))
 
         z0, z1, y0, y1, x0, x1 = core
         # Core's local offset within the expanded block, hoisted to simple slice bounds.
@@ -211,7 +224,7 @@ def _seeded_watershed(args, base_path, level, in_store, cell_points, bg_field, c
         lz1, ly1, lx1 = lz0 + (z1 - z0), ly0 + (y1 - y0), lx0 + (x1 - x0)
         crop = labels[lz0:lz1, ly0:ly1, lx0:lx1]
         out[0, 0, z0:z1, y0:y1, x0:x1].write(cp.asnumpy(crop)).result()
-        del vol, norm, markers, fg, surface, ws, labels, crop
+        del vol, norm, markers, fg, comp, labels, crop
 
     logger.info(
         "[seeded] wrote uint32 instance labels to %s%s/ (%d seeded objects)",
@@ -262,7 +275,8 @@ def _build_label_pyramid(args, base_path, spec, level, start, datasets, source_m
 def _parse_args(argv):
     """Parse command-line arguments."""
     ap = argparse.ArgumentParser(
-        description="Seeded instance segmentation from a points array (watershed)."
+        description="Seeded instance segmentation from a points array "
+        "(GPU EDT nearest-seed labeling)."
     )
     ap.add_argument(
         "--in-spec",
@@ -295,7 +309,7 @@ def _parse_args(argv):
         "--ccl-block",
         type=int,
         default=512,
-        help="Block (chunk) size for the per-chunk watershed.",
+        help="Block (chunk) size for the per-chunk labeling.",
     )
     ap.add_argument(
         "--ccl-readahead",
@@ -314,13 +328,15 @@ def _parse_args(argv):
         "--seed-flood-threshold",
         type=float,
         default=0.05,
-        help="Normalized intensity threshold for the watershed foreground.",
+        help="Normalized intensity threshold for the foreground mask.",
     )
     ap.add_argument(
         "--watershed-surface",
         choices=["edt", "intensity"],
         default="edt",
-        help="Flood surface: 'edt' (shape, robust) or 'intensity'.",
+        help="Kept for compatibility. Only 'edt' (nearest-seed via distance "
+        "transform) is implemented; 'intensity' warns and falls back to 'edt' "
+        "(cuCIM has no watershed for an intensity surface).",
     )
     ap.add_argument(
         "--seed-sphere-radius",
@@ -346,10 +362,15 @@ def _parse_args(argv):
 
 
 def main(argv=None):
-    """Rescale points, then per-chunk seeded watershed -> uint32 instance OME-Zarr."""
+    """Rescale points, then per-chunk nearest-seed labeling -> uint32 instances."""
     import cupy as cp
 
     args = _parse_args(sys.argv[1:] if argv is None else argv)
+    if args.watershed_surface == "intensity":
+        logger.warning(
+            "--watershed-surface intensity is not implemented (cuCIM has no "
+            "watershed); falling back to 'edt' (nearest-seed)."
+        )
     spec = args.in_spec
 
     bucket, group_path, level = _spec_level_and_group(spec)
@@ -403,7 +424,7 @@ def main(argv=None):
 
     with cp.cuda.Device(_device_index(args.devices[0])):
         bg_field = _estimate_background(spec, cfg, shape)
-        _seeded_watershed(args, base_path, level, in_store, cell_points, bg_field, cfg)
+        _seeded_segment(args, base_path, level, in_store, cell_points, bg_field, cfg)
 
     if args.no_pyramid:
         logger.info("Done (single level %s). Skipped pyramid (--no-pyramid).", level)
