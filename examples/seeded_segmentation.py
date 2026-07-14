@@ -2,12 +2,21 @@
 
 Standalone companion to ``run_gfp_mask_example.py`` for when you already have a
 **point per object** (e.g. billions of bouton centers in a numpy ``(N, 3)`` array).
-Instead of thresholding intensity (which fails on dim/uneven objects), it grows each
-object from its seed by assigning every foreground voxel to its nearest seed via the
-Euclidean distance transform (a fully-GPU stand-in for a ``-EDT`` marker-controlled
-watershed, since cuCIM has no watershed) and writes a ``uint32`` instance-label
-OME-Zarr (each object's voxels carry its point's row index + 1) plus a label-preserving
-pyramid.
+Instead of one global intensity threshold (which fails on dim/uneven objects), it
+optionally Gaussian-denoises the normalized intensity (``--smooth-sigma``, "smooth then
+segment"), assigns every voxel to its nearest seed via the Euclidean distance transform
+(a fully-GPU stand-in for a ``-EDT`` marker-controlled watershed, since cuCIM has no
+watershed), and carves each blob at a fraction of *its own seed's* brightness
+(``--seed-relative-threshold``) — so bright and dim blobs hug tightly and the background
+between seeds is excluded. Morphological cleanup (``--close-iterations`` /
+``--fill-holes`` / ``--dilate-iterations``) makes objects solid and well-formed, and a
+size filter (``--min-object-size`` / ``--max-object-size``) drops specks and over-grown
+blobs. Optionally, ``--merge-core-threshold`` merges several seeds sharing one bright
+blob into a single object (seeds separated by an intensity valley still split). It
+writes a ``uint32`` instance-label OME-Zarr (each object's voxels carry its point's row
+index + 1) plus a label-preserving pyramid. (``params.json`` supplies only normalize/
+flat-field keys; its ``smooth_sigma`` is a model param, ignored here — use
+``--smooth-sigma``.)
 
 Because objects are small, each block + halo is segmented **independently** — the
 seed's array index is its global instance ID, so there is no cross-block merging /
@@ -34,6 +43,10 @@ import argparse
 import logging
 import re
 import sys
+import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
 
 import numpy as np
 import tensorstore as ts
@@ -47,6 +60,7 @@ from aind_torch_utils.correction import (  # noqa: E402
 from aind_torch_utils.labeling import (  # noqa: E402
     block_ranges,
     bucket_points,
+    merge_seed_groups,
     rescale_points,
     region_seeds,
 )
@@ -126,16 +140,165 @@ def _expand(core, halo, nz, ny, nx):
     )
 
 
+def _norm_sigma(values):
+    """Normalize --smooth-sigma to a (z, y, x) tuple (broadcast a single value)."""
+    if len(values) == 1:
+        return tuple(values) * 3
+    if len(values) == 3:
+        return tuple(values)
+    raise SystemExit("--smooth-sigma takes 1 value (isotropic) or 3 (z y x).")
+
+
+def _size_keep(assigned, k, min_size, max_size, cp):
+    """Boolean keep[0..k]: local labels whose voxel count is within [min, max].
+
+    ``assigned`` holds the per-voxel local object label (0 = background). Counts are
+    over the (cleaned) block+halo, which is the full object for the owning chunk.
+    """
+    counts = cp.bincount(assigned.ravel(), minlength=k + 1)
+    keep = cp.ones(k + 1, dtype=bool)
+    if min_size > 0:
+        keep &= counts >= min_size
+    if max_size > 0:
+        keep &= counts <= max_size
+    keep[0] = False  # background never kept
+    return keep
+
+
+def _clean_mask(mask, cndi, close_iters, fill_holes, dilate_iters):
+    """Morphological cleanup so objects look solid and well-formed.
+
+    Closing bridges small gaps and smooths edges, hole-filling solidifies interiors,
+    and dilation makes objects fuller. Applied to the binary carve before the
+    nearest-seed relabel, so touching objects still split at the Voronoi midplane
+    (boundaries stay crisp) even if closing/dilation bridges them.
+    """
+    if close_iters > 0:
+        mask = cndi.binary_closing(mask, iterations=int(close_iters), brute_force=True)
+    if fill_holes:
+        mask = cndi.binary_fill_holes(mask)
+    if dilate_iters > 0:
+        mask = cndi.binary_dilation(
+            mask, iterations=int(dilate_iters), brute_force=True
+        )
+    return mask
+
+
+def _prep_block(data, exp, cell_points, block, cfg, bg_field):
+    """Host-side flat-field + normalize + seed extraction (runs off the GPU thread).
+
+    Returns ``(norm_host, coords, ids)`` so the GPU consumer only uploads and computes.
+    """
+    ez0, ez1, ey0, ey1, ex0, ex1 = exp
+    vol = data.astype(np.float32, copy=False)
+    if cfg.flatfield and bg_field is not None:
+        bg = sample_background(
+            bg_field.field, bg_field.scale, ez0, ez1, ey0, ey1, ex0, ex1
+        )
+        vol = apply_flatfield(
+            vol, bg, mode=cfg.flatfield_mode, eps=cfg.eps, bg_mean=bg_field.mean
+        )
+    norm_host = normalize_global(vol, cfg.norm_lower, cfg.norm_upper, cfg.eps)
+    coords, ids = region_seeds(cell_points, block, exp)
+    return norm_host, coords, ids
+
+
+def _seed_groups(mask, norm, lz, ly, lx, local_to_global, threshold, cp, cndi):
+    """Group seeds sharing a bright intensity core -> (local_to_group, group_to_global).
+
+    A "core" is ``mask & (norm >= threshold)``. Seeds whose cores are connected at that
+    (higher) level merge into one object; seeds separated by an intensity valley (or
+    dimmer than ``threshold``) stay separate. See :func:`labeling.merge_seed_groups`.
+    """
+    core_comp, _ = cndi.label(mask & (norm >= threshold))
+    seed_core = cp.asnumpy(core_comp[lz, ly, lx])
+    return merge_seed_groups(seed_core, local_to_global[1:])
+
+
+def _segment_block(norm, coords, ids, exp, args, cp, cndi):
+    """GPU per-block: markers -> nearest-seed carve -> morphology -> size filter.
+
+    ``norm`` is the (smoothed) normalized intensity already on the GPU. Returns
+    ``(labels_uint32, k)`` for the full expanded block; the caller crops to the core.
+    cuCIM has no watershed, so each voxel takes its nearest seed via the Euclidean
+    feature transform (== the ``-EDT`` watershed for point markers).
+    """
+    ez0, ey0, ex0 = exp[0], exp[2], exp[4]
+    k = int(ids.shape[0])
+    labels = cp.zeros(norm.shape, dtype=cp.uint32)
+    if not k:
+        return labels, 0
+    markers = cp.zeros(norm.shape, dtype=cp.int32)
+    local_to_global = np.zeros(k + 1, dtype=np.uint32)
+    lz = cp.asarray(coords[:, 0] - ez0)
+    ly = cp.asarray(coords[:, 1] - ey0)
+    lx = cp.asarray(coords[:, 2] - ex0)
+    markers[lz, ly, lx] = cp.arange(1, k + 1, dtype=cp.int32)
+    local_to_global[1:] = ids
+    # return_distances=False -> the indices array is returned alone (no tuple).
+    inds = cndi.distance_transform_edt(
+        markers == 0, return_distances=False, return_indices=True
+    )
+    nearest = markers[inds[0], inds[1], inds[2]]  # nearest seed's local label
+    seed_int = norm[inds[0], inds[1], inds[2]]  # nearest seed's intensity
+    # Carve at a fraction of the nearest seed's brightness + an absolute floor.
+    mask = (norm >= args.seed_relative_threshold * seed_int) & (
+        norm >= args.seed_flood_threshold
+    )
+    if args.seed_sphere_radius > 0:  # guarantee a core at each seed
+        mask = mask | cndi.binary_dilation(
+            markers > 0,
+            iterations=int(args.seed_sphere_radius),
+            brute_force=True,  # cupyx implements only brute_force here
+        )
+    # Solidify/smooth so objects look full with clear boundaries.
+    mask = _clean_mask(
+        mask, cndi, args.close_iterations, args.fill_holes, args.dilate_iterations
+    )
+    # Label the CARVED mask into connected components.
+    comp, _ = cndi.label(mask)
+    # A voxel may only take a seed that lies in ITS OWN component: the nearest seed's
+    # component must equal the voxel's. This keeps every ID inside one connected
+    # component (no leaking across a background gap into a neighbour), still splits
+    # touching objects among their own seeds, and drops no-seed blobs (their nearest
+    # seed is foreign).
+    comp_of_nearest = comp[inds[0], inds[1], inds[2]]
+    assigned = cp.where(mask & (comp == comp_of_nearest), nearest, cp.int32(0))
+    # Map local seed labels -> compact object "groups": identity (one object per seed),
+    # or merged so seeds sharing a bright intensity core become one object.
+    if args.merge_core_threshold > 0:
+        local_to_group, group_to_global = _seed_groups(
+            mask, norm, lz, ly, lx, local_to_global, args.merge_core_threshold, cp, cndi
+        )
+    else:
+        local_to_group = np.arange(k + 1, dtype=np.int64)
+        group_to_global = local_to_global
+    assigned = cp.asarray(local_to_group)[assigned]  # local label -> group index
+    if args.min_object_size > 0 or args.max_object_size > 0:
+        n_groups = group_to_global.shape[0] - 1  # size filter counts the whole object
+        keep = _size_keep(
+            assigned, n_groups, args.min_object_size, args.max_object_size, cp
+        )
+        assigned = cp.where(keep[assigned], assigned, cp.int32(0))
+    return (
+        cp.asarray(group_to_global)[assigned],
+        k,
+    )  # group -> global uint32 (0 stays 0)
+
+
+def _write_block(out, core, data):
+    """Write the cropped label block to its core region (runs in a writer thread)."""
+    z0, z1, y0, y1, x0, x1 = core
+    out[0, 0, z0:z1, y0:y1, x0:x1].write(data).result()
+
+
 def _seeded_segment(args, base_path, level, in_store, cell_points, bg_field, cfg):
     """Per-chunk GPU EDT nearest-seed labeling from points -> uint32 instance labels.
 
-    For each block + halo: flat-field + normalize the intensity, build a foreground mask
-    (permissive threshold OR a sphere around each seed), rasterize the chunk's seeds as
-    local markers, assign each foreground voxel to its nearest seed via the Euclidean
-    distance-transform feature map (equivalent to a ``-EDT`` marker-controlled watershed
-    for point markers) while dropping foreground blobs with no seed, map to the seeds'
-    global IDs, crop to the core, and write. Halo seeds give cross-boundary objects the
-    right basin; core-crop => each object written once.
+    Pipelined to keep the GPU busy: a producer thread does the host flat-field/normalize
+    (numpy is CPU-only) for the next block while the GPU processes the current one, and
+    a writer pool does the S3 writes in the background. The GPU consumer loop only
+    uploads, runs :func:`_segment_block`, and hands the cropped core off to be written.
     """
     import cupy as cp
     import cupyx.scipy.ndimage as cndi
@@ -161,71 +324,51 @@ def _seeded_segment(args, base_path, level, in_store, cell_points, bg_field, cfg
         region,
     )
 
+    # Producer: prefetched read + host prep -> bounded queue (overlaps the GPU work).
+    ready = Queue(maxsize=max(2, args.ccl_readahead))
+
+    def _producer():
+        try:
+            reads = _prefetch_blocks(in_store, exps, args.ccl_readahead, "seeded")
+            for (exp, data), core in zip(reads, cores):
+                prepped = _prep_block(data, exp, cell_points, block, cfg, bg_field)
+                ready.put((core, exp) + prepped)
+        finally:
+            ready.put(None)  # sentinel
+
+    prod = threading.Thread(target=_producer, daemon=True)
+    prod.start()
+
+    n_writers = max(2, args.ccl_readahead // 2)
+    writer = ThreadPoolExecutor(max_workers=n_writers)
+    pending = deque()
     n_objects = 0
-    reads = _prefetch_blocks(in_store, exps, args.ccl_readahead, "seeded")
-    for (exp, data), core in zip(reads, cores):
-        ez0, ez1, ey0, ey1, ex0, ex1 = exp
-
-        # Flat-field + global-normalize the (expanded) intensity, like PrepWorker.
-        vol = data.astype(np.float32, copy=False)
-        if cfg.flatfield and bg_field is not None:
-            bg = sample_background(
-                bg_field.field, bg_field.scale, ez0, ez1, ey0, ey1, ex0, ex1
-            )
-            vol = apply_flatfield(
-                vol, bg, mode=cfg.flatfield_mode, eps=cfg.eps, bg_mean=bg_field.mean
-            )
-        norm = cp.asarray(
-            normalize_global(vol, cfg.norm_lower, cfg.norm_upper, cfg.eps)
-        )
-
-        # Seeds in this block+halo -> local markers 1..k, with a local->global ID map.
-        coords, ids = region_seeds(cell_points, block, exp)
-        k = int(ids.shape[0])
-        markers = cp.zeros(norm.shape, dtype=cp.int32)
-        local_to_global = np.zeros(k + 1, dtype=np.uint32)
-        if k:
-            lz = cp.asarray(coords[:, 0] - ez0)
-            ly = cp.asarray(coords[:, 1] - ey0)
-            lx = cp.asarray(coords[:, 2] - ex0)
-            markers[lz, ly, lx] = cp.arange(1, k + 1, dtype=cp.int32)
-            local_to_global[1:] = ids
-            n_objects += k
-
-        # Foreground: permissive threshold, plus a sphere around each seed so dim
-        # objects (below threshold) still have a growable core.
-        fg = norm >= args.seed_flood_threshold
-        if k and args.seed_sphere_radius > 0:
-            fg = fg | cndi.binary_dilation(
-                markers > 0, iterations=int(args.seed_sphere_radius)
-            )
-
-        # cuCIM has no watershed. Assign each fg voxel to its nearest seed via the
-        # Euclidean feature transform (== the -EDT watershed for point markers), but
-        # only inside a fg connected component that contains a seed -> no-seed blobs
-        # are dropped, dim seeded objects are captured whole, and touching (multi-seed)
-        # blobs split at the midplane.
-        comp, ncomp = cndi.label(fg)
-        labels = cp.zeros(norm.shape, dtype=cp.uint32)
-        if k:
-            _, inds = cndi.distance_transform_edt(
-                markers == 0, return_distances=False, return_indices=True
-            )
-            nearest = markers[inds[0], inds[1], inds[2]]  # nearest seed's local label
-            has_seed = cp.zeros(int(ncomp) + 1, dtype=bool)
-            sc = comp[markers > 0]
-            has_seed[sc[sc > 0]] = True  # comps with >=1 seed (skip bg=0)
-            g = cp.asarray(local_to_global)  # local id -> global uint32 id
-            labels = cp.where(fg & has_seed[comp], g[nearest], cp.uint32(0))
-
+    while True:
+        item = ready.get()
+        if item is None:
+            break
+        core, exp, norm_host, coords, ids = item
+        norm = cp.asarray(norm_host)
+        if any(s > 0 for s in args.smooth_sigma):
+            norm = cndi.gaussian_filter(norm, sigma=tuple(args.smooth_sigma))
+        labels, k = _segment_block(norm, coords, ids, exp, args, cp, cndi)
+        n_objects += k
         z0, z1, y0, y1, x0, x1 = core
-        # Core's local offset within the expanded block, hoisted to simple slice bounds.
-        lz0, ly0, lx0 = z0 - ez0, y0 - ey0, x0 - ex0
+        lz0, ly0, lx0 = z0 - exp[0], y0 - exp[2], x0 - exp[4]
         lz1, ly1, lx1 = lz0 + (z1 - z0), ly0 + (y1 - y0), lx0 + (x1 - x0)
-        crop = labels[lz0:lz1, ly0:ly1, lx0:lx1]
-        out[0, 0, z0:z1, y0:y1, x0:x1].write(cp.asnumpy(crop)).result()
-        del vol, norm, markers, fg, comp, labels, crop
+        crop_host = cp.asnumpy(labels[lz0:lz1, ly0:ly1, lx0:lx1])
+        del norm, labels
+        # Return cached free blocks each block; the EDT feature transform needs a large
+        # contiguous allocation and the pool fragments over many blocks.
+        cp.get_default_memory_pool().free_all_blocks()
+        pending.append(writer.submit(_write_block, out, core, crop_host))
+        while len(pending) > 2 * n_writers:  # backpressure: bound in-flight writes
+            pending.popleft().result()
 
+    for fut in pending:
+        fut.result()
+    writer.shutdown()
+    prod.join()
     logger.info(
         "[seeded] wrote uint32 instance labels to %s%s/ (%d seeded objects)",
         base_path,
@@ -328,7 +471,26 @@ def _parse_args(argv):
         "--seed-flood-threshold",
         type=float,
         default=0.05,
-        help="Normalized intensity threshold for the foreground mask.",
+        help="Absolute intensity floor: a voxel must be at least this (normalized) to "
+        "be foreground at all, regardless of the relative threshold. Excludes "
+        "near-zero background.",
+    )
+    ap.add_argument(
+        "--seed-relative-threshold",
+        type=float,
+        default=0.5,
+        help="Carve each blob at this fraction of ITS NEAREST SEED's intensity: keep a "
+        "voxel when norm >= this * seed_intensity. Higher = tighter hug (less "
+        "background), lower = grows more. Handles bright and dim blobs uniformly.",
+    )
+    ap.add_argument(
+        "--merge-core-threshold",
+        type=float,
+        default=0.0,
+        help="Merge multiple seeds that share one bright blob into a SINGLE object: "
+        "seeds whose cores (norm >= this) stay connected merge; a dip below this "
+        "between them (an intensity valley) keeps them split. Set above --seed-flood "
+        "and below the blob peak. 0 = off (one object per seed).",
     )
     ap.add_argument(
         "--watershed-surface",
@@ -344,6 +506,50 @@ def _parse_args(argv):
         default=-1,
         help="Dilate each seed by this radius into the foreground mask so "
         "dim objects have a growable core. -1 = auto (factor/2 + 1).",
+    )
+    ap.add_argument(
+        "--smooth-sigma",
+        type=float,
+        nargs="+",
+        default=[0.0],
+        help="Gaussian sigma (voxels) applied to the normalized intensity BEFORE the "
+        "carve, to denoise. One value = isotropic; three = (z, y, x). 0 = off. Try "
+        "~0.7 (or '0.5 1 1' for anisotropic data). params.json 'smooth_sigma' is "
+        "ignored here.",
+    )
+    ap.add_argument(
+        "--close-iterations",
+        type=int,
+        default=0,
+        help="Binary-closing iterations on each object mask: smooths edges and "
+        "bridges small gaps so objects are well-formed (0 = off).",
+    )
+    ap.add_argument(
+        "--fill-holes",
+        action="store_true",
+        help="Fill enclosed holes in each object so masks look solid, not patchy.",
+    )
+    ap.add_argument(
+        "--dilate-iterations",
+        type=int,
+        default=0,
+        help="Dilate each object by this many voxels so masks look fuller. Bounded "
+        "by the nearest-seed Voronoi split, so boundaries between objects stay clear "
+        "(0 = off).",
+    )
+    ap.add_argument(
+        "--min-object-size",
+        type=int,
+        default=0,
+        help="Drop objects smaller than this many voxels (measured on the final "
+        "smoothed+carved+cleaned object, at the seg level). 0 = off.",
+    )
+    ap.add_argument(
+        "--max-object-size",
+        type=int,
+        default=0,
+        help="Drop objects larger than this many voxels (removes over-grown blobs "
+        "from bad seeds). 0 = off (no cap).",
     )
     ap.add_argument(
         "--no-pyramid",
@@ -371,6 +577,7 @@ def main(argv=None):
             "--watershed-surface intensity is not implemented (cuCIM has no "
             "watershed); falling back to 'edt' (nearest-seed)."
         )
+    args.smooth_sigma = _norm_sigma(args.smooth_sigma)
     spec = args.in_spec
 
     bucket, group_path, level = _spec_level_and_group(spec)
@@ -411,6 +618,7 @@ def main(argv=None):
 
     # Load points, rescale, index by block cell.
     pts = np.load(args.seeds)
+    pts = pts[:, :3]
     if pts.ndim != 2 or pts.shape[1] != 3:
         raise ValueError(f"--seeds must be (N,3) (z,y,x); got shape {pts.shape}.")
     ids = np.arange(1, pts.shape[0] + 1, dtype=np.uint32)  # ID = row index + 1

@@ -5,6 +5,7 @@ from aind_torch_utils.labeling import (
     UnionFind,
     block_ranges,
     bucket_points,
+    merge_seed_groups,
     region_seeds,
     rescale_points,
     union_faces,
@@ -226,3 +227,42 @@ def test_region_seeds_gathers_and_filters_to_bbox():
     # empty region.
     _, i3 = region_seeds(cells, block=8, bbox=(0, 4, 8, 12, 0, 4))
     assert i3.tolist() == []
+
+
+def test_merge_seed_groups_merges_shared_core_to_min_id():
+    # Seeds 0,1 share core 5 -> merge (repr = min global id 10); seed 2 in core 7 alone;
+    # seed 3 has core 0 (dimmer than threshold) -> stays its own group.
+    seed_core = np.array([5, 5, 7, 0], dtype=np.int64)
+    global_ids = np.array([10, 12, 20, 30], dtype=np.uint32)
+    local_to_group, group_to_global = merge_seed_groups(seed_core, global_ids)
+
+    assert local_to_group[0] == 0  # background
+    # seeds 0 and 1 (local labels 1,2) land in the same group.
+    assert local_to_group[1] == local_to_group[2]
+    assert local_to_group[3] != local_to_group[1]  # different core
+    assert local_to_group[4] != local_to_group[1]  # core-0 singleton
+    # groups are compact 1..G.
+    assert sorted(set(local_to_group[1:].tolist())) == [1, 2, 3]
+    # representative global id = smallest in the group.
+    assert group_to_global[local_to_group[1]] == 10  # min(10, 12)
+    assert group_to_global[local_to_group[3]] == 20
+    assert group_to_global[local_to_group[4]] == 30
+    assert group_to_global[0] == 0
+    assert group_to_global.dtype == np.uint32
+
+
+def test_merge_seed_groups_all_core_zero_stay_separate():
+    # No seed in a core -> every seed is its own object (identity-like grouping).
+    seed_core = np.array([0, 0, 0], dtype=np.int64)
+    global_ids = np.array([7, 8, 9], dtype=np.uint32)
+    local_to_group, group_to_global = merge_seed_groups(seed_core, global_ids)
+    assert sorted(set(local_to_group[1:].tolist())) == [1, 2, 3]  # all distinct
+    assert sorted(group_to_global[1:].tolist()) == [7, 8, 9]
+
+
+def test_merge_seed_groups_empty():
+    local_to_group, group_to_global = merge_seed_groups(
+        np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.uint32)
+    )
+    assert local_to_group.tolist() == [0]
+    assert group_to_global.tolist() == [0]

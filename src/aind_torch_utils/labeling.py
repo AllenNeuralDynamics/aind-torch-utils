@@ -163,3 +163,37 @@ def region_seeds(cell_points: dict, block: int, bbox):
         & (coords[:, 2] < x1)
     )
     return coords[m], ids[m]
+
+
+def merge_seed_groups(seed_core: np.ndarray, global_ids: np.ndarray):
+    """Group seeds that share an intensity core -> compact object groups.
+
+    ``seed_core[i]`` is the connected-core label at seed ``i`` (0 = the seed is not in a
+    core, e.g. dimmer than the merge threshold). ``global_ids[i]`` is seed ``i``'s
+    global instance id (its point index + 1). Seeds sharing the same core (>0) merge
+    into one object; seeds with core 0 stay separate (each its own group). Returns:
+
+    - ``local_to_group`` ``(k + 1,)`` int64: maps a local seed label (1..k, 0 = bg) to
+      a compact group index (1..G, 0 stays 0).
+    - ``group_to_global`` ``(G + 1,)`` uint32: maps a group to its representative global
+      id (the **smallest** global id in the group; ``[0] = 0``).
+    """
+    k = int(global_ids.shape[0])
+    if k == 0:
+        return (
+            np.zeros(1, dtype=np.int64),
+            np.zeros(1, dtype=np.uint32),
+        )
+    keys = np.asarray(seed_core, dtype=np.int64).copy()
+    away = keys == 0  # seeds not in any core -> unique negative key each (never merge)
+    if away.any():
+        keys[away] = -np.arange(1, int(away.sum()) + 1, dtype=np.int64)
+    uniq, inv = np.unique(keys, return_inverse=True)  # inv in [0, G)
+    local_to_group = np.zeros(k + 1, dtype=np.int64)
+    local_to_group[1:] = inv + 1  # groups 1..G
+    gids = np.asarray(global_ids, dtype=np.uint32)
+    repr_u = np.full(uniq.size, np.iinfo(np.uint32).max, dtype=np.uint32)
+    np.minimum.at(repr_u, inv, gids)
+    group_to_global = np.zeros(uniq.size + 1, dtype=np.uint32)
+    group_to_global[1:] = repr_u
+    return local_to_group, group_to_global
