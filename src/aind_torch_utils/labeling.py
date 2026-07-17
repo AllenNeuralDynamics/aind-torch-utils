@@ -197,3 +197,125 @@ def merge_seed_groups(seed_core: np.ndarray, global_ids: np.ndarray):
     group_to_global = np.zeros(uniq.size + 1, dtype=np.uint32)
     group_to_global[1:] = repr_u
     return local_to_group, group_to_global
+
+
+def _union_group(uf, grp, coords, max_dist):
+    """Union the seeds in ``grp`` (a bright-ridge group), optionally distance-gated.
+
+    ``max_dist <= 0`` (or no coords): union the whole group. Otherwise union only pairs
+    whose centroids are within ``max_dist`` voxels (single-linkage), so far-apart seeds
+    on the same ridge are not merged.
+    """
+    if grp.size < 2:
+        return
+    if coords is not None and max_dist > 0:
+        pts = np.asarray(coords, dtype=np.float64)[grp]
+        d2 = ((pts[:, None, :] - pts[None, :, :]) ** 2).sum(-1)
+        ii, jj = np.nonzero(np.triu(d2 <= max_dist * max_dist, 1))
+        for a, b in zip(grp[ii], grp[jj]):
+            uf.union(int(a), int(b))
+    else:
+        for a, b in zip(grp[:-1], grp[1:]):
+            uf.union(int(a), int(b))
+
+
+def flood_seed_union(
+    seed_intensity,
+    seed_comp,
+    level_labels,
+    levels,
+    min_level,
+    coords=None,
+    max_dist=0.0,
+):
+    """Union seeds joined by a shallow intensity saddle (superlevel-set flooding).
+
+    Decides which seeds sit on the same object by the **valley between them**: flood
+    each seed's peak downward and union two seeds once they share a bright
+    super-threshold region, but only while each is still within its own flood band. A
+    valley deeper than a seed's band closes it off, so the floods never meet there and
+    the seeds stay separate.
+
+    Parameters
+    ----------
+    seed_intensity : (k,) float
+        Normalized intensity at each seed voxel.
+    seed_comp : (k,) int
+        Each seed's mask connected-component (blob) id. Unions are only allowed within
+        the same blob, so a super-threshold bridge that doesn't exist in the carved
+        mask can't merge seeds across components.
+    level_labels : (L, k) int
+        ``level_labels[l, i]`` = the connected-component label of seed ``i`` in
+        ``{norm >= levels[l]}`` (0 if seed ``i`` is below that level or in background).
+    levels : (L,) float
+        Flood levels, **descending** (high -> low).
+    min_level : (k,) float
+        Lowest level each seed may union at (its flood floor). The brightness prior
+        lives here: relative ``si * (1 - frac)`` or absolute ``si - depth`` (set by
+        the caller).
+    coords : (k, 3) int, optional
+        Per-seed ``(z, y, x)`` at the segmentation level. Required for ``max_dist``.
+    max_dist : float
+        If > 0, only merge seeds whose centroids are within this many voxels
+        (single-linkage), in addition to the valley test. 0 = no distance limit.
+
+    Returns
+    -------
+    (k,) int64
+        Per-seed 1-based group key (union-find root + 1, so 0 never occurs) suitable as
+        the ``seed_core`` argument to :func:`merge_seed_groups`.
+    """
+    k = int(seed_intensity.shape[0])
+    uf = UnionFind(k)
+    si = np.asarray(seed_intensity, dtype=np.float64)
+    scomp = np.asarray(seed_comp, dtype=np.int64)
+    mlv = np.asarray(min_level, dtype=np.float64)
+    for lev_labels, lev in zip(level_labels, levels):
+        lab = np.asarray(lev_labels, dtype=np.int64)
+        active = (si >= lev) & (lev >= mlv) & (lab > 0)  # seed still in its flood band
+        idx = np.nonzero(active)[0]
+        if idx.size < 2:
+            continue
+        # Group seeds sharing (same blob comp, same superlevel comp) at this level, then
+        # union within each group (distance-gated by _union_group when max_dist > 0).
+        key = scomp[idx] * (int(lab.max()) + 1) + lab[idx]
+        order = np.argsort(key, kind="stable")
+        idx_s, key_s = idx[order], key[order]
+        bounds = np.nonzero(key_s[1:] != key_s[:-1])[0] + 1
+        starts = np.concatenate(([0], bounds))
+        stops = np.concatenate((bounds, [idx_s.size]))
+        for s, e in zip(starts.tolist(), stops.tolist()):
+            _union_group(uf, idx_s[s:e], coords, max_dist)
+    return (
+        uf.flatten_roots()[:k].astype(np.int64) + 1
+    )  # 1-based (0 = singleton in caller)
+
+
+def adjacency_merge(edges, group_key):
+    """Intersect a proposed seed grouping with cell adjacency -> connected groups.
+
+    A merge (flood/core) proposes which seeds are one object via ``group_key`` (seeds
+    with equal keys want to merge; singletons already have distinct keys). This unions
+    two seeds only if their cells are **adjacent** AND share the proposed group, so a
+    final group is a connected chain of touching cells (no disconnected same-id pieces).
+
+    Parameters
+    ----------
+    edges : (E, 2) int
+        Adjacent local-label pairs (1-based labels; from touching cells in the labels).
+    group_key : (k,) int
+        Proposed group per local label (index i -> label i + 1).
+
+    Returns
+    -------
+    (k,) int64
+        Per-seed 1-based group key (union-find root + 1) for :func:`merge_seed_groups`.
+    """
+    k = int(np.asarray(group_key).shape[0])
+    uf = UnionFind(k)
+    gk = np.asarray(group_key)
+    e = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
+    for a, b in e:
+        if gk[a - 1] == gk[b - 1]:  # adjacent cells that want the same group -> merge
+            uf.union(int(a) - 1, int(b) - 1)
+    return uf.flatten_roots()[:k].astype(np.int64) + 1

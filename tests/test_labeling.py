@@ -1,10 +1,13 @@
 """Tests for the pure-numpy connected-components stitching helpers."""
+
 import numpy as np
 
 from aind_torch_utils.labeling import (
     UnionFind,
+    adjacency_merge,
     block_ranges,
     bucket_points,
+    flood_seed_union,
     merge_seed_groups,
     region_seeds,
     rescale_points,
@@ -266,3 +269,83 @@ def test_merge_seed_groups_empty():
     )
     assert local_to_group.tolist() == [0]
     assert group_to_global.tolist() == [0]
+
+
+def test_flood_seed_union_shallow_merges_deep_splits():
+    # Seeds 0 & 1 (both in blob comp 1) are joined by a shallow saddle at level 0.8;
+    # seed 2 only connects to them at 0.6 (a deep valley). With frac=0.2 -> floors at
+    # si*(1-0.2)=0.72/0.64/0.72, so 0,1 merge (meet at 0.8 >= their floors) but seed 2
+    # (floor 0.72) is inactive by the time they all connect at 0.6 -> stays separate.
+    si = np.array([0.9, 0.8, 0.9])
+    seed_comp = np.array([1, 1, 1])
+    levels = np.array([0.9, 0.8, 0.7, 0.6])
+    level_labels = np.array(
+        [
+            [1, 0, 2],  # 0.9: seed1 below level -> 0
+            [1, 1, 2],  # 0.8: seeds 0,1 share comp 1; seed 2 separate
+            [1, 1, 2],  # 0.7
+            [1, 1, 1],  # 0.6: all connected (deep valley)
+        ]
+    )
+    min_level = si * (1 - 0.2)
+    key = flood_seed_union(si, seed_comp, level_labels, levels, min_level)
+    assert key[0] == key[1]  # shallow saddle -> merged
+    assert key[2] != key[0]  # deep valley -> separate
+
+
+def test_flood_seed_union_max_distance_gate():
+    # Three seeds all valley-connected (share a bright ridge at every level, one blob).
+    # Seeds 0,1 are 3 voxels apart; seed 2 is 100 away. With max_dist=5 only 0,1 merge;
+    # with no distance limit all three merge.
+    si = np.array([1.0, 1.0, 1.0])
+    seed_comp = np.array([1, 1, 1])
+    levels = np.array([1.0, 0.7])
+    level_labels = np.array([[1, 1, 1], [1, 1, 1]])
+    min_level = si * 0.5
+    coords = np.array([[0, 0, 0], [0, 0, 3], [0, 0, 100]], dtype=np.int64)
+
+    gated = flood_seed_union(
+        si, seed_comp, level_labels, levels, min_level, coords=coords, max_dist=5.0
+    )
+    assert gated[0] == gated[1]  # within 5 -> merged
+    assert gated[2] != gated[0]  # 100 away -> stays separate
+
+    free = flood_seed_union(si, seed_comp, level_labels, levels, min_level)
+    assert free[0] == free[1] == free[2]  # no distance limit -> all merge
+
+
+def test_adjacency_merge_only_touching_same_group():
+    # 4 seeds (labels 1..4). Proposed: {1,2,3} want to merge (key 7), 4 alone (key 9).
+    # Adjacency: 1-2 touch, 3 touches nobody in-group, 2-4 touch (different group).
+    # Expect: 1 & 2 merge; 3 stays separate (same group but not adjacent); 4 separate.
+    group_key = np.array([7, 7, 7, 9])
+    edges = np.array([[1, 2], [2, 4]])
+    final = adjacency_merge(edges, group_key)
+    assert final[0] == final[1]  # 1,2 same group + adjacent -> merged
+    assert final[2] != final[0]  # 3 same group but NOT adjacent -> separate
+    assert final[3] != final[0]  # 4 adjacent to 2 but different group -> separate
+    assert final[3] != final[1]
+
+
+def test_adjacency_merge_chain_transitive():
+    # 1-2 and 2-3 adjacent, all same group -> 1,2,3 merge transitively via the chain.
+    group_key = np.array([5, 5, 5])
+    edges = np.array([[1, 2], [2, 3]])
+    final = adjacency_merge(edges, group_key)
+    assert final[0] == final[1] == final[2]
+
+
+def test_adjacency_merge_no_edges():
+    final = adjacency_merge(np.empty((0, 2), dtype=np.int64), np.array([3, 3, 3]))
+    assert len(set(final.tolist())) == 3  # no adjacency -> nobody merges
+
+
+def test_flood_seed_union_same_comp_guard():
+    # Seeds 0 & 1 share a superlevel comp label but are in DIFFERENT blob components
+    # (a bridge that doesn't exist in the carved mask) -> must NOT union.
+    si = np.array([0.9, 0.9])
+    seed_comp = np.array([1, 2])  # different blobs
+    levels = np.array([0.9, 0.8])
+    level_labels = np.array([[1, 1], [1, 1]])  # same superlevel label
+    key = flood_seed_union(si, seed_comp, level_labels, levels, si * 0.5)
+    assert key[0] != key[1]  # cross-component union blocked

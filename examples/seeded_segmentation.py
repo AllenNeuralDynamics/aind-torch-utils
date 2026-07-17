@@ -4,19 +4,22 @@ Standalone companion to ``run_gfp_mask_example.py`` for when you already have a
 **point per object** (e.g. billions of bouton centers in a numpy ``(N, 3)`` array).
 Instead of one global intensity threshold (which fails on dim/uneven objects), it
 optionally Gaussian-denoises the normalized intensity (``--smooth-sigma``, "smooth then
-segment"), assigns every voxel to its nearest seed via the Euclidean distance transform
-(a fully-GPU stand-in for a ``-EDT`` marker-controlled watershed, since cuCIM has no
-watershed), and carves each blob at a fraction of *its own seed's* brightness
+segment"), carves each blob at a fraction of *its own seed's* brightness
 (``--seed-relative-threshold``) — so bright and dim blobs hug tightly and the background
-between seeds is excluded. Morphological cleanup (``--close-iterations`` /
+between seeds is excluded — then assigns voxels to seeds by marker-controlled **geodesic
+growth** through the carved mask (each id stays one connected region; cuCIM has no
+watershed). ``--grow-min-thickness`` makes splits blobbier (territories set by the thick
+cores, split at thin necks) without dropping seeded objects. Morphological cleanup
+(``--close-iterations`` /
 ``--fill-holes`` / ``--dilate-iterations``) makes objects solid and well-formed, and a
 size filter (``--min-object-size`` / ``--max-object-size``) drops specks and over-grown
-blobs. Optionally, ``--merge-core-threshold`` merges several seeds sharing one bright
-blob into a single object (seeds separated by an intensity valley still split). It
-writes a ``uint32`` instance-label OME-Zarr (each object's voxels carry its point's row
-index + 1) plus a label-preserving pyramid. (``params.json`` supplies only normalize/
-flat-field keys; its ``smooth_sigma`` is a model param, ignored here — use
-``--smooth-sigma``.)
+blobs. Optionally, ``--merge-valley-frac`` merges several seeds sharing one blob into a
+single object unless a deep intensity valley (relative to each seed's peak) separates
+them (and, with ``--merge-max-distance``, only if their centroids are within that many
+full-resolution voxels). It writes a ``uint32`` instance-label OME-Zarr (each object's
+voxels carry its point's row index + 1) plus a label-preserving pyramid.
+(``params.json`` supplies only normalize/flat-field keys; its ``smooth_sigma`` is a
+model param, ignored here — use ``--smooth-sigma``.)
 
 Because objects are small, each block + halo is segmented **independently** — the
 seed's array index is its global instance ID, so there is no cross-block merging /
@@ -58,8 +61,10 @@ from aind_torch_utils.correction import (  # noqa: E402
     sample_background,
 )
 from aind_torch_utils.labeling import (  # noqa: E402
+    adjacency_merge,
     block_ranges,
     bucket_points,
+    flood_seed_union,
     merge_seed_groups,
     rescale_points,
     region_seeds,
@@ -203,25 +208,165 @@ def _prep_block(data, exp, cell_points, block, cfg, bg_field):
     return norm_host, coords, ids
 
 
-def _seed_groups(mask, norm, lz, ly, lx, local_to_global, threshold, cp, cndi):
-    """Group seeds sharing a bright intensity core -> (local_to_group, group_to_global).
+def _core_key(mask, norm, lz, ly, lx, threshold, cp, cndi):
+    """Per-seed merge key from a bright intensity core (``mask & norm >= threshold``).
 
-    A "core" is ``mask & (norm >= threshold)``. Seeds whose cores are connected at that
-    (higher) level merge into one object; seeds separated by an intensity valley (or
-    dimmer than ``threshold``) stay separate. See :func:`labeling.merge_seed_groups`.
+    Seeds sharing a connected core get the same key (candidate merge); seeds with no
+    core (dimmer than ``threshold``) get distinct negative keys so they never merge.
     """
     core_comp, _ = cndi.label(mask & (norm >= threshold))
-    seed_core = cp.asnumpy(core_comp[lz, ly, lx])
-    return merge_seed_groups(seed_core, local_to_global[1:])
+    seed_core = cp.asnumpy(core_comp[lz, ly, lx]).astype(np.int64)
+    away = seed_core == 0
+    if away.any():
+        seed_core[away] = -np.arange(1, int(away.sum()) + 1, dtype=np.int64)
+    return seed_core
+
+
+def _flood_key(mask, norm, comp, lz, ly, lx, args, cp, cndi):
+    """Per-seed merge key from superlevel-set flooding (intensity-valley test).
+
+    Two seeds get the same key only if the saddle between them stays above their flood
+    floors (shallow valley) and they are within ``--merge-max-distance``. The floor is
+    relative to each seed's own intensity (``--merge-valley-frac``) or an absolute drop
+    (``--merge-valley-depth``). Distinct keys => no merge. See
+    :func:`labeling.flood_seed_union`.
+    """
+    si = cp.asnumpy(norm[lz, ly, lx])  # seed intensities (the prior)
+    scmp = cp.asnumpy(comp[lz, ly, lx])  # seed blob components
+    k = si.shape[0]
+    # Nothing to merge unless some blob holds >= 2 seeds -> distinct keys (no merge).
+    pos = scmp[scmp > 0]
+    if pos.size == 0 or int(np.bincount(pos).max()) < 2:
+        return np.arange(1, k + 1, dtype=np.int64)
+    if args.merge_valley_frac > 0:
+        min_level = si * (1.0 - args.merge_valley_frac)
+    else:
+        min_level = si - args.merge_valley_depth
+    lo = max(float(args.seed_flood_threshold), float(min_level.min()))
+    levels = np.linspace(float(si.max()), lo, int(args.merge_levels))
+    lev_lab = np.empty((levels.shape[0], k), dtype=np.int64)
+    for i, lev in enumerate(levels):
+        lab, _ = cndi.label(mask & (norm >= float(lev)))
+        lev_lab[i] = cp.asnumpy(lab[lz, ly, lx])
+    # coords in seg-level voxels -> scale per axis to full-res (level-0) voxels so
+    # --merge-max-distance is interpreted at the highest resolution.
+    coords = np.stack([cp.asnumpy(lz), cp.asnumpy(ly), cp.asnumpy(lx)], axis=1)
+    coords = coords.astype(np.float64) * np.asarray(args.merge_dist_scale)
+    return flood_seed_union(
+        si, scmp, lev_lab, levels, min_level, coords, args.merge_max_distance
+    )
+
+
+def _cell_adjacency(assigned, cp):
+    """Adjacent distinct local-label pairs (6-connectivity) from the labelled cells.
+
+    Returns a host ``(E, 2)`` array of 1-based label pairs whose cells touch; used to
+    restrict merging to cells that are actually connected.
+    """
+    kmax = int(assigned.max())
+    if kmax < 1:
+        return np.empty((0, 2), dtype=np.int64)
+    codes = []
+    for x, y in (
+        (assigned[:-1], assigned[1:]),
+        (assigned[:, :-1], assigned[:, 1:]),
+        (assigned[:, :, :-1], assigned[:, :, 1:]),
+    ):
+        m = (x > 0) & (y > 0) & (x != y)
+        if bool(m.any()):
+            u, v = x[m].astype(cp.int64), y[m].astype(cp.int64)
+            lo, hi = cp.minimum(u, v), cp.maximum(u, v)
+            codes.append(lo * (kmax + 1) + hi)
+    if not codes:
+        return np.empty((0, 2), dtype=np.int64)
+    uniq = cp.asnumpy(cp.unique(cp.concatenate(codes)))
+    return np.stack([uniq // (kmax + 1), uniq % (kmax + 1)], axis=1)
+
+
+def _object_groups(
+    assigned, mask, norm, comp, lz, ly, lx, local_to_global, args, cp, cndi
+):
+    """Map local seed labels -> object groups, merging only ADJACENT same-group cells.
+
+    A merge mode proposes which seeds are one object (flood/core key); the proposal is
+    intersected with cell adjacency so a merged id is a connected chain of cells
+    (no disconnected same-id pieces). Identity (no merge) returns one group per seed.
+    """
+    if args.merge_valley_frac > 0 or args.merge_valley_depth > 0:
+        key = _flood_key(mask, norm, comp, lz, ly, lx, args, cp, cndi)
+    elif args.merge_core_threshold > 0:
+        key = _core_key(mask, norm, lz, ly, lx, args.merge_core_threshold, cp, cndi)
+    else:
+        return np.arange(local_to_global.shape[0], dtype=np.int64), local_to_global
+    final_key = adjacency_merge(_cell_adjacency(assigned, cp), key)
+    return merge_seed_groups(final_key, local_to_global[1:])
+
+
+def _grow_labels(markers, grow_mask, cp, cndi):
+    """Marker-controlled geodesic growth: spread labels through ``grow_mask`` only.
+
+    Repeatedly dilate the labelled region into adjacent unlabelled foreground until
+    stable. Because labels only ever spread to neighbouring foreground voxels, every
+    labelled voxel stays connected to its seed (no straight-line jump across a gap).
+    Ties break by max label id (deterministic); foreground unreachable from any seed
+    stays 0.
+    """
+    labels = markers.copy()
+    for _ in range(int(max(labels.shape))):  # safety cap; converges in ~geodesic radius
+        grown = cndi.grey_dilation(labels, size=3)
+        nxt = cp.where((labels == 0) & grow_mask, grown, labels)
+        if bool((nxt == labels).all()):
+            break
+        labels = nxt
+    return labels
+
+
+def _assign_geodesic(markers, comp, ncomp, mask, lz, ly, lx, args, cp, cndi):
+    """Assign each foreground voxel to a seed by CONNECTIVITY (not straight-line dist).
+
+    Single-seed components are filled wholesale with their seed (connected by
+    construction); multi-seed components are grown geodesically from their seeds so each
+    cell stays connected to its seed (touching objects split at the geodesic midline).
+    No-seed components stay 0 (dropped). Returns local seed labels (0 = background).
+
+    With ``--grow-min-thickness t`` it is a two-stage growth: (1) grow each seed only
+    through the mask's thick core (distance-to-background >= t) so object *territories*
+    are set by the blobby cores and split at thin necks; (2) grow the SAME seeds through
+    the remaining full mask so thin material is attached to its nearest seed. So no
+    seeded object is dropped (every seed keeps its own connected id) while splits stay
+    centred on the thick cores. Only foreground unreachable from any seed stays 0.
+    """
+    if args.grow_min_thickness > 0:
+        edt = cndi.distance_transform_edt(mask)
+        thick = (mask & (edt >= args.grow_min_thickness)) | (markers > 0)
+        cores = _grow_labels(markers, thick, cp, cndi)  # thick cores set territories
+        return _grow_labels(cores, mask, cp, cndi)  # attach thin material to same seeds
+    n = int(ncomp) + 1
+    seed_comp = comp[lz, ly, lx]  # each seed's component
+    cnts = cp.bincount(seed_comp, minlength=n)  # seeds per component
+    local_labels = cp.arange(1, lz.shape[0] + 1, dtype=cp.int32)
+    comp_to_seed = cp.zeros(n, dtype=cp.int32)
+    comp_to_seed[seed_comp] = local_labels  # last-wins; kept only for single-seed comps
+    comp_to_seed = cp.where(cnts == 1, comp_to_seed, cp.int32(0))
+    comp_to_seed[0] = 0
+    assigned = comp_to_seed[comp]  # single-seed components filled directly
+    is_multi = cnts >= 2
+    if bool(is_multi.any()):
+        multi_vox = is_multi[comp]
+        grown = _grow_labels(
+            cp.where(multi_vox, markers, cp.int32(0)), mask & multi_vox, cp, cndi
+        )
+        assigned = cp.where(assigned > 0, assigned, grown)
+    return assigned
 
 
 def _segment_block(norm, coords, ids, exp, args, cp, cndi):
-    """GPU per-block: markers -> nearest-seed carve -> morphology -> size filter.
+    """GPU per-block: carve -> morphology -> geodesic seed assignment -> size filter.
 
     ``norm`` is the (smoothed) normalized intensity already on the GPU. Returns
     ``(labels_uint32, k)`` for the full expanded block; the caller crops to the core.
-    cuCIM has no watershed, so each voxel takes its nearest seed via the Euclidean
-    feature transform (== the ``-EDT`` watershed for point markers).
+    cuCIM has no watershed, so voxels are assigned to seeds by marker-controlled
+    geodesic growth through the carved mask (keeps each id one connected region).
     """
     ez0, ey0, ex0 = exp[0], exp[2], exp[4]
     k = int(ids.shape[0])
@@ -235,11 +380,10 @@ def _segment_block(norm, coords, ids, exp, args, cp, cndi):
     lx = cp.asarray(coords[:, 2] - ex0)
     markers[lz, ly, lx] = cp.arange(1, k + 1, dtype=cp.int32)
     local_to_global[1:] = ids
-    # return_distances=False -> the indices array is returned alone (no tuple).
+    # EDT feature transform -> per-voxel nearest-seed brightness for the carve only.
     inds = cndi.distance_transform_edt(
         markers == 0, return_distances=False, return_indices=True
     )
-    nearest = markers[inds[0], inds[1], inds[2]]  # nearest seed's local label
     seed_int = norm[inds[0], inds[1], inds[2]]  # nearest seed's intensity
     # Carve at a fraction of the nearest seed's brightness + an absolute floor.
     mask = (norm >= args.seed_relative_threshold * seed_int) & (
@@ -255,24 +399,15 @@ def _segment_block(norm, coords, ids, exp, args, cp, cndi):
     mask = _clean_mask(
         mask, cndi, args.close_iterations, args.fill_holes, args.dilate_iterations
     )
-    # Label the CARVED mask into connected components.
-    comp, _ = cndi.label(mask)
-    # A voxel may only take a seed that lies in ITS OWN component: the nearest seed's
-    # component must equal the voxel's. This keeps every ID inside one connected
-    # component (no leaking across a background gap into a neighbour), still splits
-    # touching objects among their own seeds, and drops no-seed blobs (their nearest
-    # seed is foreign).
-    comp_of_nearest = comp[inds[0], inds[1], inds[2]]
-    assigned = cp.where(mask & (comp == comp_of_nearest), nearest, cp.int32(0))
+    # Assign voxels to seeds by CONNECTIVITY (geodesic growth), so every id is one
+    # connected region tied to its seed -- no straight-line wrap-around into a blob.
+    comp, ncomp = cndi.label(mask)
+    assigned = _assign_geodesic(markers, comp, ncomp, mask, lz, ly, lx, args, cp, cndi)
     # Map local seed labels -> compact object "groups": identity (one object per seed),
-    # or merged so seeds sharing a bright intensity core become one object.
-    if args.merge_core_threshold > 0:
-        local_to_group, group_to_global = _seed_groups(
-            mask, norm, lz, ly, lx, local_to_global, args.merge_core_threshold, cp, cndi
-        )
-    else:
-        local_to_group = np.arange(k + 1, dtype=np.int64)
-        group_to_global = local_to_global
+    # or a merge mode (flood/core) that collapses seeds sharing one blob.
+    local_to_group, group_to_global = _object_groups(
+        assigned, mask, norm, comp, lz, ly, lx, local_to_global, args, cp, cndi
+    )
     assigned = cp.asarray(local_to_group)[assigned]  # local label -> group index
     if args.min_object_size > 0 or args.max_object_size > 0:
         n_groups = group_to_global.shape[0] - 1  # size filter counts the whole object
@@ -493,6 +628,40 @@ def _parse_args(argv):
         "and below the blob peak. 0 = off (one object per seed).",
     )
     ap.add_argument(
+        "--merge-valley-frac",
+        type=float,
+        default=0.0,
+        help="Merge seeds on one blob unless the intensity valley between them drops "
+        "below this fraction of their OWN peak (relative to each seed, so it adapts to "
+        "blobs dim in some regions). e.g. 0.3 tolerates a 30%%-of-peak dip; larger = "
+        "merges across deeper valleys. Recommended merge mode; takes precedence over "
+        "--merge-core-threshold. 0 = off.",
+    )
+    ap.add_argument(
+        "--merge-valley-depth",
+        type=float,
+        default=0.0,
+        help="Absolute-depth variant of --merge-valley-frac (flood floor = seed - "
+        "this, normalized). Used only if --merge-valley-frac is 0. 0 = off.",
+    )
+    ap.add_argument(
+        "--merge-levels",
+        type=int,
+        default=8,
+        help="Number of flood levels for the valley merge (more = finer saddle-depth "
+        "resolution, slower: adds this many label() passes on blocks that have "
+        "co-located seeds).",
+    )
+    ap.add_argument(
+        "--merge-max-distance",
+        type=float,
+        default=0.0,
+        help="With the valley merge, only merge seeds whose centroids are within this "
+        "many FULL-RESOLUTION (level-0) voxels; auto-scaled to the seg level by the "
+        "pyramid factor. Seeds farther apart stay separate even if joined by a bright "
+        "ridge. Single-linkage (chains of close seeds can still link). 0 = no limit.",
+    )
+    ap.add_argument(
         "--watershed-surface",
         choices=["edt", "intensity"],
         default="edt",
@@ -536,6 +705,15 @@ def _parse_args(argv):
         help="Dilate each object by this many voxels so masks look fuller. Bounded "
         "by the nearest-seed Voronoi split, so boundaries between objects stay clear "
         "(0 = off).",
+    )
+    ap.add_argument(
+        "--grow-min-thickness",
+        type=float,
+        default=0.0,
+        help="Blobbier splits without dropping points: territories are set by growing "
+        "seeds through mask regions at least this thick (distance to background, seg "
+        "voxels), splitting at thin necks; then thin material is attached to its "
+        "nearest seed (no seeded object dropped). 0 = off (grow the full shape).",
     )
     ap.add_argument(
         "--min-object-size",
@@ -608,12 +786,21 @@ def main(argv=None):
     factor = [s_seeds[a] / s_seg[a] for a in range(3)]
     if args.seed_sphere_radius < 0:
         args.seed_sphere_radius = int(round(max(factor) / 2)) + 1
+    # --merge-max-distance is given in full-resolution (level-0) voxels; this per-axis
+    # factor converts seg-level voxels -> level-0 voxels (~2**seg_level).
+    s0 = _scale_zyx(by_path["0"]) if "0" in by_path else None
+    if s0 is not None:
+        args.merge_dist_scale = tuple(s_seg[a] / s0[a] for a in range(3))
+    else:
+        args.merge_dist_scale = (float(2 ** int(level)),) * 3
     logger.info(
-        "Points @ level %s -> seg level %s, factor(z,y,x)=%s, seed-sphere r=%d",
+        "Points @ level %s -> seg level %s, factor(z,y,x)=%s, seed-sphere r=%d, "
+        "merge-dist scale(z,y,x)=%s",
         args.seeds_level,
         level,
         tuple(round(f, 3) for f in factor),
         args.seed_sphere_radius,
+        tuple(round(f, 3) for f in args.merge_dist_scale),
     )
 
     # Load points, rescale, index by block cell.
