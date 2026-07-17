@@ -35,6 +35,7 @@ import logging
 import os
 import re
 import sys
+import textwrap
 
 import numpy as np
 
@@ -338,6 +339,60 @@ def _multivariate_outliers(df, cols, frac):
     return df
 
 
+# One-paragraph explanation printed under each report page (self-documenting PDF).
+CAP_HIST = (
+    "Distribution of each metric over border-free objects. X is clipped to the "
+    "[0.5, 99.5] percentiles; heavy-tailed positive metrics use a log x-axis, the "
+    "rest linear. Y (count) is log so long tails stay visible."
+)
+CAP_CORR = (
+    "Pearson correlation between metrics (border-free objects). Red = positive, "
+    "blue = negative, grey near 0. Near-+/-1 pairs are redundant: volume vs "
+    "integrated intensity, std vs cv, the three int_std axes."
+)
+CAP_MAHAL = (
+    "Left: objects ranked by Mahalanobis distance d^2 (log y); the dashed line is "
+    "the top-fraction cutoff, so points above it are the flagged multivariate "
+    "outliers. Right: grey = 2D density of all object centroids (x-y); coloured dots "
+    "= flagged outliers (colour = z depth). Spread everywhere means the anomalies "
+    "are not spatially localized to one region."
+)
+CAP_SCATTER = (
+    "Blue hexbin = density of border-free objects for each metric pair (log count); "
+    "red = multivariate outliers (subsampled to 20k) at their true metric values. "
+    "The same red objects appear in every panel, so one can look normal here and "
+    "extreme there -- it was flagged for the joint combination, not a single axis."
+)
+CAP_RATE = (
+    "Outlier RATE = flagged objects / total objects per spatial bin (bins with < 20 "
+    "objects are blank). Left: x-y map; right: rate vs z with the overall baseline "
+    "(red dashed). Because it is normalized by local density, a genuine bad "
+    "tile/region rises above the flat baseline; raw counts just track tissue density."
+)
+CAP_PROFILES = (
+    "Per position bin along each axis: median object mean-intensity, median volume, "
+    "and object count, each divided by its own across-bin median (1.0 = typical). An "
+    "intensity ramp tracked by median volume => illumination affecting segmentation; "
+    "an intensity ramp with flat volume => flat-field imperfect but segmentation "
+    "robust. Count also reflects how much tissue sits in each slab."
+)
+CAP_GALLERY = (
+    "Each tile: z-max projection of the object's intensity crop, its mask outlined "
+    "in red; caption = object id and the value that flagged it. 'Multivariate' = top "
+    "by Mahalanobis d^2; '<metric> extremes' = the most extreme objects by that metric."
+)
+
+
+def _caption(fig, text, width=118):
+    """Reserve space at the bottom of ``fig`` and print a wrapped explanation there."""
+    lines = []
+    for para in text.split("\n"):
+        lines += textwrap.wrap(para, width) or [""]
+    frac = min(0.30, 0.045 + 0.022 * max(1, len(lines)))
+    fig.tight_layout(rect=(0.0, frac, 1.0, 1.0))
+    fig.text(0.5, 0.01, "\n".join(lines), ha="center", va="bottom", fontsize=7.5)
+
+
 def _hist_panel(ax, col, vals):
     """Draw one metric histogram with robust x-limits + log scaling where it helps."""
     ax.set_title(col, fontsize=8)
@@ -420,7 +475,7 @@ def _page_mahalanobis_spatial(pdf, fit, plt):
     axr.set_ylabel("y (µm)")
     axr.set_title(f"Outlier locations ({n_flag} flagged; grey = all-object density)")
     axr.set_aspect("equal")
-    fig.tight_layout()
+    _caption(fig, CAP_MAHAL)
     pdf.savefig(fig, dpi=150)
     plt.close(fig)
 
@@ -459,7 +514,7 @@ def _page_scatter_pairs(pdf, fit, plt):
     for ax in np.ravel(axes)[n_pairs:]:
         ax.axis("off")
     fig.suptitle("Feature-space (density = border-free; red = multivariate outliers)")
-    fig.tight_layout()
+    _caption(fig, CAP_SCATTER)
     pdf.savefig(fig, dpi=150)
     plt.close(fig)
 
@@ -507,7 +562,90 @@ def _page_outlier_rate(pdf, fit, plt):
     axr.set_ylabel("outlier rate")
     axr.set_title("Outlier rate vs z")
     axr.legend(fontsize=7)
-    fig.tight_layout()
+    _caption(fig, CAP_RATE)
+    pdf.savefig(fig, dpi=150)
+    plt.close(fig)
+
+
+def _normalize(arr, keep):
+    """Divide a per-bin profile by its median over well-populated bins; blank rest."""
+    a = np.array(arr, dtype=np.float64)
+    a[~keep] = np.nan
+    m = np.nanmedian(a)
+    return a / m if np.isfinite(m) and m != 0 else a
+
+
+def _axis_profile(pos, arrays, bins, min_count):
+    """Bin ``pos`` into ``bins``; return (centers, {label: normalized profile}).
+
+    Each profile is divided by its median over well-populated bins (>= ``min_count``);
+    sparser bins are NaN so tissue edges don't spike. ``arrays`` maps label ->
+    per-object values (median per bin); a ``count`` profile is always included. Returns
+    (None, {}) if there are too few objects.
+    """
+    good = np.isfinite(pos)
+    if int(good.sum()) < min_count:
+        return None, {}
+    lo, hi = np.percentile(pos[good], [0.5, 99.5])
+    if not hi > lo:
+        lo, hi = float(pos[good].min()), float(pos[good].max()) + 1.0
+    edges = np.linspace(lo, hi, bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    idx = np.where(good, np.clip(np.digitize(pos, edges) - 1, 0, bins - 1), -1)
+    order = np.argsort(idx, kind="stable")
+    idx_s = idx[order]
+    bnd = np.searchsorted(idx_s, np.arange(bins + 1))  # per-bin row ranges (-1 first)
+    cnt = (bnd[1:] - bnd[:-1]).astype(np.float64)
+    keep = cnt >= min_count
+    profiles = {"count": _normalize(cnt, keep)}
+    for label, arr in arrays.items():
+        arr_s = np.asarray(arr, dtype=np.float64)[order]
+        med = np.full(bins, np.nan)
+        for b in range(bins):
+            a0, a1 = int(bnd[b]), int(bnd[b + 1])
+            seg = arr_s[a0:a1]
+            seg = seg[np.isfinite(seg)]
+            if seg.size:
+                med[b] = np.median(seg)
+        profiles[label] = _normalize(med, keep)
+    return centers, profiles
+
+
+def _page_axis_profiles(pdf, fit, plt, bins=60):
+    """Per-axis spatial profiles to spot illumination affecting the segmentation.
+
+    Along each axis, an intensity gradient tracked by median object size => illumination
+    is affecting segmentation; intensity gradient with flat size => flat-field imperfect
+    but segmentation robust. Count is context only (confounded by how much tissue is in
+    each slab).
+    """
+    axes_info = [("z", "centroid_z_um"), ("y", "centroid_y_um"), ("x", "centroid_x_um")]
+    have = [(n, c) for (n, c) in axes_info if c in fit]
+    if not have or "mean_intensity" not in fit:
+        return
+    arrays = {"median intensity": fit["mean_intensity"].to_numpy(np.float64)}
+    if "volume_um3" in fit:
+        arrays["median volume"] = fit["volume_um3"].to_numpy(np.float64)
+    fig, axs = plt.subplots(len(have), 1, figsize=(9, 3.3 * len(have)), squeeze=False)
+    for ax, (name, poscol) in zip(axs[:, 0], have):
+        centers, profiles = _axis_profile(
+            fit[poscol].to_numpy(np.float64), arrays, bins, RATE_MIN_COUNT
+        )
+        if centers is None:
+            ax.set_title(f"along {name}: too few objects")
+            continue
+        for label, series in profiles.items():
+            ax.plot(centers, series, lw=1.0, label=label)
+        ax.axhline(1.0, color="k", lw=0.5, ls=":")
+        ax.set_xlabel(f"{name} (µm)")
+        ax.set_ylabel("normalized (÷ median)")
+        ax.set_title(f"Profiles along {name}")
+        ax.legend(fontsize=7)
+    fig.suptitle(
+        "Spatial profiles (÷ median): co-moving intensity + size ramp "
+        "=> illumination affecting segmentation"
+    )
+    _caption(fig, CAP_PROFILES)
     pdf.savefig(fig, dpi=150)
     plt.close(fig)
 
@@ -536,7 +674,7 @@ def _make_report(df, cols, out_dir):
         for ax in flat_axes[n_used:]:
             ax.axis("off")
         fig.suptitle("Per-metric distributions (border objects excluded)")
-        fig.tight_layout()
+        _caption(fig, CAP_HIST)
         pdf.savefig(fig)
         plt.close(fig)
 
@@ -549,7 +687,7 @@ def _make_report(df, cols, out_dir):
         ax.set_yticklabels(present, fontsize=6)
         fig.colorbar(im, ax=ax, fraction=0.046)
         ax.set_title("Feature correlation")
-        fig.tight_layout()
+        _caption(fig, CAP_CORR)
         pdf.savefig(fig)
         plt.close(fig)
 
@@ -560,6 +698,7 @@ def _make_report(df, cols, out_dir):
                 _page_mahalanobis_spatial,
                 _page_scatter_pairs,
                 _page_outlier_rate,
+                _page_axis_profiles,
             )
             for page in pages:
                 try:
@@ -663,7 +802,7 @@ def _render_section(pdf, plt, section, stores, scale, args, shape):
     for ax in flat[n:]:
         ax.axis("off")
     fig.suptitle(title, fontsize=9)
-    fig.tight_layout()
+    _caption(fig, CAP_GALLERY)
     pdf.savefig(fig)
     plt.close(fig)
 
