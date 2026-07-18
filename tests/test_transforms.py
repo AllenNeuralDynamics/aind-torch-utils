@@ -11,6 +11,7 @@ from aind_torch_utils.transforms import (
     Clip,
     GlobalNormalizer,
     IdentityTransform,
+    IntensityTransformAdapter,
     PercentileNormalizer,
     Sequential,
     from_config,
@@ -78,6 +79,85 @@ def test_identity_transform_is_noop():
     assert out is block
     assert state is None
     assert np.array_equal(ident.inverse(block, state, CTX), block)
+
+
+def test_intensity_transform_adapter_delegates_exactly():
+    """The adapter adds calling convention only, including no dtype coercion."""
+
+    class SourceTransform:
+        def __init__(self):
+            self.forward_input = None
+            self.inverse_input = None
+
+        def forward(self, array):
+            self.forward_input = array
+            return (array.astype(np.float32) / 3.0).astype(np.float32)
+
+        def inverse(self, array):
+            self.inverse_input = array
+            return np.rint(np.clip(array * 3.0, 0, 65535)).astype(np.uint16)
+
+    source = SourceTransform()
+    adapter = IntensityTransformAdapter(source)
+    block = np.array([-3, 0, 3, 60000], dtype=np.int32)
+
+    expected_forward = source.forward(block)
+    out, state = adapter.forward(block, CTX)
+    np.testing.assert_array_equal(out, expected_forward)
+    assert state is None
+    assert source.forward_input is block
+    assert adapter.transform is source
+    assert adapter.inverse_stage == "after_finalize"
+
+    expected_inverse = source.inverse(out)
+    recovered = adapter.inverse(out, state, CTX)
+    np.testing.assert_array_equal(recovered, expected_inverse)
+    assert recovered.dtype == np.uint16
+    assert source.inverse_input is out
+
+
+@pytest.mark.parametrize("missing", ["forward", "inverse"])
+def test_intensity_transform_adapter_validates_required_methods(missing):
+    class SourceTransform:
+        def forward(self, array):
+            return array
+
+        def inverse(self, array):
+            return array
+
+    source = SourceTransform()
+    setattr(source, missing, None)
+    with pytest.raises(TypeError, match=missing):
+        IntensityTransformAdapter(source)
+
+
+def test_intensity_transform_adapter_matches_external_asinh_when_available():
+    """Exercise the optional dependency's clipping, rounding, and HDR mapping."""
+    try:
+        from aind_exaspim_image_compression.machine_learning.transforms import (
+            AsinhTransform,
+        )
+    except ImportError:
+        pytest.skip("checkpoint-aware denoise-net transform API is not installed")
+
+    source = AsinhTransform(offset=35.0, scale=32.0)
+    adapter = IntensityTransformAdapter(source)
+    values = np.array(
+        [0, 35, 100, 1000, 10000, 60000, 65535], dtype=np.float32
+    )
+
+    expected, state = source.forward(values), None
+    actual, actual_state = adapter.forward(values, CTX)
+    np.testing.assert_array_equal(actual, expected)
+    assert actual_state is state
+    assert actual.dtype == expected.dtype == np.float32
+    assert np.all(np.diff(actual) > 0)
+
+    expected_inverse = source.inverse(expected)
+    actual_inverse = adapter.inverse(actual, actual_state, CTX)
+    np.testing.assert_array_equal(actual_inverse, expected_inverse)
+    assert actual_inverse.dtype == expected_inverse.dtype == np.uint16
+    assert np.all(np.diff(actual_inverse[-4:]) > 0)
 
 
 def test_clip_is_non_invertible_and_clips():

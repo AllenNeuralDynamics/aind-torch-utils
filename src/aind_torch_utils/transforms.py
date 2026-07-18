@@ -87,6 +87,57 @@ def is_invertible(obj: Any) -> bool:
     return callable(getattr(obj, "inverse", None))
 
 
+class IntensityTransformAdapter:
+    """Adapt an external array transform to the block-transform contract.
+
+    The wrapped transform owns all numerical behavior. In particular, this
+    adapter does not coerce arrays or dtypes around its calls, so clipping,
+    rounding, and the output dtype remain exactly those of the source
+    implementation.
+
+    Parameters
+    ----------
+    transform : Any
+        An object exposing callable ``forward(array)`` and ``inverse(array)``
+        methods. It is retained as :attr:`transform` for inspection.
+
+    Raises
+    ------
+    TypeError
+        If either required method is missing or non-callable.
+    """
+
+    # The source denoising pipeline averages overlapping predictions in the
+    # transformed domain and applies the nonlinear inverse once afterward.
+    inverse_stage: InverseStage = "after_finalize"
+
+    def __init__(self, transform: Any):
+        missing = [
+            name
+            for name in ("forward", "inverse")
+            if not callable(getattr(transform, name, None))
+        ]
+        if missing:
+            methods = ", ".join(missing)
+            raise TypeError(
+                "IntensityTransformAdapter requires callable forward(array) "
+                f"and inverse(array) methods; missing or non-callable: {methods}."
+            )
+        self.transform = transform
+
+    def forward(
+        self, block: np.ndarray, ctx: "BlockContext"
+    ) -> Tuple[np.ndarray, Any]:
+        """Delegate forward transformation and return no per-block state."""
+        return self.transform.forward(block), None
+
+    def inverse(
+        self, block: np.ndarray, state: Any, ctx: "BlockContext"
+    ) -> np.ndarray:
+        """Delegate inverse transformation after the block is finalized."""
+        return self.transform.inverse(block)
+
+
 class _AffineNormalizer:
     """Shared affine inverse for the linear normalizers.
 

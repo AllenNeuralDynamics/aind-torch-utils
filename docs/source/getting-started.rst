@@ -80,3 +80,37 @@ Minimal Programmatic Usage
 Configuration note: for the complete list of parameters, see
 ``src/aind_torch_utils/config.py`` (``InferenceConfig`` field metadata).
 
+
+Checkpoint-Aware Denoise Workflow
+---------------------------------
+
+The ``denoise-net`` workflow loads the U-Net and serialized intensity transform
+together through the source package's checkpoint loader:
+
+.. code-block:: python
+
+   import aind_torch_utils.recipes  # registers bundled workflow recipes
+   from aind_torch_utils.config import InferenceConfig
+   from aind_torch_utils.run import run_workflow
+   from aind_torch_utils.workflow import WorkflowRegistry
+
+   workflow = WorkflowRegistry.build(
+       "denoise-net",
+       {
+           "checkpoint_path": "/data/model.pth",
+           "offset": 73.5,  # optional; omit to retain the checkpoint mapping
+       },
+   )
+   cfg = InferenceConfig(devices=["cuda:0"])
+   run_workflow(workflow, input_store, output_store, cfg)
+
+The source checkpoint loader runs on CPU; the inference runtime copies and moves
+the model to ``cfg.devices``. Outputs, execution policy, compilation, AMP, seam
+handling, and storage remain controlled by ``InferenceConfig``. In particular,
+``output_denormalize=True`` (the default) restores count-space output, while
+``output_denormalize=False`` writes transformed-space predictions.
+
+Because this workflow provides its own transform, the generic ``normalize`` and
+related normalization fields do not override it. The legacy
+``ModelRegistry.load_model("denoise-net", ...)`` path remains unchanged and loads
+only the raw model/weights.

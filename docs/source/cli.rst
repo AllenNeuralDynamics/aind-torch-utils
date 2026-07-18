@@ -12,6 +12,40 @@ Minimal Example
        --model-type denoise-net \
        --weights /path/to/weights.pth
 
+Checkpoint-Aware Denoise Workflow
+---------------------------------
+
+Install the optional dependency and create a workflow-parameter file:
+
+.. code-block:: bash
+
+   pip install -e '.[denoise-net]'
+   printf '%s\n' '{"checkpoint_path": "/data/model.pth", "offset": 73.5}' \
+       > denoise-params.json
+
+Then run the registered recipe:
+
+.. code-block:: bash
+
+   python -m aind_torch_utils.run \
+       --in-spec "data/in_spec.json" \
+       --out-spec "data/out_spec.json" \
+       --workflow denoise-net \
+       --workflow-params denoise-params.json
+
+``checkpoint_path`` is required. ``offset`` is optional; omit it to use the
+checkpoint's saved intensity transform unchanged. When supplied, the source
+package composes the offset around the trained transform without changing its
+normalization denominator.
+
+Output inversion is enabled by default, so this workflow writes count-space
+predictions. Add ``--no-output-denormalize`` to intentionally write predictions
+in the transformed domain. Generic ``--normalize``, ``--norm-lower``,
+``--norm-upper``, and ``--clip-norm`` settings do not override the transform
+provided by a workflow. The older ``--model-type denoise-net --weights ...``
+form remains available as the legacy raw-model path and does not reconstruct
+checkpoint transform metadata.
+
 
 Full Parameter Set (example)
 ----------------------------
@@ -45,7 +79,8 @@ Options Overview
 ----------------
 
 - Input/Output: ``--in-spec``, ``--out-spec`` (TensorStore JSON specs)
-- Model: ``--model-type`` (registry key), ``--weights`` (optional path)
+- Model/workflow: ``--model-type`` and ``--weights`` for a raw registered model,
+  or ``--workflow`` and ``--workflow-params`` for a registered recipe
 - Geometry: ``--t``, ``--c``, ``--patch``, ``--overlap``, ``--block``, ``--batch``
 - Devices/Precision: ``--devices``, ``--no-amp``, ``--tf32``,
   ``--cudnn-benchmark``, ``--compile``, ``--compile-mode``,
@@ -54,7 +89,7 @@ Options Overview
 - Seam handling: ``--seam-mode {trim,blend}``, ``--trim-voxels``, ``--halo``,
   ``--min-blend-weight``
 - Normalization: ``--normalize {percentile,global,false}``, ``--norm-lower``,
-  ``--norm-upper``, ``--clip-norm [LO HI]``
+  ``--norm-upper``, ``--clip-norm [LO HI]``, ``--no-output-denormalize``
 - Monitoring: ``--metrics-json``, ``--metrics-interval``
 
 See ``src/aind_torch_utils/run.py`` for authoritative CLI definitions and

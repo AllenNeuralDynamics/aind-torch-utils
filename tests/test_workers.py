@@ -15,6 +15,7 @@ from aind_torch_utils.outputs import OutputSpec, Threshold
 from aind_torch_utils.transforms import (
     GlobalNormalizer,
     IdentityTransform,
+    IntensityTransformAdapter,
     from_config,
 )
 from aind_torch_utils.workers import GpuWorker, Preds, PrepWorker, WriterWorker
@@ -311,6 +312,58 @@ def test_writer_ignores_transform_state_when_denorm_disabled():
     )
 
     np.testing.assert_allclose(store.written, 0.5)
+
+
+def test_nonlinear_intensity_inverse_runs_once_after_patch_accumulation():
+    """Match source inference: average transformed predictions, then invert."""
+    cfg = InferenceConfig(
+        devices=["cpu"],
+        output_denormalize=True,
+        seam_mode="blend",
+        trim_voxels=None,
+    )
+    store = _FakeStore(np.float32)
+
+    class SquareInverse:
+        def __init__(self):
+            self.inverse_calls = 0
+
+        def forward(self, array):
+            return np.sqrt(array)
+
+        def inverse(self, array):
+            self.inverse_calls += 1
+            return np.square(array)
+
+    source = SquareInverse()
+    preprocess = IntensityTransformAdapter(source)
+    # Both patches cover the same block. Their transformed-space values average
+    # to 2, so post-merge inversion produces 4. Inverting first would produce 5.
+    host_out = torch.stack(
+        [
+            torch.full((1, 2, 2, 2), 1.0),
+            torch.full((1, 2, 2, 2), 3.0),
+        ]
+    )
+    preds = Preds(
+        block_idx=(0, 0, 0),
+        block_bbox=(slice(0, 2), slice(0, 2), slice(0, 2)),
+        linear_k=0,
+        starts_in_block=[(0, 0, 0), (0, 0, 0)],
+        host_out=host_out,
+        valid_sizes=[(2, 2, 2), (2, 2, 2)],
+        transform_state=None,
+        total_patches_in_block=2,
+        acc_shape=(2, 2, 2),
+        halo_left=(0, 0, 0),
+        ctx=_block_ctx(),
+        ready_event=None,
+    )
+
+    _run_writer_once(cfg, store, preds, preprocess)
+
+    np.testing.assert_allclose(store.written, 4.0)
+    assert source.inverse_calls == 1
 
 
 def test_writer_per_output_merge_post_and_dtype():
