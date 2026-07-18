@@ -3,7 +3,7 @@ import queue
 import threading
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import tensorstore as ts
@@ -12,7 +12,7 @@ from torch import nn
 
 from aind_torch_utils.accumulators import BlockAccumulator
 from aind_torch_utils.config import InferenceConfig
-from aind_torch_utils.distributed.sharding import ShardSpec
+from aind_torch_utils.distributed.sharding import ShardSpec, make_shard_spec
 from aind_torch_utils.utils import iter_blocks_zyx, iter_patch_starts
 
 logger = logging.getLogger(__name__)
@@ -35,7 +35,11 @@ class Batch:
         List of (z, y, x) start coordinates for each patch in the batch,
         relative to the expanded block.
     host_in : torch.Tensor
-        The input tensor of patches, pinned to host memory.
+        The input tensor of patches, pinned to host memory. When compiling
+        (cfg.use_compile), tail batches are zero-padded up to batch_size so
+        the model sees a constant input shape, and rows beyond
+        len(starts_in_block) are padding. In eager mode it has exactly
+        len(starts_in_block) rows.
     valid_sizes : List[Tuple[int, int, int]]
         List of (dz, dy, dx) valid dimensions for each patch, handling
         boundary conditions.
@@ -139,7 +143,7 @@ class PrepWorker:
         reader: "ts.TensorStore",
         prep_q: "queue.Queue[Batch]",
         model_patch: Tuple[int, int, int],
-        shard_spec: ShardSpec,
+        shard_spec: Optional[ShardSpec] = None,
         worker_id: int = 0,
         num_workers: int = 1,
         global_worker_offset: int = 0,
@@ -158,8 +162,9 @@ class PrepWorker:
             The queue to which prepared batches will be added.
         model_patch : Tuple[int, int, int]
             The (z, y, x) size of the model's input patches.
-        shard_spec : ShardSpec
-            Description of the spatial shard assigned to this process.
+        shard_spec : Optional[ShardSpec], optional
+            Description of the spatial shard assigned to this process. If
+            omitted, it is derived from the input shape and configuration.
         worker_id : int, optional
             The ID of this worker, by default 0.
         num_workers : int, optional
@@ -177,10 +182,16 @@ class PrepWorker:
         self.full_zyx = self.reader.shape[-3:]
         self.worker_id = worker_id
         self.num_workers = max(1, num_workers)
-        self.shard_spec = shard_spec
-        self.shard_strategy = shard_spec.strategy
-        self.block_start = shard_spec.block_start
-        self.block_stop = shard_spec.block_stop
+        self.shard_spec = shard_spec or make_shard_spec(
+            self.full_zyx,
+            self.cfg.block,
+            self.cfg.shard_count,
+            self.cfg.shard_index,
+            self.cfg.shard_strategy,
+        )
+        self.shard_strategy = self.shard_spec.strategy
+        self.block_start = self.shard_spec.block_start
+        self.block_stop = self.shard_spec.block_stop
         self.global_worker_count = max(1, global_worker_count)
         self.global_worker_id = global_worker_offset + worker_id
         self.global_worker_offset = global_worker_offset
@@ -189,8 +200,8 @@ class PrepWorker:
         """
         Check whether a block index lies within the shard's block bounds.
         """
-        (sz0, sy0, sx0) = self.block_start
-        (sz1, sy1, sx1) = self.block_stop
+        sz0, sy0, sx0 = self.block_start
+        sz1, sy1, sx1 = self.block_stop
         bz, by, bx = block_idx
         return sz0 <= bz < sz1 and sy0 <= by < sy1 and sx0 <= bx < sx1
 
@@ -265,9 +276,10 @@ class PrepWorker:
                 block_mn = self.cfg.norm_lower
                 block_mx = self.cfg.norm_upper
                 block_scale = max(block_mx - block_mn, self.cfg.eps)
-                # normalize the block in-place
-                norm_block -= block_mn
-                norm_block /= block_scale
+                # Clip to [p_low, p_high] first, then normalize — matches
+                # PercentileNormalizationd._normalize_channel step order.
+                norm_block = np.clip(norm_block, block_mn, block_mx)
+                norm_block = (norm_block - block_mn) / block_scale
             else:  # False
                 # Bypass normalization entirely (identity). We pretend (mn,mx)=(0,1)
                 # so the writer performs a no-op inverse transform.
@@ -292,10 +304,18 @@ class PrepWorker:
             # batch over those starts
             for i in range(0, total_patches, self.cfg.batch_size):
                 batch_starts = starts[i : i + self.cfg.batch_size]
-                B = len(batch_starts)
+                n_real = len(batch_starts)
                 pin_memory = any("cuda" in d for d in self.cfg.devices)
+                # When compiling, pad the tail batch up to batch_size so the
+                # model always sees a constant input shape; this prevents
+                # torch.compile from recompiling at runtime (not thread-safe
+                # across GPU workers). Writers ignore padded rows since they
+                # only index rows in starts_in_block. In eager mode there is
+                # no shape constraint, so allocate exactly n_real rows and
+                # avoid wasting compute and copy bandwidth on padding.
+                n_rows = self.cfg.batch_size if self.cfg.use_compile else n_real
                 host_in = torch.zeros(
-                    (B, 1, pz, py, px),
+                    (n_rows, 1, pz, py, px),
                     dtype=torch.float16 if self.cfg.amp else torch.float32,
                     pin_memory=pin_memory,
                 )
@@ -374,10 +394,8 @@ class GpuWorker:
         self.write_queues = write_queues
         self.num_writers = len(write_queues)
 
-        if self.cfg.use_tf32:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = self.cfg.use_tf32
+        torch.backends.cudnn.benchmark = self.cfg.cudnn_benchmark
 
         self.model.to(self.device)
         self.model.eval()
@@ -385,18 +403,65 @@ class GpuWorker:
         self.copy_stream = torch.cuda.Stream(device=self.device)
 
         if getattr(torch, "compile", None) and self.cfg.use_compile:
+            self._compile_model()
+
+    def _autocast_context(self):
+        return (
+            torch.autocast(device_type="cuda", dtype=torch.float16)
+            if self.cfg.amp
+            else nullcontext()
+        )
+
+    def _compile_model(self) -> None:
+        # Keep a handle to the original module so we can fall back to eager
+        # execution if compilation fails. torch.compile returns a new wrapper
+        # and does not mutate the original, so this reference stays valid.
+        eager_model = self.model
+        try:
             try:
-                # dynamic=True avoids recompiles when the final batch is smaller
+                # PrepWorker pads tail batches to batch_size, so input shapes
+                # are constant and no runtime recompiles are expected
+                # regardless of the `dynamic` setting.
                 self.model = torch.compile(
                     self.model,
                     mode=self.cfg.compile_mode,
                     dynamic=self.cfg.compile_dynamic,
                 )
-                logger.info("Successfully compiled model.")
+                logger.info("Compiled model on %s.", self.device)
             except TypeError:
                 # older PyTorch without `dynamic` kwarg
                 self.model = torch.compile(self.model, mode=self.cfg.compile_mode)
-                logger.info("Successfully compiled model (older pytorch).")
+                logger.info("Compiled model on %s (older pytorch).", self.device)
+
+            # Compilation is lazy: the graph is traced on the first forward,
+            # so tracing/guard errors surface here in warmup, not above.
+            self._warmup_compiled_model()
+        except Exception as exc:
+            # Some models do host-side numpy/Python work in forward that
+            # dynamo cannot trace. Fall back to eager so the run proceeds
+            # instead of aborting. Warmup runs on the main thread, so this
+            # also keeps the failure off the worker threads.
+            logger.warning(
+                "torch.compile failed on %s (%s); falling back to eager " "execution.",
+                self.device,
+                type(exc).__name__,
+                exc_info=True,
+            )
+            self.model = eager_model
+
+    def _warmup_compiled_model(self) -> None:
+        torch.cuda.set_device(self.device)
+        dtype = torch.float16 if self.cfg.amp else torch.float32
+        shape = (self.cfg.batch_size, 1, *self.cfg.patch)
+        warmup_in = torch.zeros(shape, dtype=dtype, device=self.device)
+
+        logger.info("Warming compiled model on %s with shape %s.", self.device, shape)
+        with torch.inference_mode():
+            with self._autocast_context():
+                warmup_out = self.model(warmup_in)
+        torch.cuda.synchronize(self.device)
+        del warmup_in, warmup_out
+        logger.info("Finished compiled model warmup on %s.", self.device)
 
     def run(self, stop_event: threading.Event) -> None:
         """
@@ -410,11 +475,7 @@ class GpuWorker:
         stop_event : threading.Event
             An event that signals the worker to stop.
         """
-        autocast_ctx = (
-            torch.autocast(device_type="cuda", dtype=torch.float16)
-            if self.cfg.amp
-            else nullcontext()
-        )
+        autocast_ctx = self._autocast_context()
 
         # Ensure the current device matches self.device for streams/events
         torch.cuda.set_device(self.device)
@@ -441,11 +502,14 @@ class GpuWorker:
             with torch.inference_mode():
                 with autocast_ctx:
                     out = self.model(dev_in)
-                if out.dtype != batch.host_in.dtype:
-                    out = out.to(batch.host_in.dtype)
 
-            # D2H into pinned buffer (async on a dedicated stream)
-            host_out = torch.empty_like(batch.host_in, pin_memory=True)
+            # D2H into pinned buffer sized to actual model output (async on a dedicated stream)
+            pin_memory = "cuda" in str(self.device)
+            host_out = torch.empty(
+                out.shape,
+                dtype=out.dtype,
+                pin_memory=pin_memory,
+            )
 
             # Ensure the copy stream waits for the default stream's compute to finish
             cur = torch.cuda.current_stream(self.device)
@@ -459,6 +523,14 @@ class GpuWorker:
             with torch.cuda.stream(self.copy_stream):
                 host_out.copy_(out, non_blocking=True)
                 evt.record()  # marks completion of the D2H on copy_stream
+
+            # out is produced on the compute stream but consumed by copy_stream.
+            # The caching allocator only tracks the producing stream, so without
+            # this it could hand out's memory to a later compute-stream
+            # allocation while this async D2H is still reading it (a
+            # write-after-read hazard). record_stream makes the allocator also
+            # wait for copy_stream before recycling the block.
+            out.record_stream(self.copy_stream)
 
             preds = Preds(
                 block_idx=batch.block_idx,
@@ -489,12 +561,16 @@ class GpuWorker:
 class WriterWorker:
     """
     Worker that accumulates predictions for a block and writes the result.
+
+    Supports single-output models (legacy: one writer) and multi-output models
+    (N writers, one per decoder). The model output tensor is expected to have
+    shape ``(B, N, Z, Y, X)`` where N equals ``len(writers)``.
     """
 
     def __init__(
         self,
         cfg: InferenceConfig,
-        writer: "ts.TensorStore",
+        writers: "Union[ts.TensorStore, List[ts.TensorStore]]",
         write_q: "queue.Queue[Optional[Preds]]",
     ):
         """
@@ -503,23 +579,42 @@ class WriterWorker:
         Parameters
         ----------
         cfg : InferenceConfig
-            The denoising configuration.
-        writer : ts.TensorStore
-            The TensorStore writer for the output data.
+            The inference configuration.
+        writers : ts.TensorStore or list of ts.TensorStore
+            One output store per model output channel. A bare TensorStore is
+            treated as a single-element list for backwards compatibility.
         write_q : queue.Queue[Optional[Preds]]
             The queue from which to get model predictions.
         """
         self.cfg = cfg
-        self.writer = writer
+        self.writers: List["ts.TensorStore"] = (
+            writers if isinstance(writers, list) else [writers]
+        )
         self.write_q = write_q
-        self.blocks: Dict[Tuple[int, int, int], BlockAccumulator] = {}
+        # maps block_idx → list of BlockAccumulator, one per output channel
+        self.blocks: Dict[Tuple[int, int, int], List[BlockAccumulator]] = {}
+
+    def _make_accumulators(
+        self, acc_shape: Tuple[int, int, int]
+    ) -> List[BlockAccumulator]:
+        return [
+            BlockAccumulator(
+                acc_shape,
+                self.cfg.eps,
+                overlap=self.cfg.overlap,
+                seam_mode=self.cfg.seam_mode,
+                trim_voxels=self.cfg.trim_voxels,
+                min_blend_weight=self.cfg.min_blend_weight,
+            )
+            for _ in self.writers
+        ]
 
     def run(self, stop_event: threading.Event) -> None:
         """
         The main run loop for the worker.
 
         Gets predictions from the write queue, accumulates them until a block
-        is complete, finalizes the block, and writes it to the output.
+        is complete, finalizes the block, and writes it to each output store.
 
         Parameters
         ----------
@@ -545,46 +640,62 @@ class WriterWorker:
                 xsl.stop - xsl.start,
             )
 
-            acc = self.blocks.get(preds.block_idx)
-            if acc is None:
-                acc = BlockAccumulator(
-                    preds.acc_shape,
-                    self.cfg.eps,
-                    overlap=self.cfg.overlap,
-                    seam_mode=self.cfg.seam_mode,
-                    trim_voxels=self.cfg.trim_voxels,
-                    min_blend_weight=self.cfg.min_blend_weight,
-                )
-                acc.total = preds.total_patches_in_block
-                self.blocks[preds.block_idx] = acc
+            accs = self.blocks.get(preds.block_idx)
+            if accs is None:
+                accs = self._make_accumulators(preds.acc_shape)
+                for acc in accs:
+                    acc.total = preds.total_patches_in_block
+                self.blocks[preds.block_idx] = accs
 
-            out_np = preds.host_out.numpy()
+            out_np = preds.host_out.numpy()  # (B, N, pz, py, px) or (B, 1, pz, py, px)
+            # Ensure the tensor has a channel dimension that matches writers
+            if out_np.ndim == 4:
+                # legacy single-output (B, pz, py, px) — add channel dim
+                out_np = out_np[:, np.newaxis]
+
+            if out_np.ndim != 5:
+                raise ValueError(
+                    "Expected model output with shape (B, N, Z, Y, X) "
+                    f"(or legacy (B, Z, Y, X)); got shape {out_np.shape}"
+                )
+
+            if out_np.shape[1] != len(self.writers):
+                raise ValueError(
+                    "Mismatch between model output channels and output stores: "
+                    f"got N={out_np.shape[1]} channels but {len(self.writers)} "
+                    f"writer(s) for block {preds.block_idx}."
+                )
+
             for bi, (sz, sy, sx) in enumerate(preds.starts_in_block):
                 dz, dy, dx = preds.valid_sizes[bi]
-                patch_pred = out_np[bi, 0]
-                mn, mx = preds.per_block_minmax[bi]
-                scale = max(mx - mn, self.cfg.eps)
-                pp = patch_pred.astype(np.float32, copy=False)
-                denorm = (pp * np.float32(scale) + np.float32(mn)).astype(
-                    np.float32, copy=False
-                )
-                acc.add(denorm, (sz, sy, sx), (dz, dy, dx))
+                for n, acc in enumerate(accs):
+                    patch_pred = out_np[bi, n]
+                    pp = patch_pred.astype(np.float32, copy=False)
 
-            if acc.count >= acc.total:
-                ext = acc.finalize()
-                del self.blocks[preds.block_idx]
+                    # This is useful for whenever the model does not need
+                    # to map to the original data range (e.g. a segmentation model)
+                    if self.cfg.output_denormalize:
+                        mn, mx = preds.per_block_minmax[bi]
+                        scale = max(mx - mn, self.cfg.eps)
+                        pp = (pp * np.float32(scale) + np.float32(mn)).astype(
+                            np.float32, copy=False
+                        )
+                    acc.add(pp, (sz, sy, sx), (dz, dy, dx))
 
+            if accs[0].count >= accs[0].total:
                 lz, ly, lx = preds.halo_left
-                core = ext[lz : lz + core_bz, ly : ly + core_by, lx : lx + core_bx]
-                # preserve target dtype from output store
-                target_dtype = self.writer.dtype.numpy_dtype
-                if np.issubdtype(target_dtype, np.integer):
-                    info = np.iinfo(target_dtype)
-                    out_arr = np.clip(core, info.min, info.max).astype(
-                        target_dtype, copy=False
-                    )
-                else:
-                    out_arr = core.astype(target_dtype, copy=False)
-                self.writer[self.cfg.t_idx, self.cfg.c_idx, zsl, ysl, xsl].write(
-                    out_arr
-                ).result()
+                for acc, writer in zip(accs, self.writers):
+                    ext = acc.finalize()
+                    core = ext[lz : lz + core_bz, ly : ly + core_by, lx : lx + core_bx]
+                    target_dtype = writer.dtype.numpy_dtype
+                    if np.issubdtype(target_dtype, np.integer):
+                        info = np.iinfo(target_dtype)
+                        out_arr = np.clip(core, info.min, info.max).astype(
+                            target_dtype, copy=False
+                        )
+                    else:
+                        out_arr = core.astype(target_dtype, copy=False)
+                    writer[self.cfg.t_idx, self.cfg.c_idx, zsl, ysl, xsl].write(
+                        out_arr
+                    ).result()
+                del self.blocks[preds.block_idx]

@@ -1,3 +1,7 @@
+"""
+Module for running the inference pipeline with multiple threads and monitoring.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -9,15 +13,15 @@ import sys
 import threading
 import time
 from copy import deepcopy
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 from torch import nn
 
 import aind_torch_utils.models  # This registers all models when imported
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.distributed.sharding import ShardSpec, make_shard_spec
 from aind_torch_utils.model_registry import ModelRegistry
 from aind_torch_utils.monitoring import QueueMonitor, SystemMonitor
-from aind_torch_utils.distributed.sharding import ShardSpec, make_shard_spec
 from aind_torch_utils.utils import open_ts_spec
 from aind_torch_utils.workers import GpuWorker, PrepWorker, WriterWorker
 
@@ -158,7 +162,7 @@ def _setup_monitors(
 def _setup_workers(
     model: nn.Module,
     input_store: Any,
-    output_store: Any,
+    output_stores: List[Any],
     cfg: InferenceConfig,
     shard_spec: ShardSpec,
     num_prep_workers: int,
@@ -170,13 +174,13 @@ def _setup_workers(
     Parameters
     ----------
     model : nn.Module
-        The model to use for denoising.
+        The model to use for inference.
     input_store : Any
         The input data store.
-    output_store : Any
-        The output data store.
+    output_stores : List[Any]
+        One output data store per model output channel.
     cfg : InferenceConfig
-        The denoising configuration.
+        The inference configuration.
     num_prep_workers : int
         The number of prep workers to create.
     prep_q : queue.Queue
@@ -211,7 +215,7 @@ def _setup_workers(
         for device in cfg.devices
     ]
     writer_workers = [
-        WriterWorker(cfg, output_store, write_queues[i])
+        WriterWorker(cfg, output_stores, write_queues[i])
         for i in range(len(write_queues))
     ]
     return prep_workers, gpu_workers, writer_workers
@@ -220,7 +224,7 @@ def _setup_workers(
 def _setup_worker_threads(
     model: nn.Module,
     input_store: Any,
-    output_store: Any,
+    output_stores: List[Any],
     cfg: InferenceConfig,
     shard_spec: ShardSpec,
     stop_event: threading.Event,
@@ -233,13 +237,13 @@ def _setup_worker_threads(
     Parameters
     ----------
     model : nn.Module
-        The model to use for denoising.
+        The model to use for inference.
     input_store : Any
         The input data store.
-    output_store : Any
-        The output data store.
+    output_stores : List[Any]
+        One output data store per model output channel.
     cfg : InferenceConfig
-        The denoising configuration.
+        The inference configuration.
     shard_spec : ShardSpec
         Description of the spatial shard handled by this process.
     stop_event : threading.Event
@@ -261,7 +265,7 @@ def _setup_worker_threads(
     prep_workers, gpu_workers, writer_workers = _setup_workers(
         model,
         input_store,
-        output_store,
+        output_stores,
         cfg,
         shard_spec,
         num_prep_workers,
@@ -289,25 +293,28 @@ def _setup_worker_threads(
 def run(
     model: nn.Module,
     input_store: Any,
-    output_store: Any,
+    output_store: Union[Any, List[Any]],
     cfg: InferenceConfig,
     metrics_json: Optional[str] = None,
     metrics_interval: float = 0.5,
     num_prep_workers: int = 1,
     num_writer_workers: int = 1,
 ) -> None:
-    """Runs the denoising pipeline.
+    """Runs the inference pipeline.
 
     Parameters
     ----------
     model : nn.Module
-        The model to use for denoising.
+        The model to use for inference. For multi-output models (e.g.,
+        SharedEncoderModel) the forward pass must return a tensor of shape
+        ``(B, N, Z, Y, X)`` and ``output_store`` must be a list of N stores.
     input_store : Any
         The input data store.
-    output_store : Any
-        The output data store.
+    output_store : Any or list of Any
+        Output TensorStore(s). Pass a single store for single-output models, or
+        a list of N stores when the model returns N output channels.
     cfg : InferenceConfig
-        The denoising configuration.
+        The inference configuration.
     metrics_json : Optional[str], optional
         Path to the output JSON file for metrics, by default None.
     metrics_interval : float, optional
@@ -317,6 +324,10 @@ def run(
     num_writer_workers : int, optional
         The number of writer workers to use, by default 1.
     """
+    output_stores: List[Any] = (
+        output_store if isinstance(output_store, list) else [output_store]
+    )
+
     # Validate shapes
     T, C, Z, Y, X = tuple(input_store.domain.shape)
     assert 0 <= cfg.t_idx < T and 0 <= cfg.c_idx < C, "Invalid t/c indices"
@@ -355,7 +366,7 @@ def run(
     prep_threads, gpu_threads, writer_threads = _setup_worker_threads(
         model,
         input_store,
-        output_store,
+        output_stores,
         cfg,
         shard_spec,
         stop_event,
@@ -468,7 +479,13 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     """
     ap = argparse.ArgumentParser(description="Scalable pytorch inference pipeline")
     ap.add_argument("--in-spec", type=str, required=True)
-    ap.add_argument("--out-spec", type=str, required=True)
+    ap.add_argument(
+        "--out-spec",
+        type=str,
+        nargs="+",
+        required=True,
+        help="Path(s) to output TensorStore JSON spec file(s). Provide one per model output channel.",
+    )
     ap.add_argument(
         "--model-type",
         type=str,
@@ -483,6 +500,14 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         help=(
             "Path to JSON file or inline JSON string with InferenceConfig fields "
             "(defaults to built-in config)"
+        ),
+    )
+    ap.add_argument(
+        "--no-output-denormalize",
+        action="store_true",
+        help=(
+            "Disable inverse normalization before writing outputs. "
+            "Use for probability/segmentation models whose outputs are not in input intensity space."
         ),
     )
     ap.add_argument(
@@ -525,12 +550,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     model = load_model(args.model_type, args.weights)
 
     in_arr = open_ts_spec(args.in_spec)
-    out_arr = open_ts_spec(args.out_spec)
+    out_arr = [open_ts_spec(s) for s in args.out_spec]
 
     if args.config:
         cfg = InferenceConfig.from_json(args.config)
     else:
         cfg = InferenceConfig()
+    if args.no_output_denormalize:
+        cfg.output_denormalize = False
     logger.info(f"Inference config:\n{cfg}")
 
     run(

@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import json
 import logging
 import os
 import sys
-import copy
-import json
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.run import _parse_args as parse_inference_args
 from aind_torch_utils.run import (
-    _parse_args as parse_inference_args,
     load_model,
     run,
 )
@@ -37,16 +37,20 @@ def _build_inference_config(
     Construct the base InferenceConfig shared by all shards.
     """
     if args.config:
-        return InferenceConfig.from_json(
+        cfg = InferenceConfig.from_json(
             args.config,
             shard_count=shard_count,
             shard_index=0,
         )
-    data: Dict[str, Any] = {}
-    if shard_count is not None:
-        data["shard_count"] = shard_count
-    data["shard_index"] = 0
-    return InferenceConfig.model_validate(data)
+    else:
+        data: Dict[str, Any] = {}
+        if shard_count is not None:
+            data["shard_count"] = shard_count
+        data["shard_index"] = 0
+        cfg = InferenceConfig.model_validate(data)
+    if args.no_output_denormalize:
+        cfg.output_denormalize = False
+    return cfg
 
 
 def _default_metrics_template(base: Optional[str]) -> Optional[str]:
@@ -58,7 +62,9 @@ def _default_metrics_template(base: Optional[str]) -> Optional[str]:
     return f"{stem}_shard{{shard}}{ext}"
 
 
-def _resolve_metrics_path(base: Optional[str], template: Optional[str], shard: int) -> Optional[str]:
+def _resolve_metrics_path(
+    base: Optional[str], template: Optional[str], shard: int
+) -> Optional[str]:
     if template:
         return template.format(shard=shard)
     if base:
@@ -100,7 +106,7 @@ def _launch_locally(
     shards: int,
     metrics_template: Optional[str],
     input_spec: Dict[str, Any],
-    output_spec: Dict[str, Any],
+    output_specs: Sequence[Dict[str, Any]],
 ) -> None:
     logger.info("Running locally across %d shard(s).", shards)
     for shard in range(shards):
@@ -115,11 +121,11 @@ def _launch_locally(
         cfg.devices = list(_canonical_devices(cfg.devices))
         model = load_model(run_args.model_type, run_args.weights)
         input_store = open_ts_spec(copy.deepcopy(input_spec))
-        output_store = open_ts_spec(copy.deepcopy(output_spec))
+        output_stores = [open_ts_spec(copy.deepcopy(spec)) for spec in output_specs]
         run(
             model,
             input_store,
-            output_store,
+            output_stores,
             cfg,
             metrics_json=payload["metrics_json"],
             metrics_interval=run_args.metrics_interval,
@@ -128,7 +134,9 @@ def _launch_locally(
         )
 
 
-def _parse_ray_args(argv: Optional[Sequence[str]] = None) -> Tuple[argparse.Namespace, argparse.Namespace]:
+def _parse_ray_args(
+    argv: Optional[Sequence[str]] = None,
+) -> Tuple[argparse.Namespace, argparse.Namespace]:
     ray_parser = argparse.ArgumentParser(add_help=False)
     ray_parser.add_argument("--ray-address", type=str, default=None)
     ray_parser.add_argument("--num-shards", type=int, default=None)
@@ -189,7 +197,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
 
     input_spec_dict = _load_spec_arg(run_args.in_spec)
-    output_spec_dict = _load_spec_arg(run_args.out_spec)
+    output_spec_dicts = [_load_spec_arg(arg) for arg in run_args.out_spec]
 
     if ray_args.dry_run:
         logger.info(
@@ -200,9 +208,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
         return
 
-    logger.info("Preparing output store (create/delete as specified) before sharded run.")
-    open_ts_spec(copy.deepcopy(output_spec_dict))
-    output_spec_for_shards = _prepare_output_spec_for_shards(output_spec_dict)
+    logger.info(
+        "Preparing output store (create/delete as specified) before sharded run."
+    )
+    for output_spec in output_spec_dicts:
+        open_ts_spec(copy.deepcopy(output_spec))
+    output_specs_for_shards = [
+        _prepare_output_spec_for_shards(spec) for spec in output_spec_dicts
+    ]
 
     if ray_args.local_fallback:
         _launch_locally(
@@ -211,7 +224,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             shards,
             metrics_template,
             input_spec_dict,
-            output_spec_for_shards,
+            output_specs_for_shards,
         )
         return
 
@@ -226,7 +239,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     ray.init(**init_kwargs)
 
     try:
-        cpus = ray_args.cpus_per_shard or max(1.0, run_args.prep_workers + run_args.writer_workers)
+        cpus = ray_args.cpus_per_shard or max(
+            1.0, run_args.prep_workers + run_args.writer_workers
+        )
         requested_gpus = ray_args.gpus_per_shard
         if requested_gpus is None:
             requested_gpus = max(0.0, len(base_cfg.devices))
@@ -240,11 +255,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             metrics_json = payload["metrics_json"]
             model = load_model(run_args.model_type, run_args.weights)
             input_store = open_ts_spec(copy.deepcopy(input_spec_dict))
-            output_store = open_ts_spec(copy.deepcopy(output_spec_for_shards))
+            output_stores = [
+                open_ts_spec(copy.deepcopy(spec)) for spec in output_specs_for_shards
+            ]
             run(
                 model,
                 input_store,
-                output_store,
+                output_stores,
                 cfg,
                 metrics_json=metrics_json,
                 metrics_interval=run_args.metrics_interval,
