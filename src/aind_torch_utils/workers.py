@@ -33,8 +33,8 @@ class Batch:
         The (z, y, x) index of the block.
     block_bbox : Tuple[slice, slice, slice]
         The core bounding box of the block in the full volume.
-    linear_k : int
-        The linear index of the block.
+    writer_key : int
+        Dense, shard-local block index used to select a writer worker.
     starts_in_block : List[Tuple[int, int, int]]
         List of (z, y, x) start coordinates for each patch in the batch,
         relative to the expanded block.
@@ -66,7 +66,7 @@ class Batch:
 
     block_idx: Tuple[int, int, int]
     block_bbox: Tuple[slice, slice, slice]
-    linear_k: int
+    writer_key: int
     starts_in_block: List[Tuple[int, int, int]]
     host_in: torch.Tensor
     valid_sizes: List[Tuple[int, int, int]]
@@ -88,8 +88,8 @@ class Preds:
         The (z, y, x) index of the block.
     block_bbox : Tuple[slice, slice, slice]
         The core bounding box of the block in the full volume.
-    linear_k : int
-        The linear index of the block.
+    writer_key : int
+        Dense, shard-local block index used to select a writer worker.
     starts_in_block : List[Tuple[int, int, int]]
         List of (z, y, x) start coordinates for each patch in the batch,
         relative to the expanded block.
@@ -116,7 +116,7 @@ class Preds:
 
     block_idx: Tuple[int, int, int]
     block_bbox: Tuple[slice, slice, slice]
-    linear_k: int
+    writer_key: int
     starts_in_block: List[Tuple[int, int, int]]
     host_out: torch.Tensor
     valid_sizes: List[Tuple[int, int, int]]
@@ -131,23 +131,23 @@ class Preds:
     )
 
 
-def shard_for_block_linear(linear_k: int, num_writers: int) -> int:
+def writer_for_key(writer_key: int, num_writers: int) -> int:
     """
-    Determines which writer shard should handle a given block.
+    Determine which writer should handle a shard-local block key.
 
     Parameters
     ----------
-    linear_k : int
-        The linear index of the block.
+    writer_key : int
+        Dense block index within the current shard.
     num_writers : int
         The total number of writer workers.
 
     Returns
     -------
     int
-        The index of the writer shard to use for this block.
+        The writer index to use for this block.
     """
-    return linear_k % num_writers
+    return writer_key % num_writers
 
 
 class PrepWorker:
@@ -237,6 +237,38 @@ class PrepWorker:
         bz, by, bx = block_idx
         return sz0 <= bz < sz1 and sy0 <= by < sy1 and sx0 <= bx < sx1
 
+    def _writer_key_for_block(
+        self, global_block_index: int, block_idx: Tuple[int, int, int]
+    ) -> int:
+        """Return the dense index of an owned block within this shard.
+
+        Strided shards own consecutive groups of prep-worker slots in each
+        global scheduling round. Contiguous shards own rectangular regions of
+        the block grid, for which a local row-major index is dense.
+        """
+        if self.shard_strategy == "stride":
+            global_slot = global_block_index % self.global_worker_count
+            local_slot = global_slot - self.global_worker_offset
+            if not 0 <= local_slot < self.num_workers:
+                raise ValueError(
+                    f"Block {global_block_index} is not owned by shard "
+                    f"{self.shard_spec.index}."
+                )
+            scheduling_round = global_block_index // self.global_worker_count
+            return scheduling_round * self.num_workers + local_slot
+
+        sz0, sy0, sx0 = self.block_start
+        _, sy1, sx1 = self.block_stop
+        bz, by, bx = block_idx
+        if not self._block_in_shard(block_idx):
+            raise ValueError(
+                f"Block {block_idx} is not owned by shard "
+                f"{self.shard_spec.index}."
+            )
+        local_y = sy1 - sy0
+        local_x = sx1 - sx0
+        return ((bz - sz0) * local_y + (by - sy0)) * local_x + (bx - sx0)
+
     def run(self, stop_event: threading.Event) -> None:
         """
         The main run loop for the worker.
@@ -318,6 +350,7 @@ class PrepWorker:
                 )
             starts = starts_cache[(bz, by, bx)]
             total_patches = len(starts)
+            writer_key = self._writer_key_for_block(k, block_idx)
 
             # batch over those starts
             for i in range(0, total_patches, self.cfg.batch_size):
@@ -357,7 +390,7 @@ class PrepWorker:
                 batch = Batch(
                     block_idx=block_idx,
                     block_bbox=core_bbox,  # keep the *core* bbox for writing
-                    linear_k=k,
+                    writer_key=writer_key,
                     starts_in_block=batch_starts,  # coords are in expanded space
                     host_in=host_in,
                     valid_sizes=valid_sizes,
@@ -595,7 +628,7 @@ class GpuWorker:
             preds = Preds(
                 block_idx=batch.block_idx,
                 block_bbox=batch.block_bbox,
-                linear_k=batch.linear_k,
+                writer_key=batch.writer_key,
                 starts_in_block=batch.starts_in_block,
                 host_out=host_out,
                 valid_sizes=batch.valid_sizes,
@@ -607,8 +640,8 @@ class GpuWorker:
                 ready_event=evt,  # <-- writer will synchronize this
             )
 
-            # route to shard
-            wid = shard_for_block_linear(preds.linear_k, self.num_writers)
+            # Route every batch for a block to its shard-local writer.
+            wid = writer_for_key(preds.writer_key, self.num_writers)
             target_q = self.write_queues[wid]
 
             while not stop_event.is_set():

@@ -1,5 +1,6 @@
 import queue
 import threading
+from collections import Counter
 from typing import Optional
 
 import numpy as np
@@ -10,6 +11,7 @@ import torch
 from aind_torch_utils.accumulators import weighted_average_factory
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.context import BlockContext
+from aind_torch_utils.distributed.sharding import make_shard_spec
 from aind_torch_utils.execution import ExecutionPolicy
 from aind_torch_utils.outputs import OutputSpec, Threshold
 from aind_torch_utils.transforms import (
@@ -18,7 +20,14 @@ from aind_torch_utils.transforms import (
     IntensityTransformAdapter,
     from_config,
 )
-from aind_torch_utils.workers import GpuWorker, Preds, PrepWorker, WriterWorker
+from aind_torch_utils.utils import iter_blocks_zyx
+from aind_torch_utils.workers import (
+    GpuWorker,
+    Preds,
+    PrepWorker,
+    WriterWorker,
+    writer_for_key,
+)
 
 
 def _default_preprocess(cfg):
@@ -132,7 +141,7 @@ def _single_patch_preds(host_out, transform_state):
     return Preds(
         block_idx=(0, 0, 0),
         block_bbox=(slice(0, 2), slice(0, 2), slice(0, 2)),
-        linear_k=0,
+        writer_key=0,
         starts_in_block=[(0, 0, 0)],
         host_out=host_out,
         valid_sizes=[(2, 2, 2)],
@@ -198,6 +207,7 @@ def test_prep_worker_pads_tail_batch_to_constant_shape_when_compiling():
 
     # 32^3 block, patch 16, overlap 4 -> 3 starts per axis -> 27 patches
     assert total_real == batches[0].total_patches_in_block == 27
+    assert {b.writer_key for b in batches} == {0}
     assert saw_partial, "geometry should produce a partial tail batch"
 
 
@@ -243,6 +253,115 @@ def test_prep_worker_uses_execution_input_dtype():
     assert all(b.host_in.dtype == torch.float16 for b in batches)
 
 
+class _ShapeOnlyStore:
+    """Reader stand-in for testing block ownership without reading data."""
+
+    def __init__(self, full_zyx):
+        self.shape = (1, 1, *full_zyx)
+
+
+def _routing_prep_worker(cfg, full_zyx, shard_spec, worker_id, local_prep):
+    """Construct a PrepWorker used only for its shard-local routing logic."""
+    return PrepWorker(
+        cfg,
+        _ShapeOnlyStore(full_zyx),
+        queue.Queue(),
+        cfg.patch,
+        _default_preprocess(cfg),
+        _default_execution(cfg),
+        shard_spec=shard_spec,
+        worker_id=worker_id,
+        num_workers=local_prep,
+        global_worker_offset=shard_spec.index * local_prep,
+        global_worker_count=shard_spec.count * local_prep,
+    )
+
+
+def test_stride_writer_keys_are_dense_and_balance_current_configuration():
+    """The 4-shard/4-prep/8-writer case must use every writer equally."""
+    full_zyx = (4096, 2660, 3548)
+    local_prep = 4
+    shard_count = 4
+    num_writers = 8
+    cfg = InferenceConfig(
+        patch=(64, 64, 64),
+        overlap=10,
+        block=(256, 256, 256),
+        batch_size=32,
+        devices=["cpu"],
+        amp=False,
+        shard_count=shard_count,
+        shard_strategy="stride",
+    )
+    blocks = list(iter_blocks_zyx(full_zyx, cfg.block))
+    global_prep = local_prep * shard_count
+
+    for shard_index in range(shard_count):
+        shard_spec = make_shard_spec(
+            full_zyx, cfg.block, shard_count, shard_index, "stride"
+        )
+        workers = [
+            _routing_prep_worker(cfg, full_zyx, shard_spec, i, local_prep)
+            for i in range(local_prep)
+        ]
+        keys = []
+        offset = shard_index * local_prep
+        for global_block_index, (block_idx, _) in enumerate(blocks):
+            global_slot = global_block_index % global_prep
+            if offset <= global_slot < offset + local_prep:
+                worker = workers[global_slot - offset]
+                keys.append(
+                    worker._writer_key_for_block(global_block_index, block_idx)
+                )
+
+        assert sorted(keys) == list(range(616))
+        counts = Counter(writer_for_key(key, num_writers) for key in keys)
+        assert [counts[i] for i in range(num_writers)] == [77] * num_writers
+
+
+def test_contiguous_writer_keys_are_dense_and_balanced():
+    """Contiguous shards use dense local row-major keys despite global gaps."""
+    full_zyx = (7, 5, 3)
+    local_prep = 4
+    shard_count = 4
+    num_writers = 5
+    cfg = InferenceConfig(
+        patch=(1, 1, 1),
+        overlap=0,
+        block=(2, 2, 2),
+        batch_size=1,
+        devices=["cpu"],
+        amp=False,
+        seam_mode="trim",
+        trim_voxels=0,
+        halo=1,
+        shard_count=shard_count,
+        shard_strategy="contiguous-z",
+    )
+    blocks = list(iter_blocks_zyx(full_zyx, cfg.block))
+
+    for shard_index in range(shard_count):
+        shard_spec = make_shard_spec(
+            full_zyx, cfg.block, shard_count, shard_index, "contiguous-z"
+        )
+        workers = [
+            _routing_prep_worker(cfg, full_zyx, shard_spec, i, local_prep)
+            for i in range(local_prep)
+        ]
+        keys = []
+        for global_block_index, (block_idx, _) in enumerate(blocks):
+            if workers[0]._block_in_shard(block_idx):
+                worker = workers[global_block_index % local_prep]
+                keys.append(
+                    worker._writer_key_for_block(global_block_index, block_idx)
+                )
+
+        assert sorted(keys) == list(range(len(keys)))
+        counts = Counter(writer_for_key(key, num_writers) for key in keys)
+        writer_counts = [counts[i] for i in range(num_writers)]
+        assert max(writer_counts) - min(writer_counts) <= 1
+
+
 def test_writer_raises_on_mismatched_output_channels_and_writers():
     cfg = InferenceConfig(devices=["cpu"])
     write_q: "queue.Queue[Optional[Preds]]" = queue.Queue()
@@ -258,7 +377,7 @@ def test_writer_raises_on_mismatched_output_channels_and_writers():
     preds = Preds(
         block_idx=(0, 0, 0),
         block_bbox=(slice(0, 2), slice(0, 2), slice(0, 2)),
-        linear_k=0,
+        writer_key=0,
         starts_in_block=[(0, 0, 0)],
         host_out=torch.zeros((1, 2, 2, 2, 2), dtype=torch.float32),
         valid_sizes=[(2, 2, 2)],
@@ -348,7 +467,7 @@ def test_nonlinear_intensity_inverse_runs_once_after_patch_accumulation():
     preds = Preds(
         block_idx=(0, 0, 0),
         block_bbox=(slice(0, 2), slice(0, 2), slice(0, 2)),
-        linear_k=0,
+        writer_key=0,
         starts_in_block=[(0, 0, 0), (0, 0, 0)],
         host_out=host_out,
         valid_sizes=[(2, 2, 2), (2, 2, 2)],
@@ -402,7 +521,7 @@ def test_writer_per_output_merge_post_and_dtype():
     preds = Preds(
         block_idx=(0, 0, 0),
         block_bbox=(slice(0, 2), slice(0, 2), slice(0, 2)),
-        linear_k=0,
+        writer_key=0,
         starts_in_block=[(0, 0, 0)],
         host_out=host_out,
         valid_sizes=[(2, 2, 2)],
