@@ -66,6 +66,10 @@ class InferenceConfig(BaseModel):
 
     # Concurrency / queues
     max_inflight_batches: int = Field(default=64, description="Max in-flight batches")
+    max_pending_writes: int = Field(
+        default=2,
+        description="Maximum asynchronous writes pending per writer worker",
+    )
 
     # Sharding
     shard_count: int = Field(
@@ -322,6 +326,8 @@ class InferenceConfig(BaseModel):
             raise ValueError("batch_size must be > 0")
         if self.max_inflight_batches <= 0:
             raise ValueError("max_inflight_batches must be > 0")
+        if self.max_pending_writes <= 0:
+            raise ValueError("max_pending_writes must be > 0")
 
         # Devices
         if not self.devices:

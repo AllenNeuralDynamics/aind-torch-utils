@@ -1,5 +1,6 @@
 import queue
 import threading
+import weakref
 from collections import Counter
 from typing import Optional
 
@@ -123,6 +124,63 @@ class _FakeStore:
         return _FakeSlice(self)
 
 
+class _TrackedWriteFuture:
+    """Controllable write future that does not retain its source array."""
+
+    def __init__(self, store, write_index, source, fail):
+        self._store = store
+        self._write_index = write_index
+        self._source_ref = weakref.ref(source)
+        self._fail = fail
+
+    def result(self):
+        self._store.events.append(("result", self._write_index))
+        self._store.source_alive_at_result.append(self._source_ref() is not None)
+        self._store.inflight -= 1
+        if self._fail:
+            raise RuntimeError(f"asynchronous write {self._write_index} failed")
+
+
+class _TrackedAsyncSlice:
+    def __init__(self, store):
+        self._store = store
+
+    def write(self, arr):
+        write_index = self._store.write_count
+        self._store.write_count += 1
+        self._store.inflight += 1
+        self._store.max_inflight = max(
+            self._store.max_inflight, self._store.inflight
+        )
+        self._store.events.append(("write", write_index))
+        return _TrackedWriteFuture(
+            self._store,
+            write_index,
+            arr,
+            write_index in self._store.fail_indices,
+        )
+
+
+class _TrackedAsyncStore:
+    """TensorStore stand-in for checking asynchronous writer behavior."""
+
+    def __init__(self, fail_indices=()):
+        self._dtype = _FakeDtype(np.float32)
+        self.fail_indices = set(fail_indices)
+        self.events = []
+        self.source_alive_at_result = []
+        self.write_count = 0
+        self.inflight = 0
+        self.max_inflight = 0
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    def __getitem__(self, key):
+        return _TrackedAsyncSlice(self)
+
+
 def _block_ctx(extent=2, full_shape=(2, 2, 2)):
     """A no-halo BlockContext for a block spanning [0, extent) on each axis."""
     bbox = (slice(0, extent),) * 3
@@ -173,6 +231,26 @@ def _run_writer_once(cfg, store, preds, preprocess):
         outputs=[_spec(cfg, store)],
         write_q=write_q,
         preprocess=preprocess,
+    ).run(threading.Event())
+
+
+def _run_single_patch_blocks(cfg, store, block_count):
+    """Run several independently accumulated blocks through one writer."""
+    write_q: "queue.Queue[Optional[Preds]]" = queue.Queue()
+    for block_index in range(block_count):
+        preds = _single_patch_preds(
+            torch.full((1, 1, 2, 2, 2), float(block_index)),
+            transform_state=None,
+        )
+        preds.block_idx = (block_index, 0, 0)
+        preds.writer_key = block_index
+        write_q.put(preds)
+    write_q.put(None)
+    WriterWorker(
+        cfg=cfg,
+        outputs=[_spec(cfg, store)],
+        write_q=write_q,
+        preprocess=IdentityTransform(),
     ).run(threading.Event())
 
 
@@ -431,6 +509,49 @@ def test_writer_ignores_transform_state_when_denorm_disabled():
     )
 
     np.testing.assert_allclose(store.written, 0.5)
+
+
+def test_writer_bounds_asynchronous_writes_and_retains_sources_until_completion():
+    cfg = InferenceConfig(
+        devices=["cpu"],
+        output_denormalize=False,
+        max_pending_writes=2,
+    )
+    store = _TrackedAsyncStore()
+
+    _run_single_patch_blocks(cfg, store, block_count=3)
+
+    # Two writes are submitted without waiting; the third applies backpressure.
+    assert store.events[:3] == [("write", 0), ("write", 1), ("result", 0)]
+    assert store.max_inflight == cfg.max_pending_writes
+    # The sentinel flushes both writes that remain after backpressure releases.
+    assert [event for event in store.events if event[0] == "result"] == [
+        ("result", 0),
+        ("result", 1),
+        ("result", 2),
+    ]
+    assert store.inflight == 0
+    assert all(store.source_alive_at_result)
+
+
+def test_writer_flushes_all_pending_writes_and_propagates_async_error():
+    cfg = InferenceConfig(
+        devices=["cpu"],
+        output_denormalize=False,
+        max_pending_writes=3,
+    )
+    store = _TrackedAsyncStore(fail_indices={0})
+
+    with pytest.raises(RuntimeError, match="asynchronous write 0 failed"):
+        _run_single_patch_blocks(cfg, store, block_count=3)
+
+    # One failed future must not prevent the remaining writes from being awaited.
+    assert [event for event in store.events if event[0] == "result"] == [
+        ("result", 0),
+        ("result", 1),
+        ("result", 2),
+    ]
+    assert store.inflight == 0
 
 
 def test_nonlinear_intensity_inverse_runs_once_after_patch_accumulation():

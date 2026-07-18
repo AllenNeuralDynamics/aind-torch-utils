@@ -1,9 +1,10 @@
 import logging
 import queue
 import threading
+from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import tensorstore as ts
@@ -665,6 +666,62 @@ class _BlockState:
     seen: int = 0
 
 
+@dataclass(slots=True)
+class _PendingWrite:
+    """A write future and the source array it may still reference."""
+
+    future: Any
+    source: np.ndarray
+
+
+class _BoundedPendingWrites:
+    """Keep a bounded set of asynchronous writes alive and observable."""
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self._writes: Deque[_PendingWrite] = deque()
+
+    def __enter__(self) -> "_BoundedPendingWrites":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        if exc_type is None:
+            self.flush()
+        else:
+            try:
+                self.flush()
+            except Exception:  # noqa: BLE001 - preserve the original worker error
+                logger.exception(
+                    "A pending TensorStore write also failed during shutdown."
+                )
+        return False
+
+    def _wait_for_oldest(self) -> None:
+        pending = self._writes.popleft()
+        # Keep `pending.source` strongly referenced until TensorStore reports
+        # that the write is committed. Calling result() also surfaces failures.
+        pending.future.result()
+
+    def submit(self, target: Any, source: np.ndarray) -> None:
+        """Start a write, waiting first when the pending-write limit is full."""
+        if len(self._writes) >= self.limit:
+            self._wait_for_oldest()
+        future = target.write(source)
+        self._writes.append(_PendingWrite(future=future, source=source))
+
+    def flush(self) -> None:
+        """Wait for every pending write and raise the first asynchronous error."""
+        first_error: Optional[Exception] = None
+        while self._writes:
+            try:
+                self._wait_for_oldest()
+            except Exception as exc:  # noqa: BLE001 - drain all writes before raising
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+
 class WriterWorker:
     """
     Worker that accumulates predictions for a block and writes the result.
@@ -747,82 +804,90 @@ class WriterWorker:
             else None
         )
 
-        while not stop_event.is_set():
-            try:
-                preds = self.write_q.get(timeout=0.1)
-            except queue.Empty:
-                continue
+        with _BoundedPendingWrites(self.cfg.max_pending_writes) as pending_writes:
+            while not stop_event.is_set():
+                try:
+                    preds = self.write_q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
 
-            if preds is None:
-                break  # single sentinel closes the writer
+                if preds is None:
+                    break  # single sentinel closes the writer
 
-            if getattr(preds, "ready_event", None) is not None:
-                preds.ready_event.synchronize()
+                if getattr(preds, "ready_event", None) is not None:
+                    preds.ready_event.synchronize()
 
-            zsl, ysl, xsl = preds.block_bbox
-            core_bz, core_by, core_bx = (
-                zsl.stop - zsl.start,
-                ysl.stop - ysl.start,
-                xsl.stop - xsl.start,
-            )
-
-            # Block placement is identical for every Preds of this block; it was
-            # built once in the prep stage and rides on the carrier.
-            ctx = preds.ctx
-
-            state = self.blocks.get(preds.block_idx)
-            if state is None:
-                state = _BlockState(
-                    accs=self._make_accumulators(preds.acc_shape, ctx)
-                )
-                self.blocks[preds.block_idx] = state
-            accs = state.accs
-
-            out_np = preds.host_out.numpy()  # (B, N, pz, py, px) or (B, 1, pz, py, px)
-            # Ensure the tensor has a channel dimension that matches the outputs
-            if out_np.ndim == 4:
-                # legacy single-output (B, pz, py, px) — add channel dim
-                out_np = out_np[:, np.newaxis]
-
-            if out_np.ndim != 5:
-                raise ValueError(
-                    "Expected model output with shape (B, N, Z, Y, X) "
-                    f"(or legacy (B, Z, Y, X)); got shape {out_np.shape}"
+                zsl, ysl, xsl = preds.block_bbox
+                core_bz, core_by, core_bx = (
+                    zsl.stop - zsl.start,
+                    ysl.stop - ysl.start,
+                    xsl.stop - xsl.start,
                 )
 
-            if out_np.shape[1] != len(self.outputs):
-                raise ValueError(
-                    "Mismatch between model output channels and output specs: "
-                    f"got N={out_np.shape[1]} channels but {len(self.outputs)} "
-                    f"output(s) for block {preds.block_idx}."
-                )
+                # Block placement is identical for every Preds of this block; it was
+                # built once in the prep stage and rides on the carrier.
+                ctx = preds.ctx
 
-            # Merge patches in the transform's *output* space. For an output that
-            # inverts with a nonlinear transform declaring 'before_accumulate', the
-            # inverse must run per patch (it does not commute with averaging); the
-            # common linear case inverts once per block after finalize (below).
-            for bi, (sz, sy, sx) in enumerate(preds.starts_in_block):
-                dz, dy, dx = preds.valid_sizes[bi]
-                for n, (spec, acc) in enumerate(zip(self.outputs, accs)):
-                    pp = out_np[bi, n].astype(np.float32, copy=False)
-                    if spec.invert and inverse_stage == "before_accumulate":
-                        pp = self.preprocess.inverse(pp, preds.transform_state, ctx)
-                    acc.add(pp, (sz, sy, sx), (dz, dy, dx))
-            state.seen += len(preds.starts_in_block)
+                state = self.blocks.get(preds.block_idx)
+                if state is None:
+                    state = _BlockState(
+                        accs=self._make_accumulators(preds.acc_shape, ctx)
+                    )
+                    self.blocks[preds.block_idx] = state
+                accs = state.accs
 
-            if state.seen >= preds.total_patches_in_block:
-                lz, ly, lx = preds.halo_left
-                for spec, acc in zip(self.outputs, accs):
-                    ext = acc.finalize()  # expanded (core + halo)
-                    if spec.invert and inverse_stage == "after_finalize":
-                        ext = self.preprocess.inverse(
-                            ext, preds.transform_state, ctx
-                        )
-                    if spec.postprocess is not None:
-                        ext = spec.postprocess(ext, ctx)
-                    core = ext[lz : lz + core_bz, ly : ly + core_by, lx : lx + core_bx]
-                    out_arr = self._cast_to_store(core, spec.store)
-                    spec.store[self.cfg.t_idx, self.cfg.c_idx, zsl, ysl, xsl].write(
-                        out_arr
-                    ).result()
-                del self.blocks[preds.block_idx]
+                out_np = preds.host_out.numpy()
+                # Ensure the tensor has a channel dimension that matches the outputs
+                if out_np.ndim == 4:
+                    # legacy single-output (B, pz, py, px) — add channel dim
+                    out_np = out_np[:, np.newaxis]
+
+                if out_np.ndim != 5:
+                    raise ValueError(
+                        "Expected model output with shape (B, N, Z, Y, X) "
+                        f"(or legacy (B, Z, Y, X)); got shape {out_np.shape}"
+                    )
+
+                if out_np.shape[1] != len(self.outputs):
+                    raise ValueError(
+                        "Mismatch between model output channels and output specs: "
+                        f"got N={out_np.shape[1]} channels but {len(self.outputs)} "
+                        f"output(s) for block {preds.block_idx}."
+                    )
+
+                # Merge patches in the transform's *output* space. For an output that
+                # inverts with a nonlinear transform declaring 'before_accumulate', the
+                # inverse must run per patch (it does not commute with averaging); the
+                # common linear case inverts once per block after finalize (below).
+                for bi, (sz, sy, sx) in enumerate(preds.starts_in_block):
+                    dz, dy, dx = preds.valid_sizes[bi]
+                    for n, (spec, acc) in enumerate(zip(self.outputs, accs)):
+                        pp = out_np[bi, n].astype(np.float32, copy=False)
+                        if spec.invert and inverse_stage == "before_accumulate":
+                            pp = self.preprocess.inverse(
+                                pp, preds.transform_state, ctx
+                            )
+                        acc.add(pp, (sz, sy, sx), (dz, dy, dx))
+                state.seen += len(preds.starts_in_block)
+
+                if state.seen >= preds.total_patches_in_block:
+                    lz, ly, lx = preds.halo_left
+                    for spec, acc in zip(self.outputs, accs):
+                        ext = acc.finalize()  # expanded (core + halo)
+                        if spec.invert and inverse_stage == "after_finalize":
+                            ext = self.preprocess.inverse(
+                                ext, preds.transform_state, ctx
+                            )
+                        if spec.postprocess is not None:
+                            ext = spec.postprocess(ext, ctx)
+                        core = ext[
+                            lz : lz + core_bz,
+                            ly : ly + core_by,
+                            lx : lx + core_bx,
+                        ]
+                        out_arr = self._cast_to_store(core, spec.store)
+                        target = spec.store[
+                            self.cfg.t_idx, self.cfg.c_idx, zsl, ysl, xsl
+                        ]
+                        pending_writes.submit(target, out_arr)
+                    del self.blocks[preds.block_idx]

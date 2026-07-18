@@ -15,6 +15,12 @@ def test_precision_performance_defaults_to_false():
     assert cfg.cudnn_benchmark is False
     assert cfg.compile_mode == "default"
     assert cfg.compile_dynamic is None
+    assert cfg.max_pending_writes == 2
+
+
+def test_max_pending_writes_must_be_positive():
+    with pytest.raises(ValueError, match="max_pending_writes must be > 0"):
+        InferenceConfig(max_pending_writes=0)
 
 
 @pytest.mark.parametrize("field", ["use_tf32", "cudnn_benchmark"])
