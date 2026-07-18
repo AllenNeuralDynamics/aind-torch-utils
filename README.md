@@ -70,6 +70,32 @@ python -m aind_torch_utils.run \
     --weights /data/BM4DNet-20250905-169-0.0073.pth
 ```
 
+## Checkpoint-Aware `denoise-net` Workflow
+
+For checkpoints that contain both the U-Net configuration and its serialized
+intensity transform, put the workflow parameters in `denoise-params.json`:
+
+```json
+{"checkpoint_path": "/data/model.pth", "offset": 73.5}
+```
+
+Then use the registered workflow:
+
+```bash
+python -m aind_torch_utils.run \
+    --in-spec "data/in_spec.json" \
+    --out-spec "data/out_spec.json" \
+    --workflow denoise-net \
+    --workflow-params denoise-params.json
+```
+
+`checkpoint_path` is required. `offset` is optional; omit it to use the saved
+checkpoint transform unchanged. The default output inversion restores count-space
+predictions. Use `--no-output-denormalize` only when transformed-space output is
+intentional. Generic `--normalize` settings do not override a workflow-provided
+transform. `--model-type denoise-net --weights ...` remains the legacy raw-model
+path.
+
 ## Programmatic Usage
 ```python
 from aind_torch_utils.config import InferenceConfig
@@ -124,6 +150,24 @@ run(
     num_writer_workers=2,
 )
 ```
+
+The checkpoint-aware equivalent is:
+
+```python
+import aind_torch_utils.recipes  # register bundled recipes
+from aind_torch_utils.run import run_workflow
+from aind_torch_utils.workflow import WorkflowRegistry
+
+workflow = WorkflowRegistry.build(
+    "denoise-net",
+    {"checkpoint_path": "/data/model.pth", "offset": 73.5},
+)
+run_workflow(workflow, input_store, output_store, cfg)
+```
+
+Leave out `offset` to preserve the checkpoint mapping. The workflow leaves output
+specification and execution policy unset, so `InferenceConfig` continues to control
+output inversion, AMP, compilation, seam handling, devices, and stores.
 
 > Configuration Note: The example above only sets a subset of available fields. For the complete list of parameters, validation rules, and detailed descriptions, open `src/aind_torch_utils/config.py` and review the `InferenceConfig` class doc/Field metadata.
 
