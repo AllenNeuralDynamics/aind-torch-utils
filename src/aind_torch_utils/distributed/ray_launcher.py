@@ -13,8 +13,10 @@ from aind_torch_utils.run import _parse_args as parse_inference_args
 from aind_torch_utils.run import (
     load_model,
     run,
+    run_workflow,
 )
 from aind_torch_utils.utils import open_ts_spec
+from aind_torch_utils.workflow import WorkflowRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +102,49 @@ def _make_shard_payload(
     return {"config": cfg_dict, "metrics_json": metrics_path}
 
 
+def _load_workflow_params(path: Optional[str]) -> Dict[str, Any]:
+    """Load workflow builder parameters from a JSON file."""
+    if not path:
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        params = json.load(f)
+    if not isinstance(params, dict):
+        raise TypeError("Workflow parameters must be a JSON object.")
+    return params
+
+
+def _run_shard(
+    run_args: argparse.Namespace,
+    workflow_params: Dict[str, Any],
+    cfg: InferenceConfig,
+    input_spec: Dict[str, Any],
+    output_specs: Sequence[Dict[str, Any]],
+    metrics_json: Optional[str],
+) -> None:
+    """Open a shard's stores and execute its selected model or workflow."""
+    input_store = open_ts_spec(copy.deepcopy(input_spec))
+    output_stores = [open_ts_spec(copy.deepcopy(spec)) for spec in output_specs]
+    run_kwargs = dict(
+        metrics_json=metrics_json,
+        metrics_interval=run_args.metrics_interval,
+        num_prep_workers=max(1, run_args.prep_workers),
+        num_writer_workers=max(1, run_args.writer_workers),
+    )
+
+    if run_args.workflow:
+        workflow = WorkflowRegistry.build(
+            run_args.workflow, copy.deepcopy(workflow_params)
+        )
+        run_workflow(workflow, input_store, output_stores, cfg, **run_kwargs)
+    else:
+        model = load_model(run_args.model_type, run_args.weights)
+        run(model, input_store, output_stores, cfg, **run_kwargs)
+
+
 def _launch_locally(
     base_cfg: InferenceConfig,
     run_args: argparse.Namespace,
+    workflow_params: Dict[str, Any],
     shards: int,
     metrics_template: Optional[str],
     input_spec: Dict[str, Any],
@@ -119,18 +161,13 @@ def _launch_locally(
         )
         cfg = InferenceConfig(**payload["config"])
         cfg.devices = list(_canonical_devices(cfg.devices))
-        model = load_model(run_args.model_type, run_args.weights)
-        input_store = open_ts_spec(copy.deepcopy(input_spec))
-        output_stores = [open_ts_spec(copy.deepcopy(spec)) for spec in output_specs]
-        run(
-            model,
-            input_store,
-            output_stores,
+        _run_shard(
+            run_args,
+            workflow_params,
             cfg,
-            metrics_json=payload["metrics_json"],
-            metrics_interval=run_args.metrics_interval,
-            num_prep_workers=max(1, run_args.prep_workers),
-            num_writer_workers=max(1, run_args.writer_workers),
+            input_spec,
+            output_specs,
+            payload["metrics_json"],
         )
 
 
@@ -188,6 +225,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     ray_args, run_args = _parse_ray_args(argv)
 
+    if bool(run_args.model_type) == bool(run_args.workflow):
+        raise SystemExit("Provide exactly one of --model-type or --workflow.")
+    if run_args.workflow and run_args.weights:
+        raise SystemExit(
+            "--weights only applies with --model-type; pass weights to the "
+            "workflow via --workflow-params."
+        )
+    workflow_params = (
+        _load_workflow_params(run_args.workflow_params) if run_args.workflow else {}
+    )
+
     base_cfg = _build_inference_config(run_args)
     shards = ray_args.num_shards or max(1, base_cfg.shard_count)
     if shards != base_cfg.shard_count:
@@ -221,6 +269,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         _launch_locally(
             base_cfg,
             run_args,
+            workflow_params,
             shards,
             metrics_template,
             input_spec_dict,
@@ -253,20 +302,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             cfg = InferenceConfig(**cfg_dict)
             cfg.devices = list(_canonical_devices(cfg.devices))
             metrics_json = payload["metrics_json"]
-            model = load_model(run_args.model_type, run_args.weights)
-            input_store = open_ts_spec(copy.deepcopy(input_spec_dict))
-            output_stores = [
-                open_ts_spec(copy.deepcopy(spec)) for spec in output_specs_for_shards
-            ]
-            run(
-                model,
-                input_store,
-                output_stores,
+            _run_shard(
+                run_args,
+                workflow_params,
                 cfg,
-                metrics_json=metrics_json,
-                metrics_interval=run_args.metrics_interval,
-                num_prep_workers=max(1, run_args.prep_workers),
-                num_writer_workers=max(1, run_args.writer_workers),
+                input_spec_dict,
+                output_specs_for_shards,
+                metrics_json,
             )
 
         futures = []
