@@ -70,6 +70,13 @@ class InferenceConfig(BaseModel):
         default=2,
         description="Maximum asynchronous writes pending per writer worker",
     )
+    tensorstore_data_copy_concurrency: int = Field(
+        default=8,
+        description=(
+            "Per-shard TensorStore data_copy_concurrency limit shared by all "
+            "input and output stores"
+        ),
+    )
 
     # Sharding
     shard_count: int = Field(
@@ -328,6 +335,8 @@ class InferenceConfig(BaseModel):
             raise ValueError("max_inflight_batches must be > 0")
         if self.max_pending_writes <= 0:
             raise ValueError("max_pending_writes must be > 0")
+        if self.tensorstore_data_copy_concurrency <= 0:
+            raise ValueError("tensorstore_data_copy_concurrency must be > 0")
 
         # Devices
         if not self.devices:

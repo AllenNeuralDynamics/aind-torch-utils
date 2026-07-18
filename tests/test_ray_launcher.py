@@ -83,7 +83,7 @@ def test_workflow_runs_in_local_and_ray_paths(
 
     monkeypatch.setattr(launcher.WorkflowRegistry, "build", build)
     monkeypatch.setattr(launcher, "run_workflow", run_workflow)
-    monkeypatch.setattr(launcher, "open_ts_spec", lambda spec: spec)
+    monkeypatch.setattr(launcher, "open_ts_spec", lambda spec, **kwargs: spec)
     monkeypatch.setattr(
         launcher,
         "load_model",
@@ -143,7 +143,7 @@ def test_model_path_still_loads_registered_model(monkeypatch):
             cfg=selected_cfg,
         )
 
-    monkeypatch.setattr(launcher, "open_ts_spec", lambda spec: spec)
+    monkeypatch.setattr(launcher, "open_ts_spec", lambda spec, **kwargs: spec)
     monkeypatch.setattr(launcher, "load_model", lambda *args: model)
     monkeypatch.setattr(launcher, "run", run_model)
 
@@ -161,4 +161,61 @@ def test_model_path_still_loads_registered_model(monkeypatch):
         "input_store": {"driver": "input"},
         "output_stores": [{"driver": "output"}],
         "cfg": cfg,
+    }
+
+
+def test_run_shard_uses_one_tensorstore_context_for_all_stores(monkeypatch):
+    args = launcher.parse_inference_args(
+        [
+            "--in-spec",
+            "in.json",
+            "--out-spec",
+            "out.json",
+            "--model-type",
+            "legacy",
+        ]
+    )
+    cfg = launcher.InferenceConfig(
+        tensorstore_data_copy_concurrency=10,
+    )
+    shared_context = object()
+    opened = []
+
+    def open_store(spec, *, context=None):
+        opened.append((spec, context))
+        return spec
+
+    monkeypatch.setattr(
+        launcher,
+        "_make_shard_tensorstore_context",
+        lambda selected_cfg: shared_context,
+    )
+    monkeypatch.setattr(launcher, "open_ts_spec", open_store)
+    monkeypatch.setattr(launcher, "load_model", lambda *args: object())
+    monkeypatch.setattr(launcher, "run", lambda *args, **kwargs: None)
+
+    launcher._run_shard(
+        args,
+        {},
+        cfg,
+        {"driver": "input"},
+        [{"driver": "output-0"}, {"driver": "output-1"}],
+        None,
+    )
+
+    assert [spec for spec, _ in opened] == [
+        {"driver": "input"},
+        {"driver": "output-0"},
+        {"driver": "output-1"},
+    ]
+    assert all(context is shared_context for _, context in opened)
+
+
+def test_shard_tensorstore_context_uses_configured_copy_limit():
+    cfg = launcher.InferenceConfig(tensorstore_data_copy_concurrency=12)
+
+    context = launcher._make_shard_tensorstore_context(cfg)
+
+    assert context.spec.to_json() == {
+        "data_copy_concurrency": {"limit": 12}
     }

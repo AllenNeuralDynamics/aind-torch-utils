@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Iterator, List, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import tensorstore as ts
 
@@ -31,7 +31,11 @@ def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-def open_ts_spec(path_or_json: Union[str, Dict[str, Any]]) -> Any:
+def open_ts_spec(
+    path_or_json: Union[str, Dict[str, Any]],
+    *,
+    context: Optional[ts.Context] = None,
+) -> Any:
     """Open a TensorStore from a JSON spec.
 
     Parameters
@@ -41,6 +45,9 @@ def open_ts_spec(path_or_json: Union[str, Dict[str, Any]]) -> Any:
         * Raw JSON string (``"{...}"`` or ``"[...]"``)
         * Filesystem path to a JSON spec file
         * In-memory dictionary spec
+    context : Optional[ts.Context], optional
+        Explicit TensorStore context whose resources should be shared by this
+        store. When omitted, TensorStore uses its default context behavior.
 
     Returns
     -------
@@ -58,7 +65,7 @@ def open_ts_spec(path_or_json: Union[str, Dict[str, Any]]) -> Any:
                 spec = json.load(f)
     else:
         spec = path_or_json
-    return ts.open(spec).result()
+    return ts.open(spec, context=context).result()
 
 
 def iter_blocks_zyx(

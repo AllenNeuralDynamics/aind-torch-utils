@@ -8,6 +8,8 @@ import os
 import sys
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
+import tensorstore as ts
+
 from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.run import _parse_args as parse_inference_args
 from aind_torch_utils.run import (
@@ -113,6 +115,17 @@ def _load_workflow_params(path: Optional[str]) -> Dict[str, Any]:
     return params
 
 
+def _make_shard_tensorstore_context(cfg: InferenceConfig) -> ts.Context:
+    """Create the TensorStore resource context shared by one shard's stores."""
+    return ts.Context(
+        {
+            "data_copy_concurrency": {
+                "limit": cfg.tensorstore_data_copy_concurrency,
+            }
+        }
+    )
+
+
 def _run_shard(
     run_args: argparse.Namespace,
     workflow_params: Dict[str, Any],
@@ -122,8 +135,20 @@ def _run_shard(
     metrics_json: Optional[str],
 ) -> None:
     """Open a shard's stores and execute its selected model or workflow."""
-    input_store = open_ts_spec(copy.deepcopy(input_spec))
-    output_stores = [open_ts_spec(copy.deepcopy(spec)) for spec in output_specs]
+    store_context = _make_shard_tensorstore_context(cfg)
+    logger.info(
+        "Shard %d TensorStore data_copy_concurrency.limit=%d",
+        cfg.shard_index,
+        cfg.tensorstore_data_copy_concurrency,
+    )
+    input_store = open_ts_spec(
+        copy.deepcopy(input_spec),
+        context=store_context,
+    )
+    output_stores = [
+        open_ts_spec(copy.deepcopy(spec), context=store_context)
+        for spec in output_specs
+    ]
     run_kwargs = dict(
         metrics_json=metrics_json,
         metrics_interval=run_args.metrics_interval,

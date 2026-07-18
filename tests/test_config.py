@@ -16,11 +16,19 @@ def test_precision_performance_defaults_to_false():
     assert cfg.compile_mode == "default"
     assert cfg.compile_dynamic is None
     assert cfg.max_pending_writes == 2
+    assert cfg.tensorstore_data_copy_concurrency == 8
 
 
 def test_max_pending_writes_must_be_positive():
     with pytest.raises(ValueError, match="max_pending_writes must be > 0"):
         InferenceConfig(max_pending_writes=0)
+
+
+def test_tensorstore_data_copy_concurrency_must_be_positive():
+    with pytest.raises(
+        ValueError, match="tensorstore_data_copy_concurrency must be > 0"
+    ):
+        InferenceConfig(tensorstore_data_copy_concurrency=0)
 
 
 @pytest.mark.parametrize("field", ["use_tf32", "cudnn_benchmark"])
