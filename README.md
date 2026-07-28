@@ -177,6 +177,14 @@ If `--metrics-json` provided:
 - System metrics (CPU %, RAM, GPU (if implemented))
 Use to diagnose stalls (e.g., GPU idle while prep queue empty => increase prep workers / decrease IO latency).
 
+## Beaker
+
+The production-shaped smoke deployment is one 8-GPU Beaker node running eight
+local Ray shards against S3 TensorStores. See
+[`beaker/README.md`](beaker/README.md) for the immutable image build, run-assets
+dataset, secrets, v2 experiment template, safety constraints, and verification
+procedure.
+
 ## Custom Model Registration
 Add your model directly to `src/aind_torch_utils/models.py` so it is automatically available when the package is imported.
 

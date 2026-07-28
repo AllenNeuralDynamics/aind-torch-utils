@@ -1,0 +1,9 @@
+{
+  "driver": "zarr",
+  "kvstore": {
+    "driver": "s3",
+    "bucket": "<S3_BUCKET>",
+    "path": "<S3_INPUT_PREFIX>/input.zarr"
+  }
+}
+

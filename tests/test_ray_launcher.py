@@ -1,6 +1,7 @@
 """Tests for model and workflow dispatch in the Ray launcher."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,10 +12,12 @@ from aind_torch_utils.workflow import Workflow
 class _ImmediateRemote:
     """Small Ray remote-function stand-in that executes synchronously."""
 
-    def __init__(self, fn):
+    def __init__(self, fn, ray):
         self._fn = fn
+        self._ray = ray
 
     def remote(self, *args, **kwargs):
+        self._ray.remote_calls.append((args, kwargs))
         return self._fn(*args, **kwargs)
 
 
@@ -24,19 +27,51 @@ class _ImmediateRay:
     def __init__(self):
         self.init_kwargs = None
         self.shutdown_called = False
+        self.get_called = False
+        self.remote_options = []
+        self.remote_calls = []
 
     def init(self, **kwargs):
         self.init_kwargs = kwargs
 
     def remote(self, **options):
-        del options
-        return _ImmediateRemote
+        self.remote_options.append(options)
+
+        def decorate(fn):
+            return _ImmediateRemote(fn, self)
+
+        return decorate
 
     def get(self, futures):
+        self.get_called = True
         return futures
 
     def shutdown(self):
         self.shutdown_called = True
+
+
+class _GetFailureRay(_ImmediateRay):
+    """Ray stand-in that reports a remote failure from ``ray.get``."""
+
+    def remote(self, **options):
+        self.remote_options.append(options)
+        ray = self
+
+        class _DeferredRemote:
+            @staticmethod
+            def remote(*args, **kwargs):
+                ray.remote_calls.append((args, kwargs))
+                return object()
+
+        def decorate(fn):
+            del fn
+            return _DeferredRemote
+
+        return decorate
+
+    def get(self, futures):
+        self.get_called = True
+        raise RuntimeError("shard failed")
 
 
 def _workflow_args(tmp_path, *extra):
@@ -219,3 +254,164 @@ def test_shard_tensorstore_context_uses_configured_copy_limit():
     assert context.spec.to_json() == {
         "data_copy_concurrency": {"limit": 12}
     }
+
+
+@pytest.mark.parametrize(
+    "chunk",
+    [
+        (1, 1, 64, 64, 64),
+        (1, 1, 32, 16, 8),
+    ],
+)
+def test_multi_shard_zarr_layout_accepts_equal_and_divisor_chunks(chunk):
+    launcher._validate_zarr_chunk_layout(
+        (64, 64, 64),
+        chunk,
+        (0, 0, 0, 0, 0),
+        output_label="output 0",
+    )
+
+
+@pytest.mark.parametrize(
+    ("chunk", "origin"),
+    [
+        ((1, 1, 128, 64, 64), (0, 0, 0, 0, 0)),
+        ((1, 1, 48, 64, 64), (0, 0, 0, 0, 0)),
+        ((1, 1, 32, 64, 64), (0, 0, 16, 0, 0)),
+        ((1, 1, None, 64, 64), (0, 0, 0, 0, 0)),
+    ],
+)
+def test_multi_shard_zarr_layout_rejects_unsafe_chunks(chunk, origin):
+    with pytest.raises(
+        ValueError,
+        match=r"block=.*chunk=.*grid_origin=",
+    ):
+        launcher._validate_zarr_chunk_layout(
+            (64, 64, 64),
+            chunk,
+            origin,
+            output_label="output 0",
+        )
+
+
+def test_declared_unsafe_layout_fails_before_destructive_open_or_ray(
+    tmp_path, monkeypatch
+):
+    args = _workflow_args(tmp_path, "--num-shards", "2")
+    output_spec_path = tmp_path / "out.json"
+    output_spec_path.write_text(
+        json.dumps(
+            {
+                "driver": "zarr",
+                "kvstore": {"driver": "memory"},
+                "metadata": {
+                    "shape": [1, 1, 128, 256, 256],
+                    "chunks": [1, 1, 64, 96, 64],
+                    "dtype": "<u2",
+                },
+                "create": True,
+                "delete_existing": True,
+            }
+        )
+    )
+    monkeypatch.setattr(
+        launcher,
+        "open_ts_spec",
+        lambda *args, **kwargs: pytest.fail("destructive output open occurred"),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_import_ray",
+        lambda: pytest.fail("Ray was initialized"),
+    )
+
+    with pytest.raises(ValueError, match="Unsafe multi-shard Zarr"):
+        launcher.main(args)
+
+
+def test_effective_unsafe_layout_fails_before_ray_init(tmp_path, monkeypatch):
+    args = _workflow_args(tmp_path, "--num-shards", "2")
+    output_spec_path = tmp_path / "out.json"
+    output_spec_path.write_text(
+        json.dumps(
+            {
+                "driver": "zarr",
+                "kvstore": {"driver": "memory"},
+                "open": True,
+            }
+        )
+    )
+    layout = SimpleNamespace(
+        write_chunk=SimpleNamespace(shape=(1, 1, 64, 64, 64)),
+        grid_origin=(0, 0, 32, 0, 0),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "open_ts_spec",
+        lambda *args, **kwargs: SimpleNamespace(chunk_layout=layout),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_import_ray",
+        lambda: pytest.fail("Ray was initialized"),
+    )
+
+    with pytest.raises(ValueError, match="grid_origin=\\(32, 0, 0\\)"):
+        launcher.main(args)
+
+
+def test_single_node_ray_launches_eight_one_gpu_shards(tmp_path, monkeypatch):
+    fake_ray = _ImmediateRay()
+    shard_runs = []
+
+    def capture_shard(
+        run_args,
+        workflow_params,
+        cfg,
+        input_spec,
+        output_specs,
+        metrics_json,
+    ):
+        shard_runs.append((cfg, metrics_json))
+
+    monkeypatch.setattr(launcher, "_import_ray", lambda: fake_ray)
+    monkeypatch.setattr(launcher, "open_ts_spec", lambda spec, **kwargs: spec)
+    monkeypatch.setattr(launcher, "_run_shard", capture_shard)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "7")
+
+    launcher.main(
+        _workflow_args(
+            tmp_path,
+            "--num-shards",
+            "8",
+            "--cpus-per-shard",
+            "8",
+            "--gpus-per-shard",
+            "1",
+            "--metrics-json-template",
+            "/results/metrics_shard{shard}.json",
+        )
+    )
+
+    assert fake_ray.init_kwargs == {}
+    assert fake_ray.remote_options == [{"num_cpus": 8.0, "num_gpus": 1.0}]
+    assert len(fake_ray.remote_calls) == 8
+    assert [cfg.shard_index for cfg, _ in shard_runs] == list(range(8))
+    assert all(cfg.devices == ["cuda:0"] for cfg, _ in shard_runs)
+    assert [path for _, path in shard_runs] == [
+        f"/results/metrics_shard{shard}.json" for shard in range(8)
+    ]
+    assert fake_ray.get_called is True
+    assert fake_ray.shutdown_called is True
+
+
+def test_ray_shutdown_after_shard_failure(tmp_path, monkeypatch):
+    fake_ray = _GetFailureRay()
+    monkeypatch.setattr(launcher, "_import_ray", lambda: fake_ray)
+    monkeypatch.setattr(launcher, "open_ts_spec", lambda spec, **kwargs: spec)
+
+    with pytest.raises(RuntimeError, match="shard failed"):
+        launcher.main(_workflow_args(tmp_path))
+
+    assert fake_ray.get_called is True
+    assert fake_ray.shutdown_called is True

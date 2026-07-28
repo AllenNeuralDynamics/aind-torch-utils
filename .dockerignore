@@ -1,0 +1,44 @@
+.git
+.github
+.gitignore
+
+# Local data, scratch space, and environment state
+data
+scratch
+tmp
+environment
+metadata
+.codeocean
+.codegraph
+.venv
+venv
+env
+.env
+
+# Python/build caches and artifacts
+**/__pycache__
+**/*.py[cod]
+*.egg-info
+.eggs
+build
+dist
+.cache
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.tox
+.nox
+htmlcov
+.coverage
+coverage.xml
+
+# Documentation and test artifacts are not needed by the runtime image
+docs/build
+docs/_build
+tests
+benchmarking
+*.log
+*.ckpt
+*.pth
+metrics*.json
+

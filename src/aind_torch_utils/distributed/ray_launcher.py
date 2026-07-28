@@ -243,6 +243,117 @@ def _prepare_output_spec_for_shards(spec: Dict[str, Any]) -> Dict[str, Any]:
     return sanitized
 
 
+def _validate_zarr_chunk_layout(
+    block: Sequence[int],
+    chunk_shape: Optional[Sequence[Optional[int]]],
+    grid_origin: Optional[Sequence[Optional[int]]],
+    *,
+    output_label: str,
+) -> None:
+    """Ensure spatial blocks do not share Zarr chunks across Ray shards."""
+    spatial_block = tuple(block)
+    spatial_chunk = (
+        tuple(chunk_shape[-3:])
+        if chunk_shape is not None and len(chunk_shape) == 5
+        else None
+    )
+    spatial_origin = (
+        tuple(grid_origin[-3:])
+        if grid_origin is not None and len(grid_origin) == 5
+        else None
+    )
+    layout = (
+        f"block={spatial_block}, chunk={spatial_chunk}, "
+        f"grid_origin={spatial_origin}"
+    )
+
+    layout_is_indeterminate = spatial_chunk is None or spatial_origin is None
+    if not layout_is_indeterminate:
+        layout_is_indeterminate = any(
+            value is None for value in (*spatial_chunk, *spatial_origin)
+        )
+    if len(spatial_block) != 3 or layout_is_indeterminate:
+        raise ValueError(
+            f"Unsafe multi-shard Zarr output layout for {output_label}: "
+            f"{layout}. The 5D write chunk shape and grid origin must be "
+            "determinate before Ray tasks start."
+        )
+
+    for axis, (block_dim, chunk_dim, origin) in enumerate(
+        zip(spatial_block, spatial_chunk, spatial_origin)
+    ):
+        invalid_dimension = chunk_dim is None or origin is None
+        if not invalid_dimension:
+            invalid_dimension = any(
+                (
+                    chunk_dim <= 0,
+                    block_dim % chunk_dim != 0,
+                    origin % chunk_dim != 0,
+                )
+            )
+        if invalid_dimension:
+            axis_name = "ZYX"[axis]
+            raise ValueError(
+                f"Unsafe multi-shard Zarr output layout for {output_label} "
+                f"on spatial axis {axis_name}: {layout}. Each spatial chunk "
+                "dimension must divide its block dimension and the chunk grid "
+                "must align with the zero-based block grid."
+            )
+
+
+def _validate_declared_zarr_output(
+    spec: Dict[str, Any],
+    block: Sequence[int],
+    *,
+    output_label: str,
+) -> None:
+    """Validate declared Zarr metadata without opening or mutating its target."""
+    if spec.get("driver") != "zarr" or "metadata" not in spec:
+        return
+    try:
+        layout = ts.Spec(copy.deepcopy(spec)).chunk_layout
+        chunk_shape = layout.write_chunk.shape
+        grid_origin = layout.grid_origin
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot determine multi-shard Zarr output layout for "
+            f"{output_label} from declared metadata."
+        ) from exc
+    _validate_zarr_chunk_layout(
+        block,
+        chunk_shape,
+        grid_origin,
+        output_label=output_label,
+    )
+
+
+def _validate_opened_zarr_output(
+    spec: Dict[str, Any],
+    store: Any,
+    block: Sequence[int],
+    *,
+    output_label: str,
+) -> None:
+    """Validate the effective write layout reported by an opened Zarr store."""
+    if spec.get("driver") != "zarr":
+        return
+    try:
+        layout = store.chunk_layout
+        chunk_shape = layout.write_chunk.shape
+        grid_origin = layout.grid_origin
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot determine effective multi-shard Zarr output layout for "
+            f"{output_label} after opening it."
+        ) from exc
+    _validate_zarr_chunk_layout(
+        block,
+        chunk_shape,
+        grid_origin,
+        output_label=output_label,
+    )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -272,6 +383,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     input_spec_dict = _load_spec_arg(run_args.in_spec)
     output_spec_dicts = [_load_spec_arg(arg) for arg in run_args.out_spec]
 
+    if shards > 1:
+        for index, output_spec in enumerate(output_spec_dicts):
+            _validate_declared_zarr_output(
+                output_spec,
+                base_cfg.block,
+                output_label=f"output {index}",
+            )
+
     if ray_args.dry_run:
         logger.info(
             "Dry run: would launch %d shard(s) with strategy=%s and metrics template=%s",
@@ -284,8 +403,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     logger.info(
         "Preparing output store (create/delete as specified) before sharded run."
     )
-    for output_spec in output_spec_dicts:
-        open_ts_spec(copy.deepcopy(output_spec))
+    for index, output_spec in enumerate(output_spec_dicts):
+        output_store = open_ts_spec(copy.deepcopy(output_spec))
+        if shards > 1:
+            _validate_opened_zarr_output(
+                output_spec,
+                output_store,
+                base_cfg.block,
+                output_label=f"output {index}",
+            )
     output_specs_for_shards = [
         _prepare_output_spec_for_shards(spec) for spec in output_spec_dicts
     ]

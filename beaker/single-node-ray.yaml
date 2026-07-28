@@ -1,0 +1,65 @@
+version: v2
+description: aind-torch-utils single-node eight-GPU Ray smoke run
+budget: "<BEAKER_BUDGET>"
+retry:
+  allowedTaskRetries: 0
+tasks:
+  - name: ray-denoise-smoke
+    image:
+      # Use an immutable Beaker image ID, not a mutable image name.
+      beaker: "<IMMUTABLE_BEAKER_IMAGE_ID>"
+    command:
+      - python
+      - -m
+      - aind_torch_utils.distributed.ray_launcher
+    arguments:
+      - --num-shards
+      - "8"
+      - --cpus-per-shard
+      - "8"
+      - --gpus-per-shard
+      - "1"
+      - --metrics-json-template
+      - "/results/metrics_shard{shard}.json"
+      - --in-spec
+      - /config/input.json
+      - --out-spec
+      - /config/output.json
+      - --workflow
+      - denoise-net
+      - --workflow-params
+      - /config/workflow.json
+      - --config
+      - /config/inference.json
+    envVars:
+      - name: AWS_ACCESS_KEY_ID
+        secret: "<BEAKER_AWS_ACCESS_KEY_ID_SECRET>"
+      - name: AWS_SECRET_ACCESS_KEY
+        secret: "<BEAKER_AWS_SECRET_ACCESS_KEY_SECRET>"
+      - name: AWS_SESSION_TOKEN
+        secret: "<BEAKER_AWS_SESSION_TOKEN_SECRET>"
+      - name: AWS_REGION
+        value: "<AWS_REGION>"
+      - name: AWS_DEFAULT_REGION
+        value: "<AWS_REGION>"
+    datasets:
+      - mountPath: /config
+        source:
+          beaker: "<RUN_ASSETS_DATASET_ID>"
+    result:
+      path: /results
+    resources:
+      gpuCount: 8
+      cpuCount: 64
+      memory: 512GiB
+      sharedMemory: 64GiB
+    replicas: 1
+    # Beaker task timeouts are nanoseconds: 7.2e12 ns = two hours.
+    timeout: 7200000000000
+    context:
+      cluster: "<BEAKER_CLUSTER>"
+      priority: normal
+      preemptible: false
+      # Current Beaker rejects legacy preemptible and autoResume together.
+      # Non-preemptible work cannot be auto-resumed; leave autoResume unset.
+

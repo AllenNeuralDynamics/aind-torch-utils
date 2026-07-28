@@ -11,6 +11,7 @@ Generic, queue-based, multi-GPU PyTorch inference pipeline for large volumetric 
 
    getting-started
    cli
+   beaker
    api/modules
 
 

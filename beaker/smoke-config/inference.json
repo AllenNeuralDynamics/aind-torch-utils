@@ -1,0 +1,14 @@
+{
+  "patch": [64, 64, 64],
+  "overlap": 10,
+  "block": [64, 64, 64],
+  "batch_size": 4,
+  "devices": ["cuda:0"],
+  "seam_mode": "trim",
+  "trim_voxels": 5,
+  "shard_strategy": "stride",
+  "max_inflight_batches": 16,
+  "max_pending_writes": 2,
+  "tensorstore_data_copy_concurrency": 8
+}
+

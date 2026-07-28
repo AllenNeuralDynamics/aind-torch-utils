@@ -613,6 +613,7 @@ def run(
 
     except (KeyboardInterrupt, Exception) as e:
         logger.exception(f"Caught {type(e).__name__}, initiating shutdown.")
+        raise
     finally:
         logger.info("Setting stop event for all threads.")
         # GUARANTEE sentinel delivery on shutdown

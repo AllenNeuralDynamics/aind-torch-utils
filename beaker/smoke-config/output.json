@@ -1,0 +1,16 @@
+{
+  "driver": "zarr",
+  "kvstore": {
+    "driver": "s3",
+    "bucket": "<S3_BUCKET>",
+    "path": "<FRESH_S3_OUTPUT_PREFIX>/output.zarr"
+  },
+  "metadata": {
+    "shape": [1, 1, 128, 256, 256],
+    "chunks": [1, 1, 64, 64, 64],
+    "dtype": "<u2"
+  },
+  "create": true,
+  "delete_existing": true
+}
+

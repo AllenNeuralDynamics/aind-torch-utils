@@ -383,3 +383,86 @@ def test_shared_encoder_model_forward():
     np.testing.assert_allclose(
         out[:, 1].numpy(), x.squeeze(1).numpy(), rtol=1e-5
     )
+
+
+@pytest.mark.parametrize("error", [RuntimeError("main failed"), KeyboardInterrupt()])
+def test_main_loop_errors_escape_after_cleanup(
+    error, dummy_data, monkeypatch, tmp_path
+):
+    input_store, output_store = dummy_data
+
+    class _Thread:
+        def __init__(self, fail_on_first_check=False):
+            self.daemon = None
+            self.started = False
+            self.joined = False
+            self.checks = 0
+            self.fail_on_first_check = fail_on_first_check
+
+        def start(self):
+            self.started = True
+
+        def is_alive(self):
+            self.checks += 1
+            if self.fail_on_first_check and self.checks == 1:
+                raise error
+            return self.started and not self.joined
+
+        def join(self):
+            self.joined = True
+
+    class _Monitor:
+        def __init__(self):
+            self.joined = False
+
+        def join(self):
+            self.joined = True
+
+        def get_data(self):
+            return []
+
+    prep = _Thread(fail_on_first_check=True)
+    gpu = _Thread()
+    writer = _Thread()
+    queue_monitor = _Monitor()
+    system_monitor = _Monitor()
+    captured = {}
+
+    def setup_monitors(prep_q, write_queues, interval, stop_event):
+        captured["stop_event"] = stop_event
+        return queue_monitor, system_monitor
+
+    monkeypatch.setattr(
+        "aind_torch_utils.run._setup_monitors",
+        setup_monitors,
+    )
+    monkeypatch.setattr(
+        "aind_torch_utils.run._setup_worker_threads",
+        lambda *args, **kwargs: ([prep], [gpu], [writer]),
+    )
+
+    cfg = InferenceConfig(
+        patch=(16, 16, 16),
+        overlap=4,
+        trim_voxels=2,
+        block=(32, 32, 32),
+        devices=["cpu"],
+        amp=False,
+        normalize=False,
+    )
+    metrics_path = tmp_path / "failure-metrics.json"
+
+    with pytest.raises(type(error), match=str(error) or None):
+        run(
+            DummyModel(),
+            input_store,
+            output_store,
+            cfg,
+            metrics_json=str(metrics_path),
+        )
+
+    assert captured["stop_event"].is_set()
+    assert all(thread.joined for thread in (prep, gpu, writer))
+    assert queue_monitor.joined is True
+    assert system_monitor.joined is True
+    assert metrics_path.exists()
