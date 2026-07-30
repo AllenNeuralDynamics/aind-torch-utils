@@ -427,6 +427,8 @@ def test_main_loop_errors_escape_after_cleanup(
     queue_monitor = _Monitor()
     system_monitor = _Monitor()
     captured = {}
+    scheduled_dumps = []
+    cancelled_dumps = []
 
     def setup_monitors(prep_q, write_queues, interval, stop_event):
         captured["stop_event"] = stop_event
@@ -439,6 +441,14 @@ def test_main_loop_errors_escape_after_cleanup(
     monkeypatch.setattr(
         "aind_torch_utils.run._setup_worker_threads",
         lambda *args, **kwargs: ([prep], [gpu], [writer]),
+    )
+    monkeypatch.setattr(
+        "aind_torch_utils.run.faulthandler.dump_traceback_later",
+        lambda interval, repeat: scheduled_dumps.append((interval, repeat)),
+    )
+    monkeypatch.setattr(
+        "aind_torch_utils.run.faulthandler.cancel_dump_traceback_later",
+        lambda: cancelled_dumps.append(True),
     )
 
     cfg = InferenceConfig(
@@ -459,6 +469,7 @@ def test_main_loop_errors_escape_after_cleanup(
             output_store,
             cfg,
             metrics_json=str(metrics_path),
+            thread_dump_interval=17.5,
         )
 
     assert captured["stop_event"].is_set()
@@ -466,3 +477,5 @@ def test_main_loop_errors_escape_after_cleanup(
     assert queue_monitor.joined is True
     assert system_monitor.joined is True
     assert metrics_path.exists()
+    assert scheduled_dumps == [(17.5, True)]
+    assert cancelled_dumps == [True]

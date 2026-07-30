@@ -163,6 +163,8 @@ def test_model_path_still_loads_registered_model(monkeypatch):
             "legacy",
             "--weights",
             "weights.pth",
+            "--thread-dump-interval",
+            "42",
         ]
     )
     cfg = launcher.InferenceConfig()
@@ -170,12 +172,12 @@ def test_model_path_still_loads_registered_model(monkeypatch):
     captured = {}
 
     def run_model(selected, input_store, output_stores, selected_cfg, **kwargs):
-        del kwargs
         captured.update(
             selected=selected,
             input_store=input_store,
             output_stores=output_stores,
             cfg=selected_cfg,
+            thread_dump_interval=kwargs["thread_dump_interval"],
         )
 
     monkeypatch.setattr(launcher, "open_ts_spec", lambda spec, **kwargs: spec)
@@ -196,6 +198,7 @@ def test_model_path_still_loads_registered_model(monkeypatch):
         "input_store": {"driver": "input"},
         "output_stores": [{"driver": "output"}],
         "cfg": cfg,
+        "thread_dump_interval": 42.0,
     }
 
 

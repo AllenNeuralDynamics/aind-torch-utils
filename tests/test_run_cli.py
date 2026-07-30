@@ -31,6 +31,12 @@ def test_cli_output_denormalize_can_be_disabled():
     assert args.no_output_denormalize is True
 
 
+def test_cli_thread_dump_interval_defaults_disabled_and_accepts_seconds():
+    assert _parse_args(_minimal_required_args()).thread_dump_interval == 0.0
+    args = _parse_args(_minimal_required_args(["--thread-dump-interval", "45.5"]))
+    assert args.thread_dump_interval == 45.5
+
+
 def test_cli_workflow_flag_parsed():
     args = _parse_args(
         ["--in-spec", "in.json", "--out-spec", "out.json", "--workflow", "seg"]

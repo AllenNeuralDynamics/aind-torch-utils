@@ -154,6 +154,7 @@ def _run_shard(
         metrics_interval=run_args.metrics_interval,
         num_prep_workers=max(1, run_args.prep_workers),
         num_writer_workers=max(1, run_args.writer_workers),
+        thread_dump_interval=run_args.thread_dump_interval,
     )
 
     if run_args.workflow:

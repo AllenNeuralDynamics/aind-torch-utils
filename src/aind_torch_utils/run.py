@@ -5,6 +5,7 @@ Module for running the inference pipeline with multiple threads and monitoring.
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import logging
 import os
@@ -37,6 +38,33 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _start_periodic_thread_dumps(interval_s: Optional[float], shard_index: int) -> bool:
+    """Schedule repeating all-thread tracebacks for diagnosing a stalled run.
+
+    ``faulthandler.dump_traceback_later`` writes directly to stderr from a
+    watchdog thread, so it remains useful when Python worker threads are
+    deadlocked or blocked in native extension calls. The timer is process-global;
+    inference runs are isolated in separate Ray worker processes.
+    """
+    if interval_s is None or interval_s <= 0:
+        return False
+    logger.info(
+        "Shard %d scheduling periodic all-thread dumps every %.1fs.",
+        shard_index,
+        interval_s,
+    )
+    faulthandler.dump_traceback_later(interval_s, repeat=True)
+    return True
+
+
+def _cancel_periodic_thread_dumps(scheduled: bool, shard_index: int) -> None:
+    """Cancel a thread-dump watchdog previously scheduled by this run."""
+    if not scheduled:
+        return
+    faulthandler.cancel_dump_traceback_later()
+    logger.info("Shard %d cancelled periodic all-thread dumps.", shard_index)
 
 
 def _put_until_stop(
@@ -460,6 +488,7 @@ def run(
     preprocess: Optional[BlockPreprocessor] = None,
     outputs: Optional[List[OutputSpec]] = None,
     execution: Optional[ExecutionPolicy] = None,
+    thread_dump_interval: Optional[float] = None,
 ) -> None:
     """Runs the inference pipeline.
 
@@ -501,6 +530,10 @@ def run(
         compile / channels_last). When ``None`` (default), synthesized from cfg
         (``amp``/``use_compile``/``compile_mode``/``compile_dynamic``), so AMP-on
         stays the legacy default.
+    thread_dump_interval : Optional[float], optional
+        Emit all Python thread stacks to stderr at this interval in seconds while
+        the worker pipeline is running. ``None`` or a non-positive value disables
+        the watchdog. Dumps repeat until the run completes.
     """
     # Validate shapes
     T, C, Z, Y, X = tuple(input_store.domain.shape)
@@ -584,6 +617,9 @@ def run(
 
     prep_sentinels_sent = False
     writer_sentinels_sent = False
+    thread_dumps_scheduled = _start_periodic_thread_dumps(
+        thread_dump_interval, shard_spec.index
+    )
 
     t0 = time.perf_counter()
     try:
@@ -615,27 +651,30 @@ def run(
         logger.exception(f"Caught {type(e).__name__}, initiating shutdown.")
         raise
     finally:
-        logger.info("Setting stop event for all threads.")
-        # GUARANTEE sentinel delivery on shutdown
-        if not prep_sentinels_sent:
-            for _ in range(len(cfg.devices)):
-                _put_until_stop(prep_q, None, stop_event, timeout=0.1)
-        if not writer_sentinels_sent:
-            for wq in write_queues:
-                _put_until_stop(wq, None, stop_event, timeout=0.1)
+        try:
+            logger.info("Setting stop event for all threads.")
+            # GUARANTEE sentinel delivery on shutdown
+            if not prep_sentinels_sent:
+                for _ in range(len(cfg.devices)):
+                    _put_until_stop(prep_q, None, stop_event, timeout=0.1)
+            if not writer_sentinels_sent:
+                for wq in write_queues:
+                    _put_until_stop(wq, None, stop_event, timeout=0.1)
 
-        stop_event.set()
+            stop_event.set()
 
-        # Final join to ensure all threads have exited
-        for th in all_threads:
-            if th.is_alive():
-                th.join()
-        # Stop monitors
-        q_monitor.join()
-        sys_monitor.join()
+            # Final join to ensure all threads have exited
+            for th in all_threads:
+                if th.is_alive():
+                    th.join()
+            # Stop monitors
+            q_monitor.join()
+            sys_monitor.join()
 
-        if metrics_json:
-            _write_metrics_json(metrics_json, q_monitor, sys_monitor)
+            if metrics_json:
+                _write_metrics_json(metrics_json, q_monitor, sys_monitor)
+        finally:
+            _cancel_periodic_thread_dumps(thread_dumps_scheduled, shard_spec.index)
 
     if worker_errors:
         names = ", ".join(name for name, _ in worker_errors)
@@ -817,6 +856,15 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         default=4,
         help="Number of writer workers",
     )
+    ap.add_argument(
+        "--thread-dump-interval",
+        type=float,
+        default=0.0,
+        help=(
+            "Emit repeating all-thread stack dumps at this interval in seconds; "
+            "non-positive values disable dumps (default: disabled)"
+        ),
+    )
     return ap.parse_args(argv)
 
 
@@ -853,6 +901,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         metrics_interval=args.metrics_interval,
         num_prep_workers=max(1, args.prep_workers),
         num_writer_workers=max(1, args.writer_workers),
+        thread_dump_interval=args.thread_dump_interval,
     )
 
     if args.workflow:
