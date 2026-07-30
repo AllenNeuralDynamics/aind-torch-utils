@@ -1,10 +1,12 @@
 FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime@sha256:417bd75df6365104c283ea4c1651fb3530d9eb5a4c2fafa51943cff2a94e6385
 
 ENV PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    CC=/usr/bin/gcc \
+    CXX=/usr/bin/g++
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/aind-torch-utils
@@ -14,4 +16,3 @@ COPY src ./src
 
 RUN python -m pip install --no-cache-dir ".[ray,denoise-net]" \
     && python -c "import importlib.metadata as m; import torch, ray, tensorstore; import aind_torch_utils.recipes; import aind_torch_utils.recipes.denoise_net; import aind_exaspim_image_compression.inference; from aind_torch_utils.workflow import WorkflowRegistry; assert 'denoise-net' in WorkflowRegistry.list_workflows(); print('torch', torch.__version__, 'ray', ray.__version__, 'tensorstore', m.version('tensorstore'))"
-
