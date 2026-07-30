@@ -66,6 +66,12 @@ beaker experiment logs --follow <EXPERIMENT_ID>
 beaker experiment get <EXPERIMENT_ID>
 ```
 
+The smoke template enables `--thread-dump-interval 1800` and disables Ray log
+deduplication. While inference is running, every shard therefore writes all
+Python thread stacks to its stderr log every five minutes. This is diagnostic
+output, not a failure signal: healthy long-running shards also emit it. Set the
+interval to `0` or remove the argument after investigating a stall.
+
 The task reserves 8 GPUs, 64 CPUs, 512 GiB RAM, and 64 GiB shared memory. Ray
 receives eight tasks at 1 GPU and 8 CPUs each, exactly consuming the advertised
 GPU/CPU allocation. Each Ray worker sees its assigned physical GPU as logical
@@ -142,4 +148,3 @@ There is no durable resume protocol in this milestone. A preemption, process
 failure, or interrupt makes the task fail after cleanup; start the next attempt
 with a new S3 output prefix. Multi-node Ray bootstrap, automatic retries/resume,
 and a Python Beaker submitter are intentionally deferred.
-

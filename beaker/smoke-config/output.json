@@ -1,15 +1,32 @@
 {
-  "driver": "zarr",
+  "driver": "zarr2",
   "kvstore": {
     "driver": "s3",
-    "bucket": "<S3_BUCKET>",
-    "path": "<FRESH_S3_OUTPUT_PREFIX>/output.zarr"
+    "bucket": "aind-scratch-data",
+    "path": "exaSPIM_708373_2024-04-02_19-49-38_fusion_2024-05-09_20-27-49/fused-denoised.zarr/0"
   },
   "metadata": {
-    "shape": [1, 1, 128, 256, 256],
-    "chunks": [1, 1, 64, 64, 64],
+    "shape": [
+        1,
+        1,
+        7209,
+        7336,
+        15601
+    ],
+    "compressor": {
+        "id": "blosc",
+        "cname": "zstd",
+        "clevel": 6,
+        "shuffle": 1
+      },
+    "zarr_format": 2,
+    "fill_value": 0,
+    "dimension_separator": "/",
+    "chunks": [1, 1, 128, 256, 256],
     "dtype": "<u2"
   },
+  "recheck_cached_metadata": false,
+  "recheck_cached_data": false,
   "create": true,
   "delete_existing": true
 }

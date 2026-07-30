@@ -1,13 +1,13 @@
 version: v2
 description: aind-torch-utils single-node eight-GPU Ray smoke run
-budget: "<BEAKER_BUDGET>"
+budget: "ai1/aihub-nd-exaspim"
 retry:
   allowedTaskRetries: 0
 tasks:
   - name: ray-denoise-smoke
     image:
       # Use an immutable Beaker image ID, not a mutable image name.
-      beaker: "<IMMUTABLE_BEAKER_IMAGE_ID>"
+      beaker: "01KYSWHSJQVBFNFX868352SH2P"
     command:
       - python
       - -m
@@ -16,9 +16,15 @@ tasks:
       - --num-shards
       - "8"
       - --cpus-per-shard
-      - "8"
+      - "16"
       - --gpus-per-shard
       - "1"
+      - --prep-workers
+      - "8"
+      - --writer-workers
+      - "8"
+      - --thread-dump-interval
+      - "1800"
       - --metrics-json-template
       - "/results/metrics_shard{shard}.json"
       - --in-spec
@@ -33,33 +39,47 @@ tasks:
       - /config/inference.json
     envVars:
       - name: AWS_ACCESS_KEY_ID
-        secret: "<BEAKER_AWS_ACCESS_KEY_ID_SECRET>"
+        secret: "BEAKER_AWS_ACCESS_KEY_ID_SECRET"
       - name: AWS_SECRET_ACCESS_KEY
-        secret: "<BEAKER_AWS_SECRET_ACCESS_KEY_SECRET>"
+        secret: "BEAKER_AWS_SECRET_ACCESS_KEY_SECRET"
       - name: AWS_SESSION_TOKEN
-        secret: "<BEAKER_AWS_SESSION_TOKEN_SECRET>"
+        secret: "BEAKER_AWS_SESSION_TOKEN_SECRET"
       - name: AWS_REGION
-        value: "<AWS_REGION>"
+        value: "us-west-2"
       - name: AWS_DEFAULT_REGION
-        value: "<AWS_REGION>"
+        value: "us-west-2"
+      - name: AWS_RETRY_MODE
+        value: "standard"
+      - name: AWS_MAX_ATTEMPTS
+        value: "10"
+      - name: TENSORSTORE_S3_REQUEST_CONCURRENCY
+        value: "256"
+      - name: TENSORSTORE_HTTP2_MAX_CONCURRENT_STREAMS
+        value: "64"
+      - name: TENSORSTORE_HTTP_THREADS
+        value: "32"
+      - name: OMP_NUM_THREADS
+        value: "1"
+      - name: RAY_DEDUP_LOGS
+        value: "0"
+
     datasets:
       - mountPath: /config
         source:
-          beaker: "<RUN_ASSETS_DATASET_ID>"
+          beaker: "01KYSR59WPTP8SFCBNSE0RMWP7"
     result:
       path: /results
     resources:
       gpuCount: 8
-      cpuCount: 64
-      memory: 512GiB
-      sharedMemory: 64GiB
+      cpuCount: 128
+      memory: 2000GB
+      sharedMemory: 128GiB
     replicas: 1
     # Beaker task timeouts are nanoseconds: 7.2e12 ns = two hours.
-    timeout: 7200000000000
+    timeout: "8h"
     context:
-      cluster: "<BEAKER_CLUSTER>"
+      cluster: "ai1/aipbd-aws-h200"
       priority: normal
-      preemptible: false
+      minRuntime: 0
       # Current Beaker rejects legacy preemptible and autoResume together.
       # Non-preemptible work cannot be auto-resumed; leave autoResume unset.
-

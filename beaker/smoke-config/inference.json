@@ -1,14 +1,24 @@
 {
   "patch": [64, 64, 64],
   "overlap": 10,
-  "block": [64, 64, 64],
-  "batch_size": 4,
+  "block": [256, 512, 512],
+  "batch_size": 256,
+  "t_idx": 0,
+  "c_idx": 0,
   "devices": ["cuda:0"],
-  "seam_mode": "trim",
-  "trim_voxels": 5,
-  "shard_strategy": "stride",
+  "amp": false,
+  "use_tf32": true,
+  "use_compile": true,
+  "compile_mode": "default",
+  "compile_dynamic": null,
   "max_inflight_batches": 16,
+  "shard_count": 1,
+  "shard_index": 0,
+  "shard_strategy": "stride",
+  "seam_mode": "blend",
+  "trim_voxels": 5,
+  "min_blend_weight": 0.05,
+  "eps": 1e-6,
   "max_pending_writes": 2,
-  "tensorstore_data_copy_concurrency": 8
+  "tensorstore_data_copy_concurrency": 16
 }
-
