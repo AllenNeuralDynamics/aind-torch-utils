@@ -53,10 +53,14 @@ def test_main_requires_exactly_one_of_model_or_workflow():
     with pytest.raises(SystemExit):
         main(
             [
-                "--in-spec", "in.json",
-                "--out-spec", "out.json",
-                "--model-type", "d",
-                "--workflow", "w",
+                "--in-spec",
+                "in.json",
+                "--out-spec",
+                "out.json",
+                "--model-type",
+                "d",
+                "--workflow",
+                "w",
             ]
         )
 
@@ -66,10 +70,14 @@ def test_main_rejects_weights_with_workflow():
     with pytest.raises(SystemExit, match="--weights only applies"):
         main(
             [
-                "--in-spec", "in.json",
-                "--out-spec", "out.json",
-                "--workflow", "w",
-                "--weights", "w.pt",
+                "--in-spec",
+                "in.json",
+                "--out-spec",
+                "out.json",
+                "--workflow",
+                "w",
+                "--weights",
+                "w.pt",
             ]
         )
 
@@ -86,6 +94,7 @@ def test_main_forwards_json_parameters_to_workflow(tmp_path, monkeypatch):
         return Workflow(processor=object())
 
     monkeypatch.setattr(run_mod.WorkflowRegistry, "build", build)
+    monkeypatch.setattr(run_mod, "load_ts_spec", lambda spec: spec)
     monkeypatch.setattr(run_mod, "open_ts_spec", lambda spec: spec)
     monkeypatch.setattr(
         run_mod,
@@ -112,3 +121,39 @@ def test_main_forwards_json_parameters_to_workflow(tmp_path, monkeypatch):
     assert captured["params"] == params
     assert captured["in_arr"] == "in.json"
     assert captured["out_arr"] == ["out.json"]
+
+
+def test_resume_rejects_delete_existing_before_open(tmp_path, monkeypatch):
+    in_spec = tmp_path / "in.json"
+    out_spec = tmp_path / "out.json"
+    config = tmp_path / "config.json"
+    in_spec.write_text(json.dumps({"driver": "input"}))
+    out_spec.write_text(
+        json.dumps(
+            {
+                "driver": "zarr",
+                "kvstore": "s3://bucket/out.zarr",
+                "delete_existing": True,
+            }
+        )
+    )
+    config.write_text(json.dumps({"resume": True}))
+    monkeypatch.setattr(
+        run_mod,
+        "open_ts_spec",
+        lambda *args, **kwargs: pytest.fail("destructive output open occurred"),
+    )
+
+    with pytest.raises(ValueError, match="delete_existing"):
+        main(
+            [
+                "--in-spec",
+                str(in_spec),
+                "--out-spec",
+                str(out_spec),
+                "--model-type",
+                "dummy",
+                "--config",
+                str(config),
+            ]
+        )

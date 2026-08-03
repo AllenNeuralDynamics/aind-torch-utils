@@ -47,6 +47,23 @@ form remains available as the legacy raw-model path and does not reconstruct
 checkpoint transform metadata.
 
 
+Resume Configuration
+--------------------
+
+Resumability is configured in the JSON passed with ``--config`` rather than by
+separate CLI flags. Install ``.[aws]`` and set ``resume`` to true. A single S3
+output can derive its marker root from the output TensorStore spec; multi-output
+runs require an explicit shared ``resume_marker_prefix``. All output specs must
+set ``delete_existing`` to false or omit it.
+
+Completion markers are stored under
+``.aind_torch_utils/resume/v2/<run-id>/t=<t>/c=<c>/z=<z>/y=<y>/x=<x>.done``.
+Use ``resume_run_id`` to select a namespace explicitly. Otherwise the runtime
+derives one from the input/output specs, workload, and output-affecting
+configuration; changing the number or arrangement of Ray shards does not change
+that identity.
+
+
 Full Parameter Set (example)
 ----------------------------
 
@@ -91,6 +108,8 @@ Options Overview
 - Normalization: ``--normalize {percentile,global,false}``, ``--norm-lower``,
   ``--norm-upper``, ``--clip-norm [LO HI]``, ``--no-output-denormalize``
 - Monitoring: ``--metrics-json``, ``--metrics-interval``
+- Resume (config JSON): ``resume``, ``work_store``, ``resume_marker_prefix``,
+  ``resume_run_id``
 
 See ``src/aind_torch_utils/run.py`` for authoritative CLI definitions and
 ``src/aind_torch_utils/config.py`` for detailed field descriptions.

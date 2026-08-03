@@ -29,7 +29,13 @@ from aind_torch_utils.model_registry import ModelRegistry
 from aind_torch_utils.monitoring import QueueMonitor, SystemMonitor
 from aind_torch_utils.outputs import OutputSpec
 from aind_torch_utils.transforms import BlockPreprocessor
-from aind_torch_utils.utils import open_ts_spec
+from aind_torch_utils.utils import load_ts_spec, open_ts_spec
+from aind_torch_utils.work_state import (
+    BlockWorkStore,
+    NoopBlockWorkStore,
+    build_block_work_store,
+    validate_resume_output_specs,
+)
 from aind_torch_utils.workers import GpuWorker, PrepWorker, WriterWorker
 from aind_torch_utils.workflow import Workflow, WorkflowRegistry
 
@@ -205,6 +211,7 @@ def _setup_workers(
     write_queues: List[queue.Queue],
     preprocess: BlockPreprocessor,
     execution: ExecutionPolicy,
+    work_store: BlockWorkStore,
 ) -> Tuple[List[PrepWorker], List[GpuWorker], List[WriterWorker]]:
     """Sets up the workers for the pipeline.
 
@@ -252,6 +259,7 @@ def _setup_workers(
             num_workers=local_prep,
             global_worker_offset=global_worker_offset,
             global_worker_count=global_worker_count,
+            work_store=work_store,
         )
         for i in range(local_prep)
     ]
@@ -275,6 +283,7 @@ def _setup_workers(
             output_specs,
             write_queues[i],
             preprocess,
+            work_store,
         )
         for i in range(len(write_queues))
     ]
@@ -316,6 +325,7 @@ def _setup_worker_threads(
     write_queues: List[queue.Queue],
     preprocess: BlockPreprocessor,
     execution: ExecutionPolicy,
+    work_store: BlockWorkStore,
     worker_errors: List[Tuple[str, BaseException]],
 ) -> Tuple[List[threading.Thread], List[threading.Thread], List[threading.Thread]]:
     """Sets up the worker threads for the pipeline.
@@ -366,6 +376,7 @@ def _setup_worker_threads(
         write_queues,
         preprocess,
         execution,
+        work_store,
     )
 
     # Threads
@@ -423,9 +434,7 @@ def _resolve_output_specs(
     if output_store is None:
         raise ValueError("Provide output_store (or outputs).")
 
-    output_stores = (
-        output_store if isinstance(output_store, list) else [output_store]
-    )
+    output_stores = output_store if isinstance(output_store, list) else [output_store]
     factory = weighted_average_factory(
         cfg.eps,
         cfg.overlap,
@@ -489,6 +498,7 @@ def run(
     outputs: Optional[List[OutputSpec]] = None,
     execution: Optional[ExecutionPolicy] = None,
     thread_dump_interval: Optional[float] = None,
+    work_store: Optional[BlockWorkStore] = None,
 ) -> None:
     """Runs the inference pipeline.
 
@@ -534,6 +544,8 @@ def run(
         Emit all Python thread stacks to stderr at this interval in seconds while
         the worker pipeline is running. ``None`` or a non-positive value disables
         the watchdog. Dumps repeat until the run completes.
+    work_store : BlockWorkStore, optional
+        Block completion backend. Required when ``cfg.resume`` is enabled.
     """
     # Validate shapes
     T, C, Z, Y, X = tuple(input_store.domain.shape)
@@ -582,6 +594,14 @@ def run(
         shard_spec.tile_index,
     )
 
+    if cfg.resume:
+        if work_store is None:
+            raise ValueError("cfg.resume=True requires a BlockWorkStore")
+        active_work_store = work_store
+    else:
+        active_work_store = NoopBlockWorkStore()
+    active_work_store.prepare(shard_spec)
+
     # Queues
     prep_q, write_queues = _setup_queues(
         num_writer_workers, maxsize=cfg.max_inflight_batches
@@ -611,6 +631,7 @@ def run(
         write_queues,
         preprocess,
         execution,
+        active_work_store,
         worker_errors,
     )
     all_threads = prep_threads + gpu_threads + writer_threads
@@ -723,9 +744,7 @@ def run_workflow(
             "This workflow builds its output specs from the opened output "
             "stores; provide output_store."
         )
-    output_stores = (
-        output_store if isinstance(output_store, list) else [output_store]
-    )
+    output_stores = output_store if isinstance(output_store, list) else [output_store]
     outputs = workflow.resolve_outputs(output_stores)
     run(
         workflow.processor,
@@ -886,8 +905,6 @@ def main(argv: Optional[List[str]] = None) -> None:
             "workflow via --workflow-params."
         )
 
-    in_arr = open_ts_spec(args.in_spec)
-
     if args.config:
         cfg = InferenceConfig.from_json(args.config)
     else:
@@ -895,6 +912,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     if args.no_output_denormalize:
         cfg.output_denormalize = False
     logger.info(f"Inference config:\n{cfg}")
+
+    input_spec = load_ts_spec(args.in_spec)
+    output_spec_dicts = [load_ts_spec(spec) for spec in (args.out_spec or [])]
+    if output_spec_dicts or not args.workflow:
+        validate_resume_output_specs(cfg, output_spec_dicts)
+    in_arr = open_ts_spec(deepcopy(input_spec))
 
     run_kwargs = dict(
         metrics_json=args.metrics_json,
@@ -919,6 +942,11 @@ def main(argv: Optional[List[str]] = None) -> None:
                     f"Workflow '{args.workflow}' supplies its own outputs; "
                     "remove --out-spec (it would be ignored)."
                 )
+            if cfg.resume:
+                raise SystemExit(
+                    "CLI resume requires --out-spec; fixed-output workflows can "
+                    "resume only through the programmatic work_store API."
+                )
             out_arr = None
         else:
             if not args.out_spec:
@@ -926,14 +954,45 @@ def main(argv: Optional[List[str]] = None) -> None:
                     f"--out-spec is required: workflow '{args.workflow}' does "
                     "not supply fixed outputs."
                 )
-            out_arr = [open_ts_spec(s) for s in args.out_spec]
-        run_workflow(workflow, in_arr, out_arr, cfg, **run_kwargs)
+            out_arr = [open_ts_spec(deepcopy(s)) for s in output_spec_dicts]
+        work_store = build_block_work_store(
+            cfg=cfg,
+            input_spec=input_spec,
+            output_specs=output_spec_dicts,
+            input_store=in_arr,
+            output_stores=out_arr or [],
+            workload={
+                "kind": "workflow",
+                "name": args.workflow,
+                "params": params,
+            },
+        )
+        run_workflow(
+            workflow,
+            in_arr,
+            out_arr,
+            cfg,
+            work_store=work_store,
+            **run_kwargs,
+        )
     else:
         if not args.out_spec:
             raise SystemExit("--out-spec is required with --model-type.")
-        out_arr = [open_ts_spec(s) for s in args.out_spec]
+        out_arr = [open_ts_spec(deepcopy(s)) for s in output_spec_dicts]
         model = load_model(args.model_type, args.weights)
-        run(model, in_arr, out_arr, cfg, **run_kwargs)
+        work_store = build_block_work_store(
+            cfg=cfg,
+            input_spec=input_spec,
+            output_specs=output_spec_dicts,
+            input_store=in_arr,
+            output_stores=out_arr,
+            workload={
+                "kind": "model",
+                "model_type": args.model_type,
+                "weights_path": args.weights,
+            },
+        )
+        run(model, in_arr, out_arr, cfg, work_store=work_store, **run_kwargs)
 
 
 if __name__ == "__main__":  # pragma: no cover

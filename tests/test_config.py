@@ -17,6 +17,8 @@ def test_precision_performance_defaults_to_false():
     assert cfg.compile_dynamic is None
     assert cfg.max_pending_writes == 2
     assert cfg.tensorstore_data_copy_concurrency == 8
+    assert cfg.resume is False
+    assert cfg.work_store == "none"
 
 
 def test_max_pending_writes_must_be_positive():
@@ -29,6 +31,15 @@ def test_tensorstore_data_copy_concurrency_must_be_positive():
         ValueError, match="tensorstore_data_copy_concurrency must be > 0"
     ):
         InferenceConfig(tensorstore_data_copy_concurrency=0)
+
+
+def test_resume_selects_s3_markers_and_validates_namespaces():
+    assert InferenceConfig(resume=True).work_store == "s3-markers"
+
+    with pytest.raises(ValueError, match="resume_marker_prefix"):
+        InferenceConfig(resume_marker_prefix="")
+    with pytest.raises(ValueError, match="resume_run_id"):
+        InferenceConfig(resume_run_id="")
 
 
 @pytest.mark.parametrize("field", ["use_tf32", "cudnn_benchmark"])

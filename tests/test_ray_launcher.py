@@ -97,9 +97,7 @@ def _workflow_args(tmp_path, *extra):
 
 
 @pytest.mark.parametrize("local_fallback", [True, False])
-def test_workflow_runs_in_local_and_ray_paths(
-    tmp_path, monkeypatch, local_fallback
-):
+def test_workflow_runs_in_local_and_ray_paths(tmp_path, monkeypatch, local_fallback):
     captured = {}
     workflow = Workflow(processor=object())
 
@@ -254,9 +252,7 @@ def test_shard_tensorstore_context_uses_configured_copy_limit():
 
     context = launcher._make_shard_tensorstore_context(cfg)
 
-    assert context.spec.to_json() == {
-        "data_copy_concurrency": {"limit": 12}
-    }
+    assert context.spec.to_json() == {"data_copy_concurrency": {"limit": 12}}
 
 
 @pytest.mark.parametrize(
@@ -360,6 +356,30 @@ def test_effective_unsafe_layout_fails_before_ray_init(tmp_path, monkeypatch):
     )
 
     with pytest.raises(ValueError, match="grid_origin=\\(32, 0, 0\\)"):
+        launcher.main(args)
+
+
+def test_resume_rejects_delete_existing_before_output_open(tmp_path, monkeypatch):
+    config_path = tmp_path / "resume.json"
+    config_path.write_text(json.dumps({"resume": True}))
+    args = _workflow_args(tmp_path, "--config", str(config_path))
+    output_spec_path = tmp_path / "out.json"
+    output_spec_path.write_text(
+        json.dumps(
+            {
+                "driver": "zarr",
+                "kvstore": "s3://bucket/out.zarr",
+                "delete_existing": True,
+            }
+        )
+    )
+    monkeypatch.setattr(
+        launcher,
+        "open_ts_spec",
+        lambda *args, **kwargs: pytest.fail("destructive output open occurred"),
+    )
+
+    with pytest.raises(ValueError, match="delete_existing"):
         launcher.main(args)
 
 

@@ -18,6 +18,10 @@ from aind_torch_utils.run import (
     run_workflow,
 )
 from aind_torch_utils.utils import open_ts_spec
+from aind_torch_utils.work_state import (
+    build_block_work_store,
+    validate_resume_output_specs,
+)
 from aind_torch_utils.workflow import WorkflowRegistry
 
 logger = logging.getLogger(__name__)
@@ -149,12 +153,33 @@ def _run_shard(
         open_ts_spec(copy.deepcopy(spec), context=store_context)
         for spec in output_specs
     ]
+    if run_args.workflow:
+        workload = {
+            "kind": "workflow",
+            "name": run_args.workflow,
+            "params": workflow_params,
+        }
+    else:
+        workload = {
+            "kind": "model",
+            "model_type": run_args.model_type,
+            "weights_path": run_args.weights,
+        }
+    work_store = build_block_work_store(
+        cfg=cfg,
+        input_spec=input_spec,
+        output_specs=output_specs,
+        input_store=input_store,
+        output_stores=output_stores,
+        workload=workload,
+    )
     run_kwargs = dict(
         metrics_json=metrics_json,
         metrics_interval=run_args.metrics_interval,
         num_prep_workers=max(1, run_args.prep_workers),
         num_writer_workers=max(1, run_args.writer_workers),
         thread_dump_interval=run_args.thread_dump_interval,
+        work_store=work_store,
     )
 
     if run_args.workflow:
@@ -383,6 +408,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     input_spec_dict = _load_spec_arg(run_args.in_spec)
     output_spec_dicts = [_load_spec_arg(arg) for arg in run_args.out_spec]
+    validate_resume_output_specs(base_cfg, output_spec_dicts)
 
     if shards > 1:
         for index, output_spec in enumerate(output_spec_dicts):

@@ -150,6 +150,70 @@ def _run_test_logic(input_store, output_store, metrics_json, devices, model):
     )
 
 
+def test_run_requires_work_store_when_resume_is_enabled(dummy_data):
+    input_store, output_store = dummy_data
+    cfg = InferenceConfig(
+        patch=(16, 16, 16),
+        overlap=4,
+        trim_voxels=2,
+        block=(32, 32, 32),
+        devices=["cpu"],
+        amp=False,
+        normalize=False,
+        output_denormalize=False,
+        resume=True,
+    )
+
+    with pytest.raises(ValueError, match="requires a BlockWorkStore"):
+        run(DummyModel(), input_store, output_store, cfg)
+
+
+def test_run_prepares_and_forwards_resume_store(dummy_data, monkeypatch):
+    input_store, output_store = dummy_data
+    captured = {}
+
+    class _WorkStore:
+        def prepare(self, shard_spec):
+            captured["prepared"] = shard_spec
+
+    class _Monitor:
+        def join(self):
+            return None
+
+        def get_data(self):
+            return []
+
+    def setup_threads(*args):
+        captured["forwarded"] = args[-2]
+        return [], [], []
+
+    monkeypatch.setattr(
+        "aind_torch_utils.run._setup_monitors",
+        lambda *args: (_Monitor(), _Monitor()),
+    )
+    monkeypatch.setattr(
+        "aind_torch_utils.run._setup_worker_threads",
+        setup_threads,
+    )
+    work_store = _WorkStore()
+    cfg = InferenceConfig(
+        patch=(16, 16, 16),
+        overlap=4,
+        trim_voxels=2,
+        block=(32, 32, 32),
+        devices=["cpu"],
+        amp=False,
+        normalize=False,
+        output_denormalize=False,
+        resume=True,
+    )
+
+    run(DummyModel(), input_store, output_store, cfg, work_store=work_store)
+
+    assert captured["prepared"].index == 0
+    assert captured["forwarded"] is work_store
+
+
 @pytest.fixture
 def multi_output_data(tmp_path):
     """Two output stores (float32) matching the 32³ input volume."""
@@ -179,7 +243,9 @@ def multi_output_data(tmp_path):
     return in_store, out_stores
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for GPU pipeline")
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for GPU pipeline"
+)
 def test_run_multi_output_pipeline(multi_output_data, tmp_path):
     """Pipeline writes two independent output stores from a multi-output model."""
     in_store, out_stores = multi_output_data
@@ -270,9 +336,7 @@ def test_validate_inversion_rejects_invert_without_inverse():
         def forward(self, block, ctx):
             return block, None
 
-    specs = [
-        OutputSpec(store=object(), accumulator_factory=object(), invert=True)
-    ]
+    specs = [OutputSpec(store=object(), accumulator_factory=object(), invert=True)]
     with pytest.raises(ValueError, match="defines no inverse"):
         _validate_inversion(_ForwardOnly(), specs)
     # invert=False everywhere -> a forward-only preprocess is fine.
@@ -294,9 +358,7 @@ def test_validate_inversion_rejects_unknown_stage():
         def inverse(self, block, state, ctx):
             return block
 
-    specs = [
-        OutputSpec(store=object(), accumulator_factory=object(), invert=True)
-    ]
+    specs = [OutputSpec(store=object(), accumulator_factory=object(), invert=True)]
     with pytest.raises(ValueError, match="Unknown inverse_stage"):
         _validate_inversion(_TypoStage(), specs)
 
@@ -312,9 +374,7 @@ def test_validate_inversion_defaults_missing_stage():
         def inverse(self, block, state, ctx):
             return block
 
-    specs = [
-        OutputSpec(store=object(), accumulator_factory=object(), invert=True)
-    ]
+    specs = [OutputSpec(store=object(), accumulator_factory=object(), invert=True)]
     _validate_inversion(_NoStage(), specs)  # must not raise
 
 
@@ -332,7 +392,9 @@ def test_run_workflow_end_to_end(temp_dir, dummy_data):
             processor=DummyModel(),
             preprocess=None,  # run() synthesizes from cfg (normalize=False)
             execution=ExecutionPolicy.from_config(
-                amp=False, use_compile=False, compile_mode="default",
+                amp=False,
+                use_compile=False,
+                compile_mode="default",
                 compile_dynamic=None,
             ),
         )
@@ -377,12 +439,8 @@ def test_shared_encoder_model_forward():
     # Expected: (B=2, N=2, Z=8, Y=8, X=8)
     assert out.shape == (2, 2, 8, 8, 8), f"Unexpected output shape: {out.shape}"
     # Both decoder outputs should equal the input (identity chain)
-    np.testing.assert_allclose(
-        out[:, 0].numpy(), x.squeeze(1).numpy(), rtol=1e-5
-    )
-    np.testing.assert_allclose(
-        out[:, 1].numpy(), x.squeeze(1).numpy(), rtol=1e-5
-    )
+    np.testing.assert_allclose(out[:, 0].numpy(), x.squeeze(1).numpy(), rtol=1e-5)
+    np.testing.assert_allclose(out[:, 1].numpy(), x.squeeze(1).numpy(), rtol=1e-5)
 
 
 @pytest.mark.parametrize("error", [RuntimeError("main failed"), KeyboardInterrupt()])

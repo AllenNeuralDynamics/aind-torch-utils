@@ -19,6 +19,12 @@ from aind_torch_utils.execution import ExecutionPolicy, cuda_safe_compile_mode
 from aind_torch_utils.outputs import OutputSpec
 from aind_torch_utils.transforms import BlockPreprocessor, is_invertible
 from aind_torch_utils.utils import iter_blocks_zyx, iter_patch_starts
+from aind_torch_utils.work_state import (
+    BlockKey,
+    BlockLease,
+    BlockWorkStore,
+    NoopBlockWorkStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +69,8 @@ class Batch:
     ctx : BlockContext
         Absolute placement of the block, built once in the prep stage and
         carried through to the writer so both stages share one derivation.
+    lease : BlockLease, optional
+        Work-store lease proving this block should be processed.
     """
 
     block_idx: Tuple[int, int, int]
@@ -76,6 +84,7 @@ class Batch:
     acc_shape: Tuple[int, int, int]  # shape of expanded (core+halo) accumulator
     halo_left: Tuple[int, int, int]  # halo size on the -Z/-Y/-X sides
     ctx: BlockContext
+    lease: Optional[BlockLease] = None
 
 
 @dataclass(slots=True)
@@ -113,6 +122,8 @@ class Preds:
         matching :class:`Batch` (the GPU stage does not touch it).
     ready_event : Optional[torch.cuda.Event]
         A CUDA event that signals when the D2H copy of `host_out` is complete.
+    lease : BlockLease, optional
+        Work-store lease passed through unchanged from the matching batch.
     """
 
     block_idx: Tuple[int, int, int]
@@ -126,6 +137,7 @@ class Preds:
     acc_shape: Tuple[int, int, int]
     halo_left: Tuple[int, int, int]
     ctx: BlockContext
+    lease: Optional[BlockLease] = None
     # CUDA event to signal the D2H copy completed
     ready_event: Optional["torch.cuda.Event"] = field(
         default=None, repr=False, compare=False
@@ -169,6 +181,7 @@ class PrepWorker:
         num_workers: int = 1,
         global_worker_offset: int = 0,
         global_worker_count: int = 1,
+        work_store: Optional[BlockWorkStore] = None,
     ):
         """
         Initializes the PrepWorker.
@@ -205,6 +218,8 @@ class PrepWorker:
             using strided sharding, by default 0.
         global_worker_count : int, optional
             Total number of global prep workers across all shards, by default 1.
+        work_store : BlockWorkStore, optional
+            Completion backend used to skip blocks before reading input.
         """
         self.cfg = cfg
         self.reader = reader
@@ -228,6 +243,7 @@ class PrepWorker:
         self.global_worker_count = max(1, global_worker_count)
         self.global_worker_id = global_worker_offset + worker_id
         self.global_worker_offset = global_worker_offset
+        self.work_store = work_store or NoopBlockWorkStore()
 
     def _block_in_shard(self, block_idx: Tuple[int, int, int]) -> bool:
         """
@@ -263,8 +279,7 @@ class PrepWorker:
         bz, by, bx = block_idx
         if not self._block_in_shard(block_idx):
             raise ValueError(
-                f"Block {block_idx} is not owned by shard "
-                f"{self.shard_spec.index}."
+                f"Block {block_idx} is not owned by shard " f"{self.shard_spec.index}."
             )
         local_y = sy1 - sy0
         local_x = sx1 - sx0
@@ -305,6 +320,19 @@ class PrepWorker:
 
             if stop_event.is_set():
                 break
+
+            block_key = BlockKey(
+                t=t,
+                c=c,
+                z=block_idx[0],
+                y=block_idx[1],
+                x=block_idx[2],
+                linear_k=k,
+            )
+            lease = self.work_store.claim_block(block_key)
+            if lease is None:
+                logger.debug("Skipping completed block %s", block_key)
+                continue
 
             zsl, ysl, xsl = core_bbox
             z0, z1 = zsl.start, zsl.stop
@@ -400,6 +428,7 @@ class PrepWorker:
                     acc_shape=acc_shape,
                     halo_left=halo_left,
                     ctx=ctx,
+                    lease=lease,
                 )
                 while not stop_event.is_set():
                     try:
@@ -462,9 +491,7 @@ class GpuWorker:
         if isinstance(self.model, nn.Module):
             self.model.to(self.device)
             if self.execution.channels_last:
-                self.model = self.model.to(
-                    memory_format=torch.channels_last_3d
-                )
+                self.model = self.model.to(memory_format=torch.channels_last_3d)
             self.model.eval()
 
         self.copy_stream = torch.cuda.Stream(device=self.device)
@@ -545,9 +572,7 @@ class GpuWorker:
         if self.execution.channels_last:
             warmup_in = warmup_in.contiguous(memory_format=torch.channels_last_3d)
 
-        logger.info(
-            "Warming compiled model on %s with shape %s.", self.device, shape
-        )
+        logger.info("Warming compiled model on %s with shape %s.", self.device, shape)
         with self._inference_context():
             with self._autocast_context():
                 warmup_out = self.model(warmup_in)
@@ -638,6 +663,7 @@ class GpuWorker:
                 acc_shape=batch.acc_shape,
                 halo_left=batch.halo_left,
                 ctx=batch.ctx,
+                lease=batch.lease,
                 ready_event=evt,  # <-- writer will synchronize this
             )
 
@@ -672,6 +698,55 @@ class _PendingWrite:
 
     future: Any
     source: np.ndarray
+    group: "_BlockWriteGroup"
+
+
+@dataclass
+class _BlockWriteGroup:
+    """Track all asynchronous output writes associated with one block lease."""
+
+    lease: Optional[BlockLease]
+    work_store: BlockWorkStore
+    remaining: int = 0
+    sealed: bool = False
+    failed: bool = False
+    failure_reported: bool = False
+    completed: bool = False
+
+    def add_write(self) -> None:
+        """Register a future before it enters the pending-write queue."""
+        self.remaining += 1
+
+    def finish_write(self, exc: Optional[BaseException]) -> None:
+        """Record one committed or failed output write."""
+        self.remaining -= 1
+        if exc is not None:
+            self._record_failure(exc)
+        self._maybe_complete()
+
+    def seal(self, exc: Optional[BaseException] = None) -> None:
+        """Declare that no more output writes will be added to this block."""
+        self.sealed = True
+        if exc is not None:
+            self._record_failure(exc)
+        self._maybe_complete()
+
+    def _record_failure(self, exc: BaseException) -> None:
+        self.failed = True
+        if self.lease is not None and not self.failure_reported:
+            self.failure_reported = True
+            self.work_store.fail_block(self.lease, exc)
+
+    def _maybe_complete(self) -> None:
+        if (
+            self.sealed
+            and self.remaining == 0
+            and not self.failed
+            and not self.completed
+            and self.lease is not None
+        ):
+            self.work_store.complete_block(self.lease)
+            self.completed = True
 
 
 class _BoundedPendingWrites:
@@ -700,14 +775,21 @@ class _BoundedPendingWrites:
         pending = self._writes.popleft()
         # Keep `pending.source` strongly referenced until TensorStore reports
         # that the write is committed. Calling result() also surfaces failures.
-        pending.future.result()
+        try:
+            pending.future.result()
+        except Exception as exc:
+            pending.group.finish_write(exc)
+            raise
+        else:
+            pending.group.finish_write(None)
 
-    def submit(self, target: Any, source: np.ndarray) -> None:
+    def submit(self, target: Any, source: np.ndarray, group: _BlockWriteGroup) -> None:
         """Start a write, waiting first when the pending-write limit is full."""
         if len(self._writes) >= self.limit:
             self._wait_for_oldest()
         future = target.write(source)
-        self._writes.append(_PendingWrite(future=future, source=source))
+        group.add_write()
+        self._writes.append(_PendingWrite(future=future, source=source, group=group))
 
     def flush(self) -> None:
         """Wait for every pending write and raise the first asynchronous error."""
@@ -742,6 +824,7 @@ class WriterWorker:
         outputs: List[OutputSpec],
         write_q: "queue.Queue[Optional[Preds]]",
         preprocess: BlockPreprocessor,
+        work_store: Optional[BlockWorkStore] = None,
     ):
         """
         Initializes the WriterWorker.
@@ -762,11 +845,14 @@ class WriterWorker:
             ``Preds``. The transform's ``inverse_stage`` decides whether inversion
             happens per patch (``before_accumulate``) or once per finalized block
             (``after_finalize``).
+        work_store : BlockWorkStore, optional
+            Completion backend notified after every output for a block commits.
         """
         self.cfg = cfg
         self.outputs = outputs
         self.write_q = write_q
         self.preprocess = preprocess
+        self.work_store = work_store or NoopBlockWorkStore()
         # maps block_idx → in-flight accumulation state for that block
         self.blocks: Dict[Tuple[int, int, int], _BlockState] = {}
 
@@ -864,30 +950,38 @@ class WriterWorker:
                     for n, (spec, acc) in enumerate(zip(self.outputs, accs)):
                         pp = out_np[bi, n].astype(np.float32, copy=False)
                         if spec.invert and inverse_stage == "before_accumulate":
-                            pp = self.preprocess.inverse(
-                                pp, preds.transform_state, ctx
-                            )
+                            pp = self.preprocess.inverse(pp, preds.transform_state, ctx)
                         acc.add(pp, (sz, sy, sx), (dz, dy, dx))
                 state.seen += len(preds.starts_in_block)
 
                 if state.seen >= preds.total_patches_in_block:
                     lz, ly, lx = preds.halo_left
-                    for spec, acc in zip(self.outputs, accs):
-                        ext = acc.finalize()  # expanded (core + halo)
-                        if spec.invert and inverse_stage == "after_finalize":
-                            ext = self.preprocess.inverse(
-                                ext, preds.transform_state, ctx
-                            )
-                        if spec.postprocess is not None:
-                            ext = spec.postprocess(ext, ctx)
-                        core = ext[
-                            lz : lz + core_bz,
-                            ly : ly + core_by,
-                            lx : lx + core_bx,
-                        ]
-                        out_arr = self._cast_to_store(core, spec.store)
-                        target = spec.store[
-                            self.cfg.t_idx, self.cfg.c_idx, zsl, ysl, xsl
-                        ]
-                        pending_writes.submit(target, out_arr)
+                    write_group = _BlockWriteGroup(
+                        lease=preds.lease,
+                        work_store=self.work_store,
+                    )
+                    try:
+                        for spec, acc in zip(self.outputs, accs):
+                            ext = acc.finalize()  # expanded (core + halo)
+                            if spec.invert and inverse_stage == "after_finalize":
+                                ext = self.preprocess.inverse(
+                                    ext, preds.transform_state, ctx
+                                )
+                            if spec.postprocess is not None:
+                                ext = spec.postprocess(ext, ctx)
+                            core = ext[
+                                lz : lz + core_bz,
+                                ly : ly + core_by,
+                                lx : lx + core_bx,
+                            ]
+                            out_arr = self._cast_to_store(core, spec.store)
+                            target = spec.store[
+                                self.cfg.t_idx, self.cfg.c_idx, zsl, ysl, xsl
+                            ]
+                            pending_writes.submit(target, out_arr, write_group)
+                    except Exception as exc:
+                        write_group.seal(exc)
+                        raise
+                    else:
+                        write_group.seal()
                     del self.blocks[preds.block_idx]

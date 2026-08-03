@@ -23,6 +23,12 @@ Optional extras (e.g., UNet dependency):
 
    pip install -e .[denoise-net]
 
+Install the AWS extra to use S3 completion markers:
+
+.. code-block:: bash
+
+   pip install -e .[aws]
+
 
 Minimal Programmatic Usage
 --------------------------
@@ -114,3 +120,24 @@ Because this workflow provides its own transform, the generic ``normalize`` and
 related normalization fields do not override it. The legacy
 ``ModelRegistry.load_model("denoise-net", ...)`` path remains unchanged and loads
 only the raw model/weights.
+
+
+Resuming Interrupted Runs
+-------------------------
+
+Enable block-level resumability in the inference JSON supplied to the CLI or
+Ray launcher:
+
+.. code-block:: json
+
+   {
+     "resume": true,
+     "work_store": "s3-markers",
+     "resume_marker_prefix": "s3://my-bucket/checkpoints/my-output"
+   }
+
+The marker prefix is optional for a single S3 output and required when a model
+has multiple outputs. Never combine resume mode with ``delete_existing: true``;
+the output is validated before it is opened. A block is marked complete only
+after all of its output writes commit, so an interrupted or partially written
+block is processed again on the next run.

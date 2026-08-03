@@ -35,6 +35,10 @@ Optional extras (e.g. UNet dependency):
 ```bash
 pip install -e .[denoise-net]
 ```
+S3-backed resumability:
+```bash
+pip install -e .[aws]
+```
 
 ## CLI Example (Full Parameter Set)
 ```bash
@@ -95,6 +99,32 @@ predictions. Use `--no-output-denormalize` only when transformed-space output is
 intentional. Generic `--normalize` settings do not override a workflow-provided
 transform. `--model-type denoise-net --weights ...` remains the legacy raw-model
 path.
+
+## Resuming Interrupted Runs
+
+Block-level resumability uses small S3 sidecar markers. Put the following in
+the inference JSON passed with `--config`:
+
+```json
+{
+  "resume": true,
+  "work_store": "s3-markers",
+  "resume_marker_prefix": "s3://my-bucket/checkpoints/my-output"
+}
+```
+
+For a single S3 output, `resume_marker_prefix` may be omitted and the marker
+root is derived from the output kvstore. Multi-output runs must provide one
+explicit shared prefix. The runtime skips marked blocks before reading their
+input and writes a marker only after every asynchronous output write for the
+block commits.
+
+Do not set `delete_existing: true` on any output spec when resuming; the CLI
+and Ray launcher reject that combination before opening the output. Markers use
+the versioned path
+`.aind_torch_utils/resume/v2/<run-id>/t=<t>/c=<c>/z=<z>/y=<y>/x=<x>.done`.
+Set `resume_run_id` to choose the namespace explicitly; otherwise it is derived
+from the workload, TensorStore specs, and output-affecting configuration.
 
 ## Programmatic Usage
 ```python

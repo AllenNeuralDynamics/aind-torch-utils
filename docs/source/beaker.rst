@@ -28,6 +28,7 @@ zero-based block grid. The launcher rejects unsafe or indeterminate layouts
 before Ray starts. When output metadata is declared in the spec, validation
 happens before any destructive create/delete open.
 
-See the repository's ``beaker/README.md`` before submitting a run. Use a fresh
-S3 output prefix on every attempt: this milestone has no durable resume or
-automatic retry protocol.
+See the repository's ``beaker/README.md`` before submitting a run. For retries,
+enable S3 marker resume in the inference config, keep ``delete_existing`` false,
+and reuse the same output and marker prefixes. Completion markers provide
+restart safety; they do not coordinate independent concurrent launches.
