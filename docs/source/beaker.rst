@@ -8,7 +8,7 @@ checkpoint at ``/config``, and writes per-shard metrics under ``/results``.
 Deployment files
 ----------------
 
-- ``Dockerfile.beaker`` pins the PyTorch 2.8 / CUDA 12.8 runtime image by digest.
+- ``Dockerfile.beaker`` pins the PyTorch 2.13 / CUDA 13.0 runtime image by digest.
 - ``beaker/single-node-ray.yaml`` is the Beaker v2 experiment template.
 - ``beaker/smoke-config/`` contains copyable input, output, inference, and
   workflow JSON examples.

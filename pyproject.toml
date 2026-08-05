@@ -18,7 +18,7 @@ classifiers = [
 dynamic = ["version"]
 
 dependencies = [
-  "torch<2.9",
+  "torch<2.14",
   "pydantic",
   "psutil",
   "tensorstore==0.1.78",
