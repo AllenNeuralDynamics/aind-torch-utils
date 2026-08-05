@@ -2,6 +2,7 @@ FROM pytorch/pytorch:2.13.0-cuda13.0-cudnn9-runtime@sha256:db80a41f8428644cebcb3
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
     CC=/usr/bin/gcc \
     CXX=/usr/bin/g++
 
@@ -14,5 +15,5 @@ WORKDIR /opt/aind-torch-utils
 COPY pyproject.toml setup.py README.md LICENSE ./
 COPY src ./src
 
-RUN python -m pip install --no-cache-dir ".[ray,denoise-net]" \
+RUN python -m pip install --no-cache-dir ".[ray,denoise-net,aws,extras]" \
     && python -c "import importlib.metadata as m; import torch, ray, tensorstore; import aind_torch_utils.recipes; import aind_torch_utils.recipes.denoise_net; import aind_exaspim_image_compression.inference; from aind_torch_utils.workflow import WorkflowRegistry; assert 'denoise-net' in WorkflowRegistry.list_workflows(); print('torch', torch.__version__, 'ray', ray.__version__, 'tensorstore', m.version('tensorstore'))"
