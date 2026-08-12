@@ -488,10 +488,20 @@ def run(
         compile / channels_last). When ``None`` (default), synthesized from cfg
         (``amp``/``use_compile``/``compile_mode``/``compile_dynamic``), so AMP-on
         stays the legacy default.
+
+    Raises
+    ------
+    ValueError
+        If the configured time or channel index is outside the input store.
     """
     # Validate shapes
     T, C, Z, Y, X = tuple(input_store.domain.shape)
-    assert 0 <= cfg.t_idx < T and 0 <= cfg.c_idx < C, "Invalid t/c indices"
+    if not (0 <= cfg.t_idx < T and 0 <= cfg.c_idx < C):
+        raise ValueError(
+            "Invalid t/c indices: "
+            f"t_idx={cfg.t_idx} must be in [0, {T}) and "
+            f"c_idx={cfg.c_idx} must be in [0, {C})."
+        )
 
     # Synthesize the default block transform from config when none is injected,
     # so existing callers keep their current normalization behavior.

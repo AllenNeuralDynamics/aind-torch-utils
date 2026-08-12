@@ -150,6 +150,20 @@ def _run_test_logic(input_store, output_store, metrics_json, devices, model):
     )
 
 
+@pytest.mark.parametrize(
+    ("t_idx", "c_idx"),
+    [(-1, 0), (1, 0), (0, -1), (0, 1)],
+)
+def test_run_rejects_invalid_time_or_channel_index(t_idx, c_idx):
+    """Invalid store indices raise even when Python assertions are disabled."""
+    input_store = unittest.mock.Mock()
+    input_store.domain.shape = (1, 1, 32, 32, 32)
+    cfg = InferenceConfig(t_idx=t_idx, c_idx=c_idx, devices=["cpu"])
+
+    with pytest.raises(ValueError, match="Invalid t/c indices"):
+        run(DummyModel(), input_store, object(), cfg)
+
+
 @pytest.fixture
 def multi_output_data(tmp_path):
     """Two output stores (float32) matching the 32³ input volume."""
