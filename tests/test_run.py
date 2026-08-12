@@ -7,8 +7,16 @@ import torch
 from torch import nn
 
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.execution import ExecutionPolicy
 from aind_torch_utils.models import SharedEncoderModel
-from aind_torch_utils.run import run
+from aind_torch_utils.outputs import OutputSpec
+from aind_torch_utils.run import (
+    _resolve_output_specs,
+    _validate_inversion,
+    run,
+    run_workflow,
+)
+from aind_torch_utils.workflow import Workflow, WorkflowRegistry
 
 
 class DummyModel(nn.Module):
@@ -142,6 +150,20 @@ def _run_test_logic(input_store, output_store, metrics_json, devices, model):
     )
 
 
+@pytest.mark.parametrize(
+    ("t_idx", "c_idx"),
+    [(-1, 0), (1, 0), (0, -1), (0, 1)],
+)
+def test_run_rejects_invalid_time_or_channel_index(t_idx, c_idx):
+    """Invalid store indices raise even when Python assertions are disabled."""
+    input_store = unittest.mock.Mock()
+    input_store.domain.shape = (1, 1, 32, 32, 32)
+    cfg = InferenceConfig(t_idx=t_idx, c_idx=c_idx, devices=["cpu"])
+
+    with pytest.raises(ValueError, match="Invalid t/c indices"):
+        run(DummyModel(), input_store, object(), cfg)
+
+
 @pytest.fixture
 def multi_output_data(tmp_path):
     """Two output stores (float32) matching the 32³ input volume."""
@@ -212,6 +234,149 @@ def test_run_multi_output_pipeline(multi_output_data, tmp_path):
     out0 = out_stores[0].read().result().astype(np.float32)
     out1 = out_stores[1].read().result().astype(np.float32)
     np.testing.assert_allclose(out0, out1, rtol=1e-4)
+
+
+def test_resolve_output_specs_synthesizes_from_store():
+    cfg = InferenceConfig(devices=["cpu"], output_denormalize=True)
+    specs = _resolve_output_specs(object(), None, cfg)
+    assert len(specs) == 1
+    assert specs[0].invert is True  # driven by output_denormalize
+    assert specs[0].postprocess is None
+    assert specs[0].accumulator_factory is not None
+
+
+def test_resolve_output_specs_list_store():
+    cfg = InferenceConfig(devices=["cpu"], output_denormalize=False)
+    specs = _resolve_output_specs([object(), object()], None, cfg)
+    assert len(specs) == 2
+    assert all(s.invert is False for s in specs)
+
+
+def test_resolve_output_specs_passthrough_explicit():
+    cfg = InferenceConfig(devices=["cpu"])
+    factory = object()
+    explicit = [OutputSpec(store=object(), accumulator_factory=factory)]
+    assert _resolve_output_specs(None, explicit, cfg) is explicit
+
+
+def test_resolve_output_specs_rejects_both_and_neither():
+    cfg = InferenceConfig(devices=["cpu"])
+    with pytest.raises(ValueError, match="not both"):
+        _resolve_output_specs(object(), [OutputSpec(object(), object())], cfg)
+    with pytest.raises(ValueError, match="Provide output_store"):
+        _resolve_output_specs(None, None, cfg)
+    with pytest.raises(ValueError, match="non-empty"):
+        _resolve_output_specs(None, [], cfg)
+
+
+def test_resolve_output_specs_rejects_none_store():
+    """A None store must fail here, not as an AttributeError in a writer thread."""
+    cfg = InferenceConfig(devices=["cpu"])
+    specs = [OutputSpec(store=None, accumulator_factory=object())]
+    with pytest.raises(ValueError, match="store=None"):
+        _resolve_output_specs(None, specs, cfg)
+
+
+def test_validate_inversion_rejects_invert_without_inverse():
+    """invert=True + forward-only preprocess must error, not silently skip."""
+
+    class _ForwardOnly:
+        def forward(self, block, ctx):
+            return block, None
+
+    specs = [
+        OutputSpec(store=object(), accumulator_factory=object(), invert=True)
+    ]
+    with pytest.raises(ValueError, match="defines no inverse"):
+        _validate_inversion(_ForwardOnly(), specs)
+    # invert=False everywhere -> a forward-only preprocess is fine.
+    _validate_inversion(
+        _ForwardOnly(),
+        [OutputSpec(store=object(), accumulator_factory=object(), invert=False)],
+    )
+
+
+def test_validate_inversion_rejects_unknown_stage():
+    """A typo'd inverse_stage must error, not silently disable inversion."""
+
+    class _TypoStage:
+        inverse_stage = "after-finalize"  # hyphen typo
+
+        def forward(self, block, ctx):
+            return block, None
+
+        def inverse(self, block, state, ctx):
+            return block
+
+    specs = [
+        OutputSpec(store=object(), accumulator_factory=object(), invert=True)
+    ]
+    with pytest.raises(ValueError, match="Unknown inverse_stage"):
+        _validate_inversion(_TypoStage(), specs)
+
+
+def test_validate_inversion_defaults_missing_stage():
+    """A duck-typed invertible transform without inverse_stage is accepted
+    (the writer defaults it to after_finalize)."""
+
+    class _NoStage:
+        def forward(self, block, ctx):
+            return block, None
+
+        def inverse(self, block, state, ctx):
+            return block
+
+    specs = [
+        OutputSpec(store=object(), accumulator_factory=object(), invert=True)
+    ]
+    _validate_inversion(_NoStage(), specs)  # must not raise
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for GPU pipeline"
+)
+def test_run_workflow_end_to_end(temp_dir, dummy_data):
+    """A registered Workflow (identity processor, no normalization) runs through
+    run_workflow and reproduces the input."""
+    input_store, output_store = dummy_data
+
+    @WorkflowRegistry.register("test-identity-workflow")
+    def _build(params):
+        return Workflow(
+            processor=DummyModel(),
+            preprocess=None,  # run() synthesizes from cfg (normalize=False)
+            execution=ExecutionPolicy.from_config(
+                amp=False, use_compile=False, compile_mode="default",
+                compile_dynamic=None,
+            ),
+        )
+
+    cfg = InferenceConfig(
+        patch=(16, 16, 16),
+        overlap=4,
+        trim_voxels=2,
+        seam_mode="trim",
+        block=(32, 32, 32),
+        batch_size=4,
+        devices=["cuda:0"],
+        amp=False,
+        max_inflight_batches=10,
+        normalize=False,
+    )
+
+    workflow = WorkflowRegistry.build("test-identity-workflow")
+    run_workflow(
+        workflow,
+        input_store,
+        output_store,
+        cfg,
+        metrics_json=str(temp_dir / "wf_metrics.json"),
+        metrics_interval=0.1,
+    )
+
+    np.testing.assert_array_equal(
+        input_store.read().result(), output_store.read().result()
+    )
 
 
 def test_shared_encoder_model_forward():

@@ -1,3 +1,5 @@
+"""General TensorStore and three-dimensional tiling utilities."""
+
 from __future__ import annotations
 
 import json
@@ -140,6 +142,22 @@ def iter_patch_starts(
     )
 
     def axis_starts(L: int, P: int, S: int) -> List[int]:
+        """Return covering patch starts for one axis.
+
+        Parameters
+        ----------
+        L : int
+            Length of the block axis.
+        P : int
+            Length of the patch axis.
+        S : int
+            Step between adjacent patches.
+
+        Returns
+        -------
+        list of int
+            Patch starts, including the final boundary-aligned start.
+        """
         if L <= P:
             return [0]
         starts = list(range(0, L - P + 1, S))

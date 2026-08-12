@@ -1,3 +1,5 @@
+"""Background monitors for pipeline queues and system resource usage."""
+
 import threading
 import time
 from dataclasses import dataclass

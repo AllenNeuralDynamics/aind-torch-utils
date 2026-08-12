@@ -18,11 +18,18 @@ from typing import Any, List, Optional, Tuple, Union
 from torch import nn
 
 import aind_torch_utils.models  # This registers all models when imported
+import aind_torch_utils.recipes  # This registers all workflow recipes when imported
+from aind_torch_utils import transforms
+from aind_torch_utils.accumulators import weighted_average_factory
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.execution import ExecutionPolicy
 from aind_torch_utils.model_registry import ModelRegistry
 from aind_torch_utils.monitoring import QueueMonitor, SystemMonitor
+from aind_torch_utils.outputs import OutputSpec
+from aind_torch_utils.transforms import BlockPreprocessor
 from aind_torch_utils.utils import open_ts_spec
 from aind_torch_utils.workers import GpuWorker, PrepWorker, WriterWorker
+from aind_torch_utils.workflow import Workflow, WorkflowRegistry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -161,11 +168,13 @@ def _setup_monitors(
 def _setup_workers(
     model: nn.Module,
     input_store: Any,
-    output_stores: List[Any],
+    output_specs: List[OutputSpec],
     cfg: InferenceConfig,
     num_prep_workers: int,
     prep_q: queue.Queue,
     write_queues: List[queue.Queue],
+    preprocess: BlockPreprocessor,
+    execution: ExecutionPolicy,
 ) -> Tuple[List[PrepWorker], List[GpuWorker], List[WriterWorker]]:
     """Sets up the workers for the pipeline.
 
@@ -175,8 +184,8 @@ def _setup_workers(
         The model to use for inference.
     input_store : Any
         The input data store.
-    output_stores : List[Any]
-        One output data store per model output channel.
+    output_specs : List[OutputSpec]
+        One spec per model output channel (store + merge + post + invert).
     cfg : InferenceConfig
         The inference configuration.
     num_prep_workers : int
@@ -185,6 +194,10 @@ def _setup_workers(
         The prep queue.
     write_queues : List[queue.Queue]
         A list of writer queues.
+    preprocess : BlockPreprocessor
+        The injected block transform shared by prep (forward) and writer (inverse).
+    execution : ExecutionPolicy
+        How the GPU processor runs (dtype/autocast/compile/channels_last).
 
     Returns
     -------
@@ -197,31 +210,75 @@ def _setup_workers(
             input_store,
             prep_q,
             cfg.patch,
+            preprocess,
+            execution,
             worker_id=i,
             num_workers=num_prep_workers,
         )
         for i in range(max(1, num_prep_workers))
     ]
+    # Per-device copies only make sense for nn.Modules (independent weights on
+    # each GPU). A plain-callable BlockProcessor is shared as-is: it manages
+    # its own state and may hold handles deepcopy cannot pickle.
     gpu_workers = [
-        GpuWorker(cfg, deepcopy(model), device, prep_q, write_queues)
+        GpuWorker(
+            cfg,
+            deepcopy(model) if isinstance(model, nn.Module) else model,
+            device,
+            prep_q,
+            write_queues,
+            execution,
+        )
         for device in cfg.devices
     ]
     writer_workers = [
-        WriterWorker(cfg, output_stores, write_queues[i])
+        WriterWorker(
+            cfg,
+            output_specs,
+            write_queues[i],
+            preprocess,
+        )
         for i in range(len(write_queues))
     ]
     return prep_workers, gpu_workers, writer_workers
 
 
+def _guarded_worker(
+    run_fn: Any,
+    stop_event: threading.Event,
+    errors: List[Tuple[str, BaseException]],
+    name: str,
+) -> Any:
+    """Wrap a worker's run() so an uncaught exception stops the pipeline.
+
+    Without this, a dead worker leaves its peers spinning on full queues
+    forever (hang) or lets run() return "successfully" with nothing written.
+    """
+
+    def target() -> None:
+        """Run the worker and record any uncaught exception."""
+        try:
+            run_fn(stop_event)
+        except Exception as exc:  # noqa: BLE001 - any worker death is fatal
+            logger.exception("Worker thread %s died; stopping pipeline.", name)
+            errors.append((name, exc))
+            stop_event.set()
+
+    return target
+
+
 def _setup_worker_threads(
     model: nn.Module,
     input_store: Any,
-    output_stores: List[Any],
+    output_specs: List[OutputSpec],
     cfg: InferenceConfig,
     stop_event: threading.Event,
     num_prep_workers: int,
     prep_q: queue.Queue,
     write_queues: List[queue.Queue],
+    preprocess: BlockPreprocessor,
+    execution: ExecutionPolicy,
+    worker_errors: List[Tuple[str, BaseException]],
 ) -> Tuple[List[threading.Thread], List[threading.Thread], List[threading.Thread]]:
     """Sets up the worker threads for the pipeline.
 
@@ -231,8 +288,8 @@ def _setup_worker_threads(
         The model to use for inference.
     input_store : Any
         The input data store.
-    output_stores : List[Any]
-        One output data store per model output channel.
+    output_specs : List[OutputSpec]
+        One spec per model output channel.
     cfg : InferenceConfig
         The inference configuration.
     stop_event : threading.Event
@@ -243,6 +300,13 @@ def _setup_worker_threads(
         The prep queue.
     write_queues : List[queue.Queue]
         A list of writer queues.
+    preprocess : BlockPreprocessor
+        The injected block transform shared by prep and writer.
+    execution : ExecutionPolicy
+        How the GPU processor runs.
+    worker_errors : list
+        Receives ``(thread_name, exception)`` for any worker that dies; the
+        caller re-raises after joins so failures are never silent.
 
     Returns
     -------
@@ -254,39 +318,135 @@ def _setup_worker_threads(
     prep_workers, gpu_workers, writer_workers = _setup_workers(
         model,
         input_store,
-        output_stores,
+        output_specs,
         cfg,
         num_prep_workers,
         prep_q,
         write_queues,
+        preprocess,
+        execution,
     )
 
     # Threads
     prep_threads = [
-        threading.Thread(target=w.run, args=(stop_event,), name=f"prep-{i}")
+        threading.Thread(
+            target=_guarded_worker(w.run, stop_event, worker_errors, f"prep-{i}"),
+            name=f"prep-{i}",
+        )
         for i, w in enumerate(prep_workers)
     ]
     gpu_threads = [
-        threading.Thread(target=worker.run, args=(stop_event,), name=f"gpu-{i}")
-        for i, worker in enumerate(gpu_workers)
+        threading.Thread(
+            target=_guarded_worker(w.run, stop_event, worker_errors, f"gpu-{i}"),
+            name=f"gpu-{i}",
+        )
+        for i, w in enumerate(gpu_workers)
     ]
     writer_threads = [
-        threading.Thread(target=w.run, args=(stop_event,), name=f"writer-{i}")
+        threading.Thread(
+            target=_guarded_worker(w.run, stop_event, worker_errors, f"writer-{i}"),
+            name=f"writer-{i}",
+        )
         for i, w in enumerate(writer_workers)
     ]
 
     return prep_threads, gpu_threads, writer_threads
 
 
+def _resolve_output_specs(
+    output_store: Union[Any, List[Any], None],
+    outputs: Optional[List[OutputSpec]],
+    cfg: InferenceConfig,
+) -> List[OutputSpec]:
+    """Return the per-output specs, synthesizing them from ``output_store`` if needed.
+
+    Exactly one of ``output_store`` / ``outputs`` must be provided. When synthesizing,
+    each store gets the default trim/blend merge and ``invert=cfg.output_denormalize``,
+    reproducing the pre-refactor single-policy writer.
+    """
+    if outputs is not None:
+        if output_store is not None:
+            raise ValueError("Pass either output_store or outputs, not both.")
+        if not outputs:
+            raise ValueError("outputs must be a non-empty list of OutputSpec.")
+        # Catch a None store here, in the caller's thread, instead of as an
+        # opaque AttributeError when the first block completes in a writer.
+        for i, spec in enumerate(outputs):
+            if spec.store is None:
+                raise ValueError(
+                    f"OutputSpec {i} has store=None; every output needs a "
+                    "destination store."
+                )
+        return outputs
+
+    if output_store is None:
+        raise ValueError("Provide output_store (or outputs).")
+
+    output_stores = (
+        output_store if isinstance(output_store, list) else [output_store]
+    )
+    factory = weighted_average_factory(
+        cfg.eps,
+        cfg.overlap,
+        cfg.seam_mode,
+        cfg.trim_voxels,
+        cfg.min_blend_weight,
+    )
+    return [
+        OutputSpec(
+            store=store,
+            accumulator_factory=factory,
+            postprocess=None,
+            invert=cfg.output_denormalize,
+        )
+        for store in output_stores
+    ]
+
+
+_KNOWN_INVERSE_STAGES = ("before_accumulate", "after_finalize")
+
+
+def _validate_inversion(
+    preprocess: BlockPreprocessor, output_specs: List[OutputSpec]
+) -> None:
+    """Fail fast on inversion misconfiguration, before any thread starts.
+
+    The writer silently skips inversion when its stage gates do not match, so a
+    non-invertible preprocess paired with ``invert=True`` (or an unrecognized
+    ``inverse_stage`` string) would otherwise write normalized-space data with
+    no error.
+    """
+    if not transforms.is_invertible(preprocess):
+        if any(spec.invert for spec in output_specs):
+            raise ValueError(
+                "An OutputSpec requests invert=True but the preprocess "
+                f"({type(preprocess).__name__}) defines no inverse. Set "
+                "invert=False (or cfg.output_denormalize=False) to write "
+                "outputs untransformed, or use an invertible preprocess."
+            )
+        return
+    # May raise for Sequential members that disagree — better here than in a
+    # writer thread.
+    stage = getattr(preprocess, "inverse_stage", "after_finalize")
+    if stage not in _KNOWN_INVERSE_STAGES:
+        raise ValueError(
+            f"Unknown inverse_stage {stage!r} on {type(preprocess).__name__}; "
+            f"expected one of {_KNOWN_INVERSE_STAGES}."
+        )
+
+
 def run(
     model: nn.Module,
     input_store: Any,
-    output_store: Union[Any, List[Any]],
+    output_store: Union[Any, List[Any], None],
     cfg: InferenceConfig,
     metrics_json: Optional[str] = None,
     metrics_interval: float = 0.5,
     num_prep_workers: int = 1,
     num_writer_workers: int = 1,
+    preprocess: Optional[BlockPreprocessor] = None,
+    outputs: Optional[List[OutputSpec]] = None,
+    execution: Optional[ExecutionPolicy] = None,
 ) -> None:
     """Runs the inference pipeline.
 
@@ -295,12 +455,13 @@ def run(
     model : nn.Module
         The model to use for inference. For multi-output models (e.g.,
         SharedEncoderModel) the forward pass must return a tensor of shape
-        ``(B, N, Z, Y, X)`` and ``output_store`` must be a list of N stores.
+        ``(B, N, Z, Y, X)`` and there must be N outputs.
     input_store : Any
         The input data store.
-    output_store : Any or list of Any
+    output_store : Any or list of Any or None
         Output TensorStore(s). Pass a single store for single-output models, or
-        a list of N stores when the model returns N output channels.
+        a list of N stores when the model returns N output channels. May be
+        ``None`` only when ``outputs`` is given.
     cfg : InferenceConfig
         The inference configuration.
     metrics_json : Optional[str], optional
@@ -311,14 +472,61 @@ def run(
         The number of prep workers to use, by default 1.
     num_writer_workers : int, optional
         The number of writer workers to use, by default 1.
-    """
-    output_stores: List[Any] = (
-        output_store if isinstance(output_store, list) else [output_store]
-    )
+    preprocess : Optional[BlockPreprocessor], optional
+        Injected input-domain transform applied per block (its inverse runs in
+        the writer). When ``None`` (default), one is synthesized from the legacy
+        config fields (``normalize``/``norm_lower``/``norm_upper``/``clip_norm``),
+        preserving existing behavior.
+    outputs : Optional[List[OutputSpec]], optional
+        Per-output specs (store + merge factory + post-processor + invert flag).
+        When ``None`` (default), specs are synthesized from ``output_store`` with
+        the default trim/blend merge and ``invert=cfg.output_denormalize`` for
+        every output, preserving existing behavior. Provide this for per-output
+        merge/post/dtype control; ``output_store`` is then optional.
+    execution : Optional[ExecutionPolicy], optional
+        How the GPU processor runs (input dtype / autocast / inference_mode /
+        compile / channels_last). When ``None`` (default), synthesized from cfg
+        (``amp``/``use_compile``/``compile_mode``/``compile_dynamic``), so AMP-on
+        stays the legacy default.
 
+    Raises
+    ------
+    ValueError
+        If the configured time or channel index is outside the input store.
+    """
     # Validate shapes
     T, C, Z, Y, X = tuple(input_store.domain.shape)
-    assert 0 <= cfg.t_idx < T and 0 <= cfg.c_idx < C, "Invalid t/c indices"
+    if not (0 <= cfg.t_idx < T and 0 <= cfg.c_idx < C):
+        raise ValueError(
+            "Invalid t/c indices: "
+            f"t_idx={cfg.t_idx} must be in [0, {T}) and "
+            f"c_idx={cfg.c_idx} must be in [0, {C})."
+        )
+
+    # Synthesize the default block transform from config when none is injected,
+    # so existing callers keep their current normalization behavior.
+    if preprocess is None:
+        preprocess = transforms.from_config(
+            cfg.normalize,
+            cfg.norm_lower,
+            cfg.norm_upper,
+            cfg.eps,
+            cfg.clip_norm,
+        )
+
+    # Resolve the per-output specs. Explicit `outputs` win; otherwise synthesize
+    # one spec per store with the default trim/blend merge and a per-output invert
+    # flag driven by cfg.output_denormalize -- byte-identical to the old writer.
+    output_specs = _resolve_output_specs(output_store, outputs, cfg)
+
+    # Fail fast (in this thread) on invert/inverse_stage misconfiguration.
+    _validate_inversion(preprocess, output_specs)
+
+    # Default execution policy from cfg keeps AMP/compile behavior identical.
+    if execution is None:
+        execution = ExecutionPolicy.from_config(
+            cfg.amp, cfg.use_compile, cfg.compile_mode, cfg.compile_dynamic
+        )
 
     # Queues
     prep_q, write_queues = _setup_queues(
@@ -332,16 +540,23 @@ def run(
         prep_q, write_queues, metrics_interval, stop_event
     )
 
+    # Collects (thread_name, exception) from any worker that dies; re-raised
+    # after joins so a failed run never looks like a successful one.
+    worker_errors: List[Tuple[str, BaseException]] = []
+
     # Threads
     prep_threads, gpu_threads, writer_threads = _setup_worker_threads(
         model,
         input_store,
-        output_stores,
+        output_specs,
         cfg,
         stop_event,
         num_prep_workers,
         prep_q,
         write_queues,
+        preprocess,
+        execution,
+        worker_errors,
     )
     all_threads = prep_threads + gpu_threads + writer_threads
 
@@ -399,10 +614,67 @@ def run(
         if metrics_json:
             _write_metrics_json(metrics_json, q_monitor, sys_monitor)
 
+    if worker_errors:
+        names = ", ".join(name for name, _ in worker_errors)
+        raise RuntimeError(
+            f"Worker thread(s) failed: {names}; see logged tracebacks."
+        ) from worker_errors[0][1]
+
     t1 = time.perf_counter()
     throughput = (Z * Y * X * input_store.dtype.numpy_dtype.itemsize) / 1e6 / (t1 - t0)
     logger.info(f"Total time: {t1-t0:.2f}s")
     logger.info(f"Throughput: {throughput:.2f}MB/s")
+
+
+def run_workflow(
+    workflow: Workflow,
+    input_store: Any,
+    output_store: Union[Any, List[Any], None],
+    cfg: InferenceConfig,
+    **run_kwargs: Any,
+) -> None:
+    """Run a :class:`Workflow` by unpacking its injected objects into :func:`run`.
+
+    The workflow supplies the processor, preprocessing, per-output specs, and
+    execution policy; everything else (metrics, worker counts) is forwarded via
+    ``run_kwargs``.
+
+    Parameters
+    ----------
+    workflow : Workflow
+        The recipe to run. When the workflow leaves ``preprocess`` or
+        ``execution`` unset (``None``), :func:`run` synthesizes them from
+        ``cfg``, so config/CLI normalization and AMP/compile flags apply; a
+        recipe sets them to pin its own behavior.
+    input_store : Any
+        The input data store.
+    output_store : Any or list of Any or None
+        Output store(s). Ignored when the workflow supplies its own ``outputs``;
+        required when it supplies an ``output_spec_factory``.
+    cfg : InferenceConfig
+        The runtime configuration.
+    **run_kwargs : Any
+        Forwarded to :func:`run` (e.g. ``metrics_json``, ``num_prep_workers``).
+    """
+    if workflow.output_spec_factory is not None and output_store is None:
+        raise ValueError(
+            "This workflow builds its output specs from the opened output "
+            "stores; provide output_store."
+        )
+    output_stores = (
+        output_store if isinstance(output_store, list) else [output_store]
+    )
+    outputs = workflow.resolve_outputs(output_stores)
+    run(
+        workflow.processor,
+        input_store,
+        None if outputs is not None else output_store,
+        cfg,
+        preprocess=workflow.preprocess,
+        outputs=outputs,
+        execution=workflow.execution,
+        **run_kwargs,
+    )
 
 
 def load_model(model_type: str, weights_path: Optional[str] = None) -> nn.Module:
@@ -452,16 +724,35 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "--out-spec",
         type=str,
         nargs="+",
-        required=True,
-        help="Path(s) to output TensorStore JSON spec file(s). Provide one per model output channel.",
+        default=None,
+        help=(
+            "Path(s) to output TensorStore JSON spec file(s). Provide one per "
+            "model output channel. Required unless the workflow supplies its "
+            "own fixed outputs."
+        ),
     )
     ap.add_argument(
         "--model-type",
         type=str,
-        required=True,
-        help="Type of model to use (must be registered)",
+        default=None,
+        help="Type of model to use (must be registered). Alternative to --workflow.",
     )
     ap.add_argument("--weights", type=str, help="Model weights path")
+    ap.add_argument(
+        "--workflow",
+        type=str,
+        default=None,
+        help=(
+            "Named workflow recipe to run (registered in aind_torch_utils.recipes). "
+            "Alternative to --model-type; brings its own preprocessing/outputs."
+        ),
+    )
+    ap.add_argument(
+        "--workflow-params",
+        type=str,
+        default=None,
+        help="Path to a JSON file of parameters passed to the workflow builder.",
+    )
     ap.add_argument("--t", type=int, default=0)
     ap.add_argument("--c", type=int, default=0)
     ap.add_argument("--patch", type=int, nargs=3, default=(64, 64, 64))
@@ -620,10 +911,15 @@ def main(argv: Optional[List[str]] = None) -> None:
     """
     args = _parse_args(sys.argv[1:] if argv is None else argv)
 
-    model = load_model(args.model_type, args.weights)
+    if bool(args.model_type) == bool(args.workflow):
+        raise SystemExit("Provide exactly one of --model-type or --workflow.")
+    if args.workflow and args.weights:
+        raise SystemExit(
+            "--weights only applies with --model-type; pass weights to the "
+            "workflow via --workflow-params."
+        )
 
     in_arr = open_ts_spec(args.in_spec)
-    out_arr = [open_ts_spec(s) for s in args.out_spec]
 
     cfg = InferenceConfig(
         patch=tuple(args.patch),
@@ -659,16 +955,43 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     logger.info(f"Inference config:\n{cfg}")
 
-    run(
-        model,
-        in_arr,
-        out_arr,
-        cfg,
-        args.metrics_json,
-        args.metrics_interval,
+    run_kwargs = dict(
+        metrics_json=args.metrics_json,
+        metrics_interval=args.metrics_interval,
         num_prep_workers=max(1, args.prep_workers),
         num_writer_workers=max(1, args.writer_workers),
     )
+
+    if args.workflow:
+        params: dict = {}
+        if args.workflow_params:
+            with open(args.workflow_params) as f:
+                params = json.load(f)
+        workflow = WorkflowRegistry.build(args.workflow, params)
+        # Decide the stores' fate BEFORE opening them: an open with a
+        # create/delete_existing spec mutates the target, and a fixed-outputs
+        # workflow would then silently ignore it.
+        if workflow.outputs is not None:
+            if args.out_spec:
+                raise SystemExit(
+                    f"Workflow '{args.workflow}' supplies its own outputs; "
+                    "remove --out-spec (it would be ignored)."
+                )
+            out_arr = None
+        else:
+            if not args.out_spec:
+                raise SystemExit(
+                    f"--out-spec is required: workflow '{args.workflow}' does "
+                    "not supply fixed outputs."
+                )
+            out_arr = [open_ts_spec(s) for s in args.out_spec]
+        run_workflow(workflow, in_arr, out_arr, cfg, **run_kwargs)
+    else:
+        if not args.out_spec:
+            raise SystemExit("--out-spec is required with --model-type.")
+        out_arr = [open_ts_spec(s) for s in args.out_spec]
+        model = load_model(args.model_type, args.weights)
+        run(model, in_arr, out_arr, cfg, **run_kwargs)
 
 
 if __name__ == "__main__":  # pragma: no cover
