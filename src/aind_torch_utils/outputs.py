@@ -60,11 +60,36 @@ class Threshold:
     """
 
     def __init__(self, thresh: float = 0.0, above: float = 1.0, below: float = 0.0):
+        """Initialize the threshold operation.
+
+        Parameters
+        ----------
+        thresh : float, optional
+            Exclusive lower bound for the ``above`` output value.
+        above : float, optional
+            Value emitted where the input exceeds ``thresh``.
+        below : float, optional
+            Value emitted where the input does not exceed ``thresh``.
+        """
         self.thresh = float(thresh)
         self.above = float(above)
         self.below = float(below)
 
     def __call__(self, block: np.ndarray, ctx: "BlockContext") -> np.ndarray:
+        """Threshold a block.
+
+        Parameters
+        ----------
+        block : np.ndarray
+            Finalized expanded block to threshold.
+        ctx : BlockContext
+            Spatial context for the block.
+
+        Returns
+        -------
+        np.ndarray
+            Float32 array containing the configured output levels.
+        """
         # float32 branch scalars keep np.where from promoting the whole block
         # to float64 (Python-float branches would double the allocation).
         return np.where(
@@ -82,6 +107,20 @@ class ThresholdThenOpen:
     """
 
     def __init__(self, thresh: float = 0.0, open_iters: int = 1):
+        """Initialize thresholding and binary opening.
+
+        Parameters
+        ----------
+        thresh : float, optional
+            Exclusive lower bound for foreground voxels.
+        open_iters : int, optional
+            Number of binary-opening iterations.
+
+        Raises
+        ------
+        ImportError
+            If the optional SciPy dependency is unavailable.
+        """
         try:
             from scipy import ndimage
         except ImportError as exc:  # pragma: no cover - depends on optional dep
@@ -93,6 +132,20 @@ class ThresholdThenOpen:
         self.open_iters = int(open_iters)
 
     def __call__(self, block: np.ndarray, ctx: "BlockContext") -> np.ndarray:
+        """Threshold and binary-open a block.
+
+        Parameters
+        ----------
+        block : np.ndarray
+            Finalized expanded block to process.
+        ctx : BlockContext
+            Spatial context for the block.
+
+        Returns
+        -------
+        np.ndarray
+            Binary-opened float32 mask.
+        """
         mask = block > self.thresh
         opened = self._ndi.binary_opening(mask, iterations=self.open_iters)
         return opened.astype(np.float32, copy=False)

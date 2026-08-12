@@ -1,3 +1,5 @@
+"""Queue workers for preparing, processing, and writing inference blocks."""
+
 import logging
 import queue
 import threading
@@ -399,6 +401,13 @@ class GpuWorker:
             self._compile_model()
 
     def _autocast_context(self):
+        """Return the configured CUDA autocast context.
+
+        Returns
+        -------
+        context manager
+            CUDA autocast when enabled, otherwise a no-op context.
+        """
         return (
             torch.autocast(device_type="cuda", dtype=torch.float16)
             if self.execution.autocast
@@ -406,11 +415,19 @@ class GpuWorker:
         )
 
     def _inference_context(self):
+        """Return the configured inference context.
+
+        Returns
+        -------
+        context manager
+            Torch inference mode when enabled, otherwise a no-op context.
+        """
         if self.execution.inference_mode:
             return torch.inference_mode()
         return nullcontext()
 
     def _compile_model(self) -> None:
+        """Compile and warm up the model, falling back to eager execution."""
         # Keep a handle to the original module so we can fall back to eager
         # execution if compilation fails. torch.compile returns a new wrapper
         # and does not mutate the original, so this reference stays valid.
@@ -465,6 +482,7 @@ class GpuWorker:
             self.model = eager_model
 
     def _warmup_compiled_model(self) -> None:
+        """Run one device batch to trigger lazy model compilation."""
         torch.cuda.set_device(self.device)
         dtype = self.execution.input_dtype
         shape = (self.cfg.batch_size, 1, *self.cfg.patch)
@@ -644,9 +662,39 @@ class WriterWorker:
     def _make_accumulators(
         self, acc_shape: Tuple[int, int, int], ctx: BlockContext
     ) -> List[BlockAccumulator]:
+        """Create one accumulator for each output specification.
+
+        Parameters
+        ----------
+        acc_shape : tuple of int
+            Shape of the expanded block in ``(z, y, x)`` order.
+        ctx : BlockContext
+            Spatial context for the block.
+
+        Returns
+        -------
+        list of BlockAccumulator
+            Fresh accumulators in output specification order.
+        """
         return [spec.accumulator_factory(acc_shape, ctx) for spec in self.outputs]
 
     def _cast_to_store(self, core: np.ndarray, store: Any) -> np.ndarray:
+        """Cast a core block to a destination store's dtype.
+
+        Integer output is clipped to the representable range before casting.
+
+        Parameters
+        ----------
+        core : np.ndarray
+            Core block to cast.
+        store : Any
+            Destination TensorStore-like object exposing ``dtype.numpy_dtype``.
+
+        Returns
+        -------
+        np.ndarray
+            Block cast to the destination dtype.
+        """
         target_dtype = store.dtype.numpy_dtype
         if np.issubdtype(target_dtype, np.integer):
             info = np.iinfo(target_dtype)

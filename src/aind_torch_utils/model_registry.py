@@ -1,3 +1,5 @@
+"""Registry for named PyTorch model loaders."""
+
 from typing import Callable, Dict, Optional
 
 from torch import nn
@@ -34,6 +36,18 @@ class ModelRegistry:
         """
 
         def decorator(func: Callable[[Optional[str]], nn.Module]) -> Callable:
+            """Store a model loader under the requested name.
+
+            Parameters
+            ----------
+            func : Callable
+                Model loader to register.
+
+            Returns
+            -------
+            Callable
+                The registered loader, unchanged.
+            """
             cls._registry[name] = func
             return func
 

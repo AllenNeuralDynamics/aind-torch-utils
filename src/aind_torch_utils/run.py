@@ -256,6 +256,7 @@ def _guarded_worker(
     """
 
     def target() -> None:
+        """Run the worker and record any uncaught exception."""
         try:
             run_fn(stop_event)
         except Exception as exc:  # noqa: BLE001 - any worker death is fatal

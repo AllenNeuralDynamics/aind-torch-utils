@@ -98,11 +98,34 @@ class _AffineNormalizer:
     inverse_stage: InverseStage = "after_finalize"
 
     def __init__(self, eps: float = 1e-6):
+        """Initialize the inverse transform.
+
+        Parameters
+        ----------
+        eps : float, optional
+            Minimum affine scale used during inversion.
+        """
         self.eps = float(eps)
 
     def inverse(
         self, block: np.ndarray, state: Any, ctx: "BlockContext"
     ) -> np.ndarray:
+        """Invert affine normalization on a block.
+
+        Parameters
+        ----------
+        block : np.ndarray
+            Normalized block to invert.
+        state : tuple of float
+            Lower and upper bounds saved during normalization.
+        ctx : BlockContext
+            Spatial context for the block.
+
+        Returns
+        -------
+        np.ndarray
+            Denormalized float32 block.
+        """
         mn, mx = state
         scale = max(mx - mn, self.eps)
         return (block * np.float32(scale) + np.float32(mn)).astype(
@@ -119,6 +142,17 @@ class PercentileNormalizer(_AffineNormalizer):
     """
 
     def __init__(self, lower: float, upper: float, eps: float = 1e-6):
+        """Initialize the percentile normalizer.
+
+        Parameters
+        ----------
+        lower : float
+            Lower percentile used as the zero point.
+        upper : float
+            Upper percentile used as the unit point.
+        eps : float, optional
+            Minimum normalization scale.
+        """
         super().__init__(eps=eps)
         self.lower = float(lower)
         self.upper = float(upper)
@@ -126,6 +160,22 @@ class PercentileNormalizer(_AffineNormalizer):
     def forward(
         self, block: np.ndarray, ctx: "BlockContext"
     ) -> Tuple[np.ndarray, Any]:
+        """Normalize a block using its percentile bounds.
+
+        Parameters
+        ----------
+        block : np.ndarray
+            Input block to normalize.
+        ctx : BlockContext
+            Spatial context for the block.
+
+        Returns
+        -------
+        normalized : np.ndarray
+            Float32 block normalized by its percentile range.
+        state : tuple of float
+            Lower and upper percentile values used for inversion.
+        """
         block = _as_float32(block)
         mn, mx = np.percentile(block, [self.lower, self.upper])
         scale = max(mx - mn, self.eps)
@@ -141,6 +191,17 @@ class GlobalNormalizer(_AffineNormalizer):
     """
 
     def __init__(self, lower: float, upper: float, eps: float = 1e-6):
+        """Initialize the global normalizer.
+
+        Parameters
+        ----------
+        lower : float
+            Fixed lower clipping and normalization bound.
+        upper : float
+            Fixed upper clipping and normalization bound.
+        eps : float, optional
+            Minimum normalization scale.
+        """
         super().__init__(eps=eps)
         self.lower = float(lower)
         self.upper = float(upper)
@@ -148,6 +209,22 @@ class GlobalNormalizer(_AffineNormalizer):
     def forward(
         self, block: np.ndarray, ctx: "BlockContext"
     ) -> Tuple[np.ndarray, Any]:
+        """Clip and normalize a block using fixed bounds.
+
+        Parameters
+        ----------
+        block : np.ndarray
+            Input block to normalize.
+        ctx : BlockContext
+            Spatial context for the block.
+
+        Returns
+        -------
+        normalized : np.ndarray
+            Clipped and normalized float32 block.
+        state : tuple of float
+            Fixed lower and upper bounds used for inversion.
+        """
         lo, hi = self.lower, self.upper
         scale = max(hi - lo, self.eps)
         out = np.clip(block, lo, hi)
@@ -167,11 +244,43 @@ class IdentityTransform:
     def forward(
         self, block: np.ndarray, ctx: "BlockContext"
     ) -> Tuple[np.ndarray, Any]:
+        """Apply the identity transform.
+
+        Parameters
+        ----------
+        block : np.ndarray
+            Input block.
+        ctx : BlockContext
+            Spatial context for the block.
+
+        Returns
+        -------
+        transformed : np.ndarray
+            The original block.
+        state : None
+            No transform state is required.
+        """
         return block, None
 
     def inverse(
         self, block: np.ndarray, state: Any, ctx: "BlockContext"
     ) -> np.ndarray:
+        """Invert the identity transform.
+
+        Parameters
+        ----------
+        block : np.ndarray
+            Block to invert.
+        state : Any
+            Ignored transform state.
+        ctx : BlockContext
+            Spatial context for the block.
+
+        Returns
+        -------
+        np.ndarray
+            The original block.
+        """
         return block
 
 
@@ -183,12 +292,37 @@ class Clip:
     """
 
     def __init__(self, lo: float, hi: float):
+        """Initialize the clip transform.
+
+        Parameters
+        ----------
+        lo : float
+            Inclusive lower clipping bound.
+        hi : float
+            Inclusive upper clipping bound.
+        """
         self.lo = float(lo)
         self.hi = float(hi)
 
     def forward(
         self, block: np.ndarray, ctx: "BlockContext"
     ) -> Tuple[np.ndarray, Any]:
+        """Clip a block to the configured bounds.
+
+        Parameters
+        ----------
+        block : np.ndarray
+            Input block to clip.
+        ctx : BlockContext
+            Spatial context for the block.
+
+        Returns
+        -------
+        transformed : np.ndarray
+            Clipped block.
+        state : None
+            No transform state is produced.
+        """
         return np.clip(block, self.lo, self.hi), None
 
 
@@ -201,10 +335,29 @@ class Sequential:
     """
 
     def __init__(self, steps: List[BlockPreprocessor]):
+        """Initialize the transform composition.
+
+        Parameters
+        ----------
+        steps : list of BlockPreprocessor
+            Transforms to apply from left to right.
+        """
         self.steps = list(steps)
 
     @property
     def inverse_stage(self) -> InverseStage:
+        """Return the shared inverse stage of invertible members.
+
+        Returns
+        -------
+        InverseStage
+            The shared stage, or ``"after_finalize"`` when none is declared.
+
+        Raises
+        ------
+        ValueError
+            If invertible members declare different inverse stages.
+        """
         stages = {
             s.inverse_stage
             for s in self.steps
@@ -220,6 +373,22 @@ class Sequential:
     def forward(
         self, block: np.ndarray, ctx: "BlockContext"
     ) -> Tuple[np.ndarray, Any]:
+        """Apply each transform in order.
+
+        Parameters
+        ----------
+        block : np.ndarray
+            Input block to transform.
+        ctx : BlockContext
+            Spatial context for the block.
+
+        Returns
+        -------
+        transformed : np.ndarray
+            Result after applying all transforms.
+        state : tuple
+            Per-transform states in forward order.
+        """
         states: List[Any] = []
         for step in self.steps:
             block, state = step.forward(block, ctx)
@@ -229,6 +398,22 @@ class Sequential:
     def inverse(
         self, block: np.ndarray, state: Any, ctx: "BlockContext"
     ) -> np.ndarray:
+        """Invert eligible transforms in reverse order.
+
+        Parameters
+        ----------
+        block : np.ndarray
+            Block to invert.
+        state : tuple
+            Per-transform states returned by :meth:`forward`.
+        ctx : BlockContext
+            Spatial context for the block.
+
+        Returns
+        -------
+        np.ndarray
+            Block after applying all available inverse transforms.
+        """
         for step, step_state in zip(reversed(self.steps), reversed(state)):
             if is_invertible(step):
                 block = step.inverse(block, step_state, ctx)

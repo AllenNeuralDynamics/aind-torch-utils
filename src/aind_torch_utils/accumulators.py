@@ -124,6 +124,22 @@ class WeightedAverageAccumulator:
         o = self.overlap
 
         def _axis_weights(L_block, s, v):
+            """Build overlap-aware weights for one patch axis.
+
+            Parameters
+            ----------
+            L_block : int
+                Length of the block axis.
+            s : int
+                Patch start along the axis.
+            v : int
+                Valid patch length along the axis.
+
+            Returns
+            -------
+            np.ndarray
+                One-dimensional float32 blending weights.
+            """
             w = np.ones(v, dtype=np.float32)
             # left overlap exists if s > 0
             left = min(o, s)
@@ -221,6 +237,13 @@ class WeightedAverageAccumulator:
             self.wacc[sz : sz + dz, sy : sy + dy, sx : sx + dx] += W
 
     def finalize(self) -> np.ndarray:
+        """Return the weighted-average block.
+
+        Returns
+        -------
+        np.ndarray
+            The merged block as a float32 array.
+        """
         out = self.acc / np.maximum(self.wacc, self.eps)
         return out
 
@@ -229,10 +252,35 @@ class _RegionAccumulator:
     """Shared plumbing for accumulators that write into a single block buffer."""
 
     def __init__(self, block_shape: Tuple[int, int, int], fill: float = 0.0):
+        """Initialize the block buffer.
+
+        Parameters
+        ----------
+        block_shape : tuple of int
+            Shape of the output block in ``(z, y, x)`` order.
+        fill : float, optional
+            Initial value for every voxel.
+        """
         self.block_shape = block_shape
         self.acc = np.full(block_shape, fill, dtype=np.float32)
 
     def _region(self, start, valid):
+        """Build matching block and patch slices.
+
+        Parameters
+        ----------
+        start : tuple of int
+            Starting ``(z, y, x)`` coordinates within the block.
+        valid : tuple of int
+            Valid ``(dz, dy, dx)`` extent of the patch.
+
+        Returns
+        -------
+        block_slices : tuple of slice
+            Destination slices within the block.
+        patch_slices : tuple of slice
+            Source slices within the patch.
+        """
         sz, sy, sx = start
         dz, dy, dx = valid
         return (
@@ -241,6 +289,13 @@ class _RegionAccumulator:
         )
 
     def finalize(self) -> np.ndarray:
+        """Return the accumulated block.
+
+        Returns
+        -------
+        np.ndarray
+            The block buffer.
+        """
         return self.acc
 
 
@@ -252,6 +307,17 @@ class LastWriteAccumulator(_RegionAccumulator):
     """
 
     def add(self, pred_patch, start, valid):
+        """Overwrite a valid block region with values from a patch.
+
+        Parameters
+        ----------
+        pred_patch : np.ndarray
+            Patch values to write.
+        start : tuple of int
+            Starting ``(z, y, x)`` coordinates within the block.
+        valid : tuple of int
+            Valid ``(dz, dy, dx)`` extent of the patch.
+        """
         block_sl, patch_sl = self._region(start, valid)
         self.acc[block_sl] = np.asarray(pred_patch[patch_sl], dtype=np.float32)
 
@@ -264,9 +330,27 @@ class MaxAccumulator(_RegionAccumulator):
     """
 
     def __init__(self, block_shape: Tuple[int, int, int]):
+        """Initialize an empty accumulator.
+
+        Parameters
+        ----------
+        block_shape : tuple of int
+            Shape of the output block in ``(z, y, x)`` order.
+        """
         super().__init__(block_shape, fill=-np.inf)
 
     def add(self, pred_patch, start, valid):
+        """Merge a patch using the element-wise maximum.
+
+        Parameters
+        ----------
+        pred_patch : np.ndarray
+            Patch values to merge.
+        start : tuple of int
+            Starting ``(z, y, x)`` coordinates within the block.
+        valid : tuple of int
+            Valid ``(dz, dy, dx)`` extent of the patch.
+        """
         block_sl, patch_sl = self._region(start, valid)
         region = self.acc[block_sl]
         np.maximum(
@@ -274,6 +358,13 @@ class MaxAccumulator(_RegionAccumulator):
         )
 
     def finalize(self) -> np.ndarray:
+        """Return the maximum-merged block.
+
+        Returns
+        -------
+        np.ndarray
+            The merged block with uncovered values replaced by zero.
+        """
         self.acc[np.isneginf(self.acc)] = 0.0
         return self.acc
 
@@ -282,6 +373,17 @@ class SumAccumulator(_RegionAccumulator):
     """Sum overlapping contributions (e.g. vote counts, densities)."""
 
     def add(self, pred_patch, start, valid):
+        """Add a patch's values to a valid block region.
+
+        Parameters
+        ----------
+        pred_patch : np.ndarray
+            Patch values to add.
+        start : tuple of int
+            Starting ``(z, y, x)`` coordinates within the block.
+        valid : tuple of int
+            Valid ``(dz, dy, dx)`` extent of the patch.
+        """
         block_sl, patch_sl = self._region(start, valid)
         self.acc[block_sl] += np.asarray(pred_patch[patch_sl], dtype=np.float32)
 
@@ -301,10 +403,28 @@ class MajorityVoteAccumulator:
     """
 
     def __init__(self, block_shape: Tuple[int, int, int]):
+        """Initialize vote storage.
+
+        Parameters
+        ----------
+        block_shape : tuple of int
+            Shape of the output block in ``(z, y, x)`` order.
+        """
         self.block_shape = block_shape
         self.votes: Dict[float, np.ndarray] = {}
 
     def add(self, pred_patch, start, valid):
+        """Count each patch label as one vote.
+
+        Parameters
+        ----------
+        pred_patch : np.ndarray
+            Patch of discrete label values.
+        start : tuple of int
+            Starting ``(z, y, x)`` coordinates within the block.
+        valid : tuple of int
+            Valid ``(dz, dy, dx)`` extent of the patch.
+        """
         sz, sy, sx = start
         dz, dy, dx = valid
         patch = np.asarray(pred_patch[:dz, :dy, :dx])
@@ -323,6 +443,13 @@ class MajorityVoteAccumulator:
             arr[region] += patch == label
 
     def finalize(self) -> np.ndarray:
+        """Return the winning label for each voxel.
+
+        Returns
+        -------
+        np.ndarray
+            The majority-vote block, with zero for uncovered voxels.
+        """
         if not self.votes:
             return np.zeros(self.block_shape, dtype=np.float32)
         labels = sorted(self.votes.keys())
@@ -350,6 +477,20 @@ def weighted_average_factory(
     def factory(
         shape: Tuple[int, int, int], ctx: "BlockContext"
     ) -> BlockAccumulator:
+        """Create a configured weighted-average accumulator.
+
+        Parameters
+        ----------
+        shape : tuple of int
+            Shape of the expanded block in ``(z, y, x)`` order.
+        ctx : BlockContext
+            Spatial context for the block.
+
+        Returns
+        -------
+        BlockAccumulator
+            A new accumulator for the block.
+        """
         return WeightedAverageAccumulator(
             shape,
             eps,

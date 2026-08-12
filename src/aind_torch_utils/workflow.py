@@ -76,6 +76,13 @@ class Workflow:
     execution: Optional[ExecutionPolicy] = None
 
     def __post_init__(self):
+        """Validate the output specification configuration.
+
+        Raises
+        ------
+        ValueError
+            If both fixed outputs and an output specification factory are set.
+        """
         if self.outputs is not None and self.output_spec_factory is not None:
             raise ValueError(
                 "Set either outputs or output_spec_factory on a Workflow, not both."
@@ -108,6 +115,18 @@ class WorkflowRegistry:
         def decorator(
             func: Callable[[Dict[str, Any]], Workflow]
         ) -> Callable[[Dict[str, Any]], Workflow]:
+            """Store a workflow builder under the requested name.
+
+            Parameters
+            ----------
+            func : Callable
+                Workflow builder to register.
+
+            Returns
+            -------
+            Callable
+                The registered builder, unchanged.
+            """
             cls._registry[name] = func
             return func
 

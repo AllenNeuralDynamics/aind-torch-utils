@@ -1,3 +1,5 @@
+"""Configuration models for tiled inference workflows."""
+
 import warnings
 from typing import List, Literal, Optional, Tuple, Union
 
@@ -13,6 +15,12 @@ CompileMode = Literal[
 
 
 class InferenceConfig(BaseModel):
+    """Configuration for block-wise, tiled inference.
+
+    The model validates geometry, seam handling, normalization, device, and
+    concurrency options together so invalid combinations fail before a run starts.
+    """
+
     # Geometry
     patch: Tuple[int, int, int] = Field(
         default=(64, 64, 64),
