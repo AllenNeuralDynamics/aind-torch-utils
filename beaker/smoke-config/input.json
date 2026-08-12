@@ -1,9 +1,0 @@
-{
-  "driver": "zarr",
-  "kvstore": {
-    "driver": "s3",
-    "bucket": "aind-open-data",
-    "path": "exaSPIM_708373_2024-04-02_19-49-38_fusion_2024-05-09_20-27-49/fused.zarr/2"
-  }
-}
-
