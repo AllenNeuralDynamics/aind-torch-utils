@@ -96,6 +96,15 @@ def _workflow_args(tmp_path, *extra):
     ]
 
 
+def test_workflow_params_accept_inline_json(tmp_path):
+    params = {"checkpoint_path": "/config/model.pth", "offset": 2.5}
+    assert launcher._load_workflow_params(json.dumps(params)) == params
+
+    path = tmp_path / "params.json"
+    path.write_text(json.dumps(params))
+    assert launcher._load_workflow_params(str(path)) == params
+
+
 @pytest.mark.parametrize("local_fallback", [True, False])
 def test_workflow_runs_in_local_and_ray_paths(tmp_path, monkeypatch, local_fallback):
     captured = {}
@@ -290,6 +299,23 @@ def test_multi_shard_zarr_layout_rejects_unsafe_chunks(chunk, origin):
             chunk,
             origin,
             output_label="output 0",
+        )
+
+
+def test_declared_zarr2_alias_is_validated():
+    spec = {
+        "driver": "zarr2",
+        "kvstore": {"driver": "memory"},
+        "metadata": {
+            "shape": [1, 1, 128, 256, 256],
+            "chunks": [1, 1, 64, 96, 64],
+            "dtype": "<u2",
+        },
+        "create": True,
+    }
+    with pytest.raises(ValueError, match="Unsafe multi-shard Zarr"):
+        launcher._validate_declared_zarr_output(
+            spec, (64, 64, 64), output_label="output 0"
         )
 
 

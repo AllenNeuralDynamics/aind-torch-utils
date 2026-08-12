@@ -42,6 +42,15 @@ extras = ["matplotlib"]
 aws = ["boto3"]
 denoise-net = ["aind-exaspim-image-compression@git+https://github.com/AllenNeuralDynamics/aind-exaspim-image-compression.git@f352c0ceac2593b6651980bbc78b777adb9d97ec"]
 ray = ["ray[default]==2.50.0"]
+beaker = [
+  "crick",
+  "dask[array,distributed]",
+  "PyYAML",
+  "s3fs==2025.7.0",
+]
+
+[project.scripts]
+aind-beaker-submit = "aind_torch_utils.distributed.beaker_submit:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

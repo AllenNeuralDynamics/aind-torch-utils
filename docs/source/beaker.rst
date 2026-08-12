@@ -1,17 +1,18 @@
 Single-node Ray on Beaker
 =========================
 
-The supported Beaker smoke path uses one 8-GPU node and eight local Ray shards.
-It reads and writes TensorStore Zarr arrays in S3, mounts configuration and a
-checkpoint at ``/config``, and writes per-shard metrics under ``/results``.
+The supported Beaker path uses one 8-GPU node and eight local Ray shards. It
+reads and writes TensorStore Zarr arrays in S3, mounts only a checkpoint at
+``/config``, and writes per-shard metrics under ``/results``.
 
 Deployment files
 ----------------
 
 - ``Dockerfile.beaker`` pins the PyTorch 2.13 / CUDA 13.0 runtime image by digest.
-- ``beaker/single-node-ray.yaml`` is the Beaker v2 experiment template.
-- ``beaker/smoke-config/`` contains copyable input, output, inference, and
-  workflow JSON examples.
+- ``beaker/single-node-ray.yaml`` is the Beaker v2 base experiment profile.
+- ``beaker/inference.json`` is embedded into every rendered experiment.
+- ``aind-beaker-submit`` discovers metadata, computes the background offset,
+  persists the run artifacts, and submits the experiment.
 - ``beaker/README.md`` is the complete build, upload, secret, submission,
   verification, and failure-check runbook.
 

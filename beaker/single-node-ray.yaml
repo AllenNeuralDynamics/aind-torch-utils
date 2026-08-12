@@ -1,49 +1,46 @@
+# Base profile for aind-beaker-submit. Render it; do not submit placeholders.
 version: v2
-description: aind-torch-utils single-node eight-GPU Ray smoke run
+description: aind-torch-utils automated single-node eight-GPU Ray run
 budget: "ai1/aihub-nd-exaspim"
 retry:
-  allowedTaskRetries: 0
+  allowedTaskRetries: 5
 tasks:
-  - name: ray-denoise-smoke
+  - name: denoise-template
     image:
       # Use an immutable Beaker image ID, not a mutable image name.
-      beaker: "01KYSWHSJQVBFNFX868352SH2P"
+      beaker: "01KZ971S7N9G4NX5TWS53PWYD3"
     command:
-      - python
-      - -m
-      - aind_torch_utils.distributed.ray_launcher
+      - /opt/aind-torch-utils/beaker/run-with-gpu-metrics.sh
     arguments:
       - --num-shards
       - "8"
       - --cpus-per-shard
-      - "16"
+      - "24"
       - --gpus-per-shard
       - "1"
       - --prep-workers
-      - "8"
+      - "7"
       - --writer-workers
-      - "8"
+      - "17"
       - --thread-dump-interval
-      - "1800"
+      - "3600"
       - --metrics-json-template
       - "/results/metrics_shard{shard}.json"
       - --in-spec
-      - /config/input.json
+      - __INPUT_SPEC__
       - --out-spec
-      - /config/output.json
+      - __OUTPUT_SPEC__
       - --workflow
       - denoise-net
       - --workflow-params
-      - /config/workflow.json
+      - __WORKFLOW_PARAMS__
       - --config
-      - /config/inference.json
+      - __INFERENCE_CONFIG__
     envVars:
       - name: AWS_ACCESS_KEY_ID
         secret: "BEAKER_AWS_ACCESS_KEY_ID_SECRET"
       - name: AWS_SECRET_ACCESS_KEY
         secret: "BEAKER_AWS_SECRET_ACCESS_KEY_SECRET"
-      - name: AWS_SESSION_TOKEN
-        secret: "BEAKER_AWS_SESSION_TOKEN_SECRET"
       - name: AWS_REGION
         value: "us-west-2"
       - name: AWS_DEFAULT_REGION
@@ -57,26 +54,30 @@ tasks:
       - name: TENSORSTORE_HTTP2_MAX_CONCURRENT_STREAMS
         value: "64"
       - name: TENSORSTORE_HTTP_THREADS
-        value: "32"
+        value: "16"
       - name: OMP_NUM_THREADS
+        value: "1"
+      - name: GPU_METRICS_INTERVAL
         value: "1"
       - name: RAY_DEDUP_LOGS
         value: "0"
+      - name: RAY_TMPDIR
+        value: /results/ray-tmp
 
     datasets:
       - mountPath: /config
         source:
-          beaker: "01KYSR59WPTP8SFCBNSE0RMWP7"
+          beaker: "01KZV0TS6G9WWVNFMYSSAETY75"
     result:
       path: /results
     resources:
       gpuCount: 8
-      cpuCount: 128
+      cpuCount: 192
       memory: 2000GB
-      sharedMemory: 128GiB
+      sharedMemory: 64GiB
     replicas: 1
-    # Beaker task timeouts are nanoseconds: 7.2e12 ns = two hours.
-    timeout: "8h"
+    # Keep enough wall time for full-resolution inference and task retries.
+    timeout: "72h"
     context:
       cluster: "ai1/aipbd-aws-h200"
       priority: normal

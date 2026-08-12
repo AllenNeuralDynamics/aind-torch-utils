@@ -14,6 +14,8 @@ WORKDIR /opt/aind-torch-utils
 
 COPY pyproject.toml setup.py README.md LICENSE ./
 COPY src ./src
+COPY beaker/run-with-gpu-metrics.sh ./beaker/run-with-gpu-metrics.sh
 
 RUN python -m pip install --no-cache-dir ".[ray,denoise-net,aws,extras]" \
+    && chmod 755 /opt/aind-torch-utils/beaker/run-with-gpu-metrics.sh \
     && python -c "import importlib.metadata as m; import torch, ray, tensorstore; import aind_torch_utils.recipes; import aind_torch_utils.recipes.denoise_net; import aind_exaspim_image_compression.inference; from aind_torch_utils.workflow import WorkflowRegistry; assert 'denoise-net' in WorkflowRegistry.list_workflows(); print('torch', torch.__version__, 'ray', ray.__version__, 'tensorstore', m.version('tensorstore'))"

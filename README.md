@@ -210,8 +210,17 @@ Use to diagnose stalls (e.g., GPU idle while prep queue empty => increase prep w
 ## Beaker
 
 The production-shaped smoke deployment is one 8-GPU Beaker node running eight
-local Ray shards against S3 TensorStores. See
-[`beaker/README.md`](beaker/README.md) for the immutable image build, run-assets
+local Ray shards against S3 TensorStores. After configuring the checked-in base
+profile once, generate and submit a run directly from an input Zarr:
+
+```bash
+pip install -e '.[beaker]'
+aind-beaker-submit s3://aind-open-data/path/to/fused.zarr
+```
+
+The submitter derives both TensorStore specs, computes the background offset,
+and persists the rendered experiment without creating a per-run dataset. See
+[`beaker/README.md`](beaker/README.md) for the immutable image build, checkpoint
 dataset, secrets, v2 experiment template, safety constraints, and verification
 procedure.
 

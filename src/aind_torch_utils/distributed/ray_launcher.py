@@ -109,11 +109,15 @@ def _make_shard_payload(
 
 
 def _load_workflow_params(path: Optional[str]) -> Dict[str, Any]:
-    """Load workflow builder parameters from a JSON file."""
+    """Load workflow builder parameters from a JSON file or inline object."""
     if not path:
         return {}
-    with open(path, "r", encoding="utf-8") as f:
-        params = json.load(f)
+    stripped = path.lstrip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        params = json.loads(stripped)
+    else:
+        with open(path, "r", encoding="utf-8") as f:
+            params = json.load(f)
     if not isinstance(params, dict):
         raise TypeError("Workflow parameters must be a JSON object.")
     return params
@@ -334,7 +338,7 @@ def _validate_declared_zarr_output(
     output_label: str,
 ) -> None:
     """Validate declared Zarr metadata without opening or mutating its target."""
-    if spec.get("driver") != "zarr" or "metadata" not in spec:
+    if spec.get("driver") not in {"zarr", "zarr2"} or "metadata" not in spec:
         return
     try:
         layout = ts.Spec(copy.deepcopy(spec)).chunk_layout
@@ -361,7 +365,7 @@ def _validate_opened_zarr_output(
     output_label: str,
 ) -> None:
     """Validate the effective write layout reported by an opened Zarr store."""
-    if spec.get("driver") != "zarr":
+    if spec.get("driver") not in {"zarr", "zarr2"}:
         return
     try:
         layout = store.chunk_layout

@@ -33,7 +33,8 @@ Then run the registered recipe:
        --workflow denoise-net \
        --workflow-params denoise-params.json
 
-``checkpoint_path`` is required. ``offset`` is optional; omit it to use the
+Workflow parameters may be supplied as either a JSON file path or an inline JSON
+object. ``checkpoint_path`` is required. ``offset`` is optional; omit it to use the
 checkpoint's saved intensity transform unchanged. When supplied, the source
 package composes the offset around the trained transform without changing its
 normalization denominator.

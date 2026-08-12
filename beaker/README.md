@@ -1,9 +1,10 @@
-# Single-node Ray smoke run on Beaker
+# Automated single-node Ray runs on Beaker
 
-This is the deliberately small Beaker deployment path: one task replica reserves
-8 GPUs and starts local Ray, which schedules eight shards with 1 GPU and 8 CPUs
-each. TensorStore reads and writes S3 directly. Beaker mounts only the run
-configuration/checkpoint at `/config` and captures shard metrics from `/results`.
+`aind-beaker-submit` turns one S3 Zarr URI into a complete denoising experiment.
+It discovers input metadata, derives the TensorStore specs, estimates the
+background offset from a coarse resolution, saves a reproducible local run
+record, and submits the rendered YAML. The only Beaker dataset mounted at
+`/config` is the model checkpoint.
 
 ## 1. Build and upload an immutable image
 
@@ -22,30 +23,25 @@ beaker image create \
 ```
 
 Resolve the uploaded image ID and put that immutable ID in
-`single-node-ray.yaml`; do not use the mutable image name for a smoke run.
-The image contains the CUDA 12.8 runtime. The selected cluster's NVIDIA host
-driver must support CUDA 12.8; verify this with the cluster owner or a short
-`nvidia-smi` job before the paid run.
+`single-node-ray.yaml`; do not use a mutable image name. The image contains the
+CUDA 13.0 runtime and the GPU-metrics wrapper at
+`/opt/aind-torch-utils/beaker/run-with-gpu-metrics.sh`.
 
-## 2. Create the run-assets dataset
+## 2. Create the checkpoint dataset once
 
-Copy `smoke-config/` to a new staging directory, replace every angle-bracket
-placeholder, and add the real checkpoint as `checkpoint.pth`. The input must be
-a zero-origin 5D `T,C,Z,Y,X` Zarr with spatial shape `128×256×256`. With `64³`
-blocks this produces 32 blocks, so all eight shards receive work.
+Create a committed dataset containing one root-level model checkpoint. The
+submitter discovers its filename automatically; use `--checkpoint-name` when a
+dataset deliberately contains multiple checkpoints.
 
 ```bash
-cp -R beaker/smoke-config /tmp/aind-ray-smoke-assets
-# Edit input.json and output.json, then:
-cp /path/to/checkpoint.pth /tmp/aind-ray-smoke-assets/checkpoint.pth
-beaker dataset create --name aind-ray-smoke-assets \
-  /tmp/aind-ray-smoke-assets
+checkpoint_dir=$(mktemp -d)
+cp /path/to/checkpoint.pth "$checkpoint_dir/model.pth"
+beaker dataset create --name aind-denoise-checkpoint "$checkpoint_dir"
 ```
 
-Use a fresh, nonexistent S3 output prefix for every attempt. The output spec has
-`delete_existing: true`; reusing a prefix destroys the previous output. Give the
-AWS credentials read access to the input and write access only to that unique
-output prefix.
+Put the immutable dataset ID in `single-node-ray.yaml`. Existing datasets with
+additional legacy files remain usable during migration, but generated
+experiments reference only the checkpoint.
 
 Create Beaker secrets for `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and, when
 using temporary credentials, `AWS_SESSION_TOKEN`. Replace the three secret-name
@@ -54,54 +50,92 @@ token, remove the `AWS_SESSION_TOKEN` entry instead of creating an empty secret.
 Set both region placeholders to the input/output bucket's region. Never put
 credential values in the dataset, YAML, image, shell history, or Git.
 
-## 3. Customize and submit
+## 3. Install and submit
 
-Replace the budget, cluster, immutable image ID, run-assets dataset ID, secret
-names, and region in `single-node-ray.yaml`, then inspect the expanded file and
-submit it:
+Install the local calibration and rendering dependencies:
 
 ```bash
-beaker experiment create -f beaker/single-node-ray.yaml
-beaker experiment logs --follow <EXPERIMENT_ID>
-beaker experiment get <EXPERIMENT_ID>
+pip install -e '.[beaker]'
 ```
 
-The smoke template enables `--thread-dump-interval 1800` and disables Ray log
+Configure the image, checkpoint dataset, budget, cluster, secret names, and AWS
+region once in `single-node-ray.yaml`. Then submit with only the input Zarr root:
+
+```bash
+aind-beaker-submit s3://aind-open-data/path/to/fused.zarr
+```
+
+Metadata inspection and offset calibration run locally, so private inputs also
+require ambient local AWS credentials (for example, an AWS profile or standard
+AWS environment variables). Credential values are never copied into run
+artifacts; the generated experiment retains only the Beaker secret references.
+
+Input resolution defaults to `0` and background calibration defaults to level
+`5`. Input Zarr v2 and v3 are auto-detected; output is Zarr v2 at level `0`.
+The output defaults to a sibling `-denoised.zarr`, or can be overridden:
+
+```bash
+aind-beaker-submit INPUT \
+  --output-uri s3://bucket/path/custom-denoised.zarr
+```
+
+Input chunks are copied to the output and must divide the configured inference
+block. Use `--output-chunks Z Y X` when the source chunks are incompatible. If
+the output already exists, submission stops before calibration; pass
+`--resume-existing` to validate and reuse it. `--no-submit` renders without
+creating an experiment.
+
+Every invocation saves `input.json`, `output.json`, `workflow.json`,
+`inference.json`, `offset-stats.json`, `experiment.yaml`, and the submission
+response beneath `beaker/runs/`. It never creates a per-run Beaker dataset.
+The generated task and experiment name is `denoised-<s3-prefix>`, where
+`<s3-prefix>` is the input's top-level S3 key prefix; `--name` overrides it.
+
+The base template enables `--thread-dump-interval 3600` and disables Ray log
 deduplication. While inference is running, every shard therefore writes all
-Python thread stacks to its stderr log every five minutes. This is diagnostic
+Python thread stacks to its stderr log every hour. This is diagnostic
 output, not a failure signal: healthy long-running shards also emit it. Set the
 interval to `0` or remove the argument after investigating a stall.
 
-The task reserves 8 GPUs, 64 CPUs, 512 GiB RAM, and 64 GiB shared memory. Ray
-receives eight tasks at 1 GPU and 8 CPUs each, exactly consuming the advertised
+The task command runs the image's metrics wrapper, which starts one node-wide
+`nvidia-smi` sampler before the Ray launcher and stops it when the launcher
+exits. `GPU_METRICS_INTERVAL` controls the sampling interval and defaults to one
+second. The wrapper preserves the launcher's exit status.
+
+The task reserves 8 GPUs, 192 CPUs, 2000 GB RAM, and 64 GiB shared memory. Ray
+receives eight tasks at 1 GPU and 24 CPUs each, exactly consuming the advertised
 GPU/CPU allocation. Each Ray worker sees its assigned physical GPU as logical
 `cuda:0`, which is why `inference.json` contains only `devices: ["cuda:0"]`.
 There is one task replica and no `--ray-address`, so Ray remains local to the
 node.
 
-The template uses `preemptible: false`, zero task retries, and a two-hour task
-timeout. It deliberately does not set Beaker's newer `autoResume` field: current
-Beaker APIs reject a context containing both legacy `preemptible` and
-`autoResume`, and a non-preemptible task has nothing to auto-resume. If a
-workspace requires the newer scheduling fields, replace `preemptible: false`
-with the workspace-approved non-preemptible policy and keep `autoResume: false`;
-do not combine the legacy and new fields.
+The template allows five task retries and has a 72-hour timeout. It deliberately
+leaves `autoResume` unset because block-level S3 markers provide the inference
+resume mechanism.
 
 ## 4. Verify the smoke result
 
-A successful result dataset contains exactly:
+A successful result dataset contains:
 
 ```text
+gpu_metrics.csv
 metrics_shard0.json
 metrics_shard1.json
 ...
 metrics_shard7.json
 ```
 
-Inspect all eight Ray task start/finish messages and the per-GPU utilization
-graphs in Beaker to confirm every GPU participated. Download the result dataset
-from the experiment page or with the dataset ID shown by `beaker experiment
-get`.
+Inspect all eight Ray task start/finish messages and Beaker's resource graphs to
+confirm every GPU participated. Download the result dataset from the experiment
+page or with the dataset ID shown by `beaker experiment get`.
+
+After downloading it, plot GPU utilization and VRAM with:
+
+```bash
+python benchmarking/plot_gpu_metrics.py \
+  /path/to/gpu_metrics.csv \
+  --out /path/to/gpu_metrics
+```
 
 Open the S3 output with TensorStore and verify:
 

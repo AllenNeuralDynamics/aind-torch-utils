@@ -94,3 +94,6 @@ environment/
 metadata/
 .codegraph/
 **.ckpt
+*.pth
+*.pt
+beaker/runs/

@@ -832,7 +832,10 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "--workflow-params",
         type=str,
         default=None,
-        help="Path to a JSON file of parameters passed to the workflow builder.",
+        help=(
+            "Path to a JSON file or inline JSON object of parameters passed "
+            "to the workflow builder."
+        ),
     )
     ap.add_argument(
         "--config",
@@ -930,8 +933,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     if args.workflow:
         params: dict = {}
         if args.workflow_params:
-            with open(args.workflow_params) as f:
-                params = json.load(f)
+            stripped = args.workflow_params.lstrip()
+            if stripped.startswith("{") or stripped.startswith("["):
+                params = json.loads(stripped)
+            else:
+                with open(args.workflow_params) as f:
+                    params = json.load(f)
         workflow = WorkflowRegistry.build(args.workflow, params)
         # Decide the stores' fate BEFORE opening them: an open with a
         # create/delete_existing spec mutates the target, and a fixed-outputs
