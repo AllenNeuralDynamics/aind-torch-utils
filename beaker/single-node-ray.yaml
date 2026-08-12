@@ -8,7 +8,7 @@ tasks:
   - name: denoise-template
     image:
       # Use an immutable Beaker image ID, not a mutable image name.
-      beaker: "01KZ971S7N9G4NX5TWS53PWYD3"
+      beaker: "01KZV3AY3389Q98D0X1VW2ZWGA"
     command:
       - /opt/aind-torch-utils/beaker/run-with-gpu-metrics.sh
     arguments:
