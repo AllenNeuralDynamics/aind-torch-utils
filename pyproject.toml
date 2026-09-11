@@ -21,7 +21,7 @@ dependencies = [
   "torch<2.14",
   "pydantic",
   "psutil",
-  "tensorstore==0.1.78",
+  "tensorstore==0.1.85",
   "numpy>=2.0.0",
 ]
 
