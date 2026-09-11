@@ -78,6 +78,20 @@ class InferenceConfig(BaseModel):
         ),
     )
 
+    # Failure detection and recovery (seconds, measured with a monotonic clock).
+    read_timeout_s: float = Field(default=300, gt=0, allow_inf_nan=False)
+    write_timeout_s: float = Field(default=300, gt=0, allow_inf_nan=False)
+    progress_timeout_s: float = Field(default=900, gt=0, allow_inf_nan=False)
+    startup_timeout_s: float = Field(default=1800, gt=0, allow_inf_nan=False)
+    shutdown_timeout_s: float = Field(default=30, gt=0, allow_inf_nan=False)
+    max_shard_retries: int = Field(default=2, ge=0)
+    retry_backoff_s: float = Field(default=5, ge=0, allow_inf_nan=False)
+    diagnostic_timeout_s: float = Field(default=15, gt=0, allow_inf_nan=False)
+    diagnostics_dir: Optional[str] = Field(
+        default=None,
+        description="Diagnostic directory; defaults to diagnostics beside metrics or in cwd",
+    )
+
     # Sharding
     shard_count: int = Field(
         default=1,

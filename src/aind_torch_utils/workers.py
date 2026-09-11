@@ -1,6 +1,7 @@
 import logging
 import queue
 import threading
+import time
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -17,6 +18,12 @@ from aind_torch_utils.context import BlockContext
 from aind_torch_utils.distributed.sharding import ShardSpec, make_shard_spec
 from aind_torch_utils.execution import ExecutionPolicy, cuda_safe_compile_mode
 from aind_torch_utils.outputs import OutputSpec
+from aind_torch_utils.recovery import (
+    PipelineProgress,
+    PipelineStopped,
+    PipelineTimeoutError,
+    wait_for_future,
+)
 from aind_torch_utils.transforms import BlockPreprocessor, is_invertible
 from aind_torch_utils.utils import iter_blocks_zyx, iter_patch_starts
 from aind_torch_utils.work_state import (
@@ -244,6 +251,7 @@ class PrepWorker:
         self.global_worker_id = global_worker_offset + worker_id
         self.global_worker_offset = global_worker_offset
         self.work_store = work_store or NoopBlockWorkStore()
+        self.progress: Optional[PipelineProgress] = None
 
     def _block_in_shard(self, block_idx: Tuple[int, int, int]) -> bool:
         """
@@ -332,6 +340,8 @@ class PrepWorker:
             lease = self.work_store.claim_block(block_key)
             if lease is None:
                 logger.debug("Skipping completed block %s", block_key)
+                if self.progress is not None:
+                    self.progress.advance()
                 continue
 
             zsl, ysl, xsl = core_bbox
@@ -363,7 +373,39 @@ class PrepWorker:
             # read expanded block and cast to float32 for the injected transform
             ez_sl, ey_sl, ex_sl = expanded_bbox
             view = self.reader[t, c, ez_sl, ey_sl, ex_sl]
-            norm_block = view.read().result().astype(np.float32, copy=False)
+            started = time.monotonic()
+            details = {
+                "block": block_key.coords,
+                "linear_k": k,
+                "bbox": [(s.start, s.stop) for s in expanded_bbox],
+            }
+            token = (
+                self.progress.begin("read", details, self.cfg.read_timeout_s)
+                if self.progress is not None
+                else None
+            )
+            logger.debug("Reading block %s bbox=%s", block_key, details["bbox"])
+            try:
+                read_array = wait_for_future(
+                    view.read(),
+                    stop_event,
+                    started + self.cfg.read_timeout_s,
+                    f"input block {block_key} bbox={details['bbox']}",
+                )
+            except Exception:
+                logger.error(
+                    "Input read failed/stopped: block=%s bbox=%s elapsed=%.3fs",
+                    block_key,
+                    details["bbox"],
+                    time.monotonic() - started,
+                )
+                raise
+            if token is not None:
+                self.progress.end(token)
+            logger.debug(
+                "Read block %s in %.3fs", block_key, time.monotonic() - started
+            )
+            norm_block = read_array.astype(np.float32, copy=False)
             bz, by, bx = acc_shape
 
             # The injected transform owns all normalization/correction math and
@@ -383,6 +425,8 @@ class PrepWorker:
 
             # batch over those starts
             for i in range(0, total_patches, self.cfg.batch_size):
+                if stop_event.is_set():
+                    return
                 batch_starts = starts[i : i + self.cfg.batch_size]
                 n_real = len(batch_starts)
                 pin_memory = any("cuda" in d for d in self.cfg.devices)
@@ -433,6 +477,8 @@ class PrepWorker:
                 while not stop_event.is_set():
                     try:
                         self.prep_q.put(batch, timeout=0.1)
+                        if self.progress is not None:
+                            self.progress.advance()
                         break
                     except queue.Full:
                         continue
@@ -442,6 +488,8 @@ class GpuWorker:
     """
     Worker that runs model inference on a GPU.
     """
+
+    progress: Optional[PipelineProgress] = None
 
     def __init__(
         self,
@@ -674,6 +722,8 @@ class GpuWorker:
             while not stop_event.is_set():
                 try:
                     target_q.put(preds, timeout=0.1)
+                    if self.progress is not None:
+                        self.progress.advance()
                     break
                 except queue.Full:
                     continue
@@ -699,6 +749,13 @@ class _PendingWrite:
     future: Any
     source: np.ndarray
     group: "_BlockWriteGroup"
+    deadline: float
+    token: Optional[str]
+
+
+# A cancelled/timed-out write may still reference its source in native code.
+# Keep these buffers until the failed process is retired by the supervisor.
+_ABANDONED_WRITES: List[_PendingWrite] = []
 
 
 @dataclass
@@ -752,8 +809,19 @@ class _BlockWriteGroup:
 class _BoundedPendingWrites:
     """Keep a bounded set of asynchronous writes alive and observable."""
 
-    def __init__(self, limit: int):
+    def __init__(
+        self,
+        limit: int,
+        timeout_s: float = 300,
+        stop_event: Optional[threading.Event] = None,
+        progress: Optional[PipelineProgress] = None,
+        shutdown_timeout_s: float = 30,
+    ):
         self.limit = limit
+        self.timeout_s = timeout_s
+        self.stop_event = stop_event if stop_event is not None else threading.Event()
+        self.progress = progress
+        self.shutdown_timeout_s = shutdown_timeout_s
         self._writes: Deque[_PendingWrite] = deque()
 
     def __enter__(self) -> "_BoundedPendingWrites":
@@ -764,6 +832,9 @@ class _BoundedPendingWrites:
             self.flush()
         else:
             try:
+                deadline = time.monotonic() + self.shutdown_timeout_s
+                for pending in self._writes:
+                    pending.deadline = min(pending.deadline, deadline)
                 self.flush()
             except Exception:  # noqa: BLE001 - preserve the original worker error
                 logger.exception(
@@ -776,20 +847,58 @@ class _BoundedPendingWrites:
         # Keep `pending.source` strongly referenced until TensorStore reports
         # that the write is committed. Calling result() also surfaces failures.
         try:
-            pending.future.result()
+            wait_for_future(
+                pending.future,
+                self.stop_event,
+                pending.deadline,
+                f"output block {pending.group.lease}",
+            )
         except Exception as exc:
+            if isinstance(exc, (PipelineStopped, PipelineTimeoutError)):
+                _ABANDONED_WRITES.append(pending)
             pending.group.finish_write(exc)
             raise
         else:
             pending.group.finish_write(None)
+            if self.progress is not None and pending.token is not None:
+                self.progress.end(pending.token)
 
     def submit(self, target: Any, source: np.ndarray, group: _BlockWriteGroup) -> None:
         """Start a write, waiting first when the pending-write limit is full."""
         if len(self._writes) >= self.limit:
             self._wait_for_oldest()
+        if self.stop_event.is_set():
+            raise PipelineStopped("Stopped before output submission")
+        started = time.monotonic()
+        token = (
+            self.progress.begin(
+                "write",
+                {
+                    "block": (
+                        group.lease.block.coords if group.lease is not None else None
+                    )
+                },
+                self.timeout_s,
+            )
+            if self.progress is not None
+            else None
+        )
         future = target.write(source)
         group.add_write()
-        self._writes.append(_PendingWrite(future=future, source=source, group=group))
+        self._writes.append(
+            _PendingWrite(
+                future=future,
+                source=source,
+                group=group,
+                deadline=started + self.timeout_s,
+                token=token,
+            )
+        )
+
+    def poll(self) -> None:
+        """Observe committed writes even when no next block arrives."""
+        while self._writes and self._writes[0].future.done():
+            self._wait_for_oldest()
 
     def flush(self) -> None:
         """Wait for every pending write and raise the first asynchronous error."""
@@ -817,6 +926,8 @@ class WriterWorker:
     (issue #25 §4.4): ``finalize -> invert (if requested) -> postprocess -> crop
     halo -> cast to store dtype -> write``.
     """
+
+    progress: Optional[PipelineProgress] = None
 
     def __init__(
         self,
@@ -890,8 +1001,15 @@ class WriterWorker:
             else None
         )
 
-        with _BoundedPendingWrites(self.cfg.max_pending_writes) as pending_writes:
+        with _BoundedPendingWrites(
+            self.cfg.max_pending_writes,
+            self.cfg.write_timeout_s,
+            stop_event,
+            self.progress,
+            self.cfg.shutdown_timeout_s,
+        ) as pending_writes:
             while not stop_event.is_set():
+                pending_writes.poll()
                 try:
                     preds = self.write_q.get(timeout=0.1)
                 except queue.Empty:
@@ -953,6 +1071,8 @@ class WriterWorker:
                             pp = self.preprocess.inverse(pp, preds.transform_state, ctx)
                         acc.add(pp, (sz, sy, sx), (dz, dy, dx))
                 state.seen += len(preds.starts_in_block)
+                if self.progress is not None:
+                    self.progress.advance()
 
                 if state.seen >= preds.total_patches_in_block:
                     lz, ly, lx = preds.halo_left

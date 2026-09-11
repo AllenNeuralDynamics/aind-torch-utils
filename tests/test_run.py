@@ -1,3 +1,5 @@
+import threading
+import time
 import unittest.mock
 
 import numpy as np
@@ -10,6 +12,7 @@ from aind_torch_utils.config import InferenceConfig
 from aind_torch_utils.execution import ExecutionPolicy
 from aind_torch_utils.models import SharedEncoderModel
 from aind_torch_utils.outputs import OutputSpec
+from aind_torch_utils.recovery import PipelineTimeoutError
 from aind_torch_utils.run import (
     _resolve_output_specs,
     _validate_inversion,
@@ -17,6 +20,68 @@ from aind_torch_utils.run import (
     run_workflow,
 )
 from aind_torch_utils.workflow import Workflow, WorkflowRegistry
+
+
+def test_watchdog_and_shared_join_deadline_bound_uncooperative_workers(
+    dummy_data,
+    monkeypatch,
+    tmp_path,
+):
+    input_store, output_store = dummy_data
+    release = threading.Event()
+    threads = [
+        threading.Thread(target=release.wait, name=f"stuck-{i}") for i in range(3)
+    ]
+    reports = []
+    monkeypatch.setattr(
+        "aind_torch_utils.run._setup_worker_threads",
+        lambda *args, **kwargs: ([threads[0]], [threads[1]], [threads[2]]),
+    )
+    monkeypatch.setattr(
+        "aind_torch_utils.run.capture_diagnostics", lambda *args: reports.append(args)
+    )
+    cfg = InferenceConfig(
+        devices=["cpu"],
+        progress_timeout_s=0.05,
+        shutdown_timeout_s=0.1,
+        diagnostics_dir=str(tmp_path),
+    )
+    started = time.monotonic()
+    try:
+        with pytest.raises(PipelineTimeoutError, match="Shutdown deadline"):
+            run(DummyModel(), input_store, output_store, cfg)
+        assert time.monotonic() - started < 1
+        assert reports and "No pipeline progress" in reports[0][3]
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(timeout=1)
+
+
+def test_worker_failure_cannot_deadlock_sentinel_delivery_into_full_queue(
+    dummy_data,
+    monkeypatch,
+):
+    input_store, output_store = dummy_data
+
+    def setup(*args, **kwargs):
+        stop, prep_q, errors = args[5], args[7], args[-1]
+        prep_q.put(object())
+
+        def fail():
+            errors.append(("gpu-0", RuntimeError("GPU failed")))
+            stop.set()
+
+        return [], [threading.Thread(target=fail)], []
+
+    monkeypatch.setattr("aind_torch_utils.run._setup_worker_threads", setup)
+    cfg = InferenceConfig(
+        devices=["cpu"], max_inflight_batches=1, shutdown_timeout_s=0.1
+    )
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="Worker thread.*gpu-0"):
+        run(DummyModel(), input_store, output_store, cfg)
+    assert time.monotonic() - started < 1
 
 
 class DummyModel(nn.Module):
@@ -177,13 +242,13 @@ def test_run_prepares_and_forwards_resume_store(dummy_data, monkeypatch):
             captured["prepared"] = shard_spec
 
     class _Monitor:
-        def join(self):
+        def join(self, timeout=None):
             return None
 
         def get_data(self):
             return []
 
-    def setup_threads(*args):
+    def setup_threads(*args, **kwargs):
         captured["forwarded"] = args[-2]
         return [], [], []
 
@@ -466,14 +531,14 @@ def test_main_loop_errors_escape_after_cleanup(
                 raise error
             return self.started and not self.joined
 
-        def join(self):
+        def join(self, timeout=None):
             self.joined = True
 
     class _Monitor:
         def __init__(self):
             self.joined = False
 
-        def join(self):
+        def join(self, timeout=None):
             self.joined = True
 
         def get_data(self):

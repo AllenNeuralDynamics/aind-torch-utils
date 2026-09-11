@@ -9,6 +9,16 @@ import aind_torch_utils.distributed.ray_launcher as launcher
 from aind_torch_utils.workflow import Workflow
 
 
+@pytest.fixture(autouse=True)
+def inline_supervision(monkeypatch):
+    """Dispatch tests run inline; subprocess behavior is tested separately."""
+    monkeypatch.setattr(
+        launcher,
+        "supervise_shard",
+        lambda target, args, cfg, metrics_json: target(*args),
+    )
+
+
 class _ImmediateRemote:
     """Small Ray remote-function stand-in that executes synchronously."""
 
@@ -443,7 +453,9 @@ def test_single_node_ray_launches_eight_one_gpu_shards(tmp_path, monkeypatch):
     )
 
     assert fake_ray.init_kwargs == {}
-    assert fake_ray.remote_options == [{"num_cpus": 8.0, "num_gpus": 1.0}]
+    assert fake_ray.remote_options == [
+        {"num_cpus": 8.0, "num_gpus": 1.0, "max_retries": 0}
+    ]
     assert len(fake_ray.remote_calls) == 8
     assert [cfg.shard_index for cfg, _ in shard_runs] == list(range(8))
     assert all(cfg.devices == ["cuda:0"] for cfg, _ in shard_runs)

@@ -178,7 +178,68 @@ chunk from `64` to `96`, and run the image command with `--num-shards 8
 --dry-run`. It must fail with an unsafe-layout error before touching S3 or
 starting Ray.
 
-There is no durable resume protocol in this milestone. A preemption, process
-failure, or interrupt makes the task fail after cleanup; start the next attempt
-with a new S3 output prefix. Multi-node Ray bootstrap, automatic retries/resume,
-and a Python Beaker submitter are intentionally deferred.
+## Stall detection and resumable retries
+
+Each Ray shard runs its inference pipeline in a spawned child process. A
+supervisor outside that process tracks completed reads, prepared/predicted
+batches, merged batches, output commits, and skipped completion markers.
+Polling an empty queue does not count as progress. The supervisor remains able
+to detect a stall even if a native call holds the child's Python GIL. The local
+fallback launcher uses the same supervision, sequentially.
+
+These `InferenceConfig` fields can be supplied in the JSON passed to `--config`:
+
+| Field | Default | Meaning |
+|---|---:|---|
+| `read_timeout_s` | 300 | Deadline for each input read, including submission time. |
+| `write_timeout_s` | 300 | Deadline from output submission through observed commit/completion-marker handling. |
+| `progress_timeout_s` | 900 | Maximum time without useful pipeline progress. |
+| `startup_timeout_s` | 1800 | Maximum time for child startup, opening stores, loading markers, and model warmup. |
+| `shutdown_timeout_s` | 30 | Shared worker-thread join budget; also the supervisor's graceful process-stop budget. |
+| `max_shard_retries` | 2 | Additional attempts after a timeout or unexpected process exit. |
+| `retry_backoff_s` | 5 | Delay between attempts. |
+| `diagnostic_timeout_s` | 15 | Maximum runtime of the native debugger per diagnostic capture. |
+| `diagnostics_dir` | null | Defaults to `diagnostics/` beside the metrics JSON, or in the working directory. |
+
+All deadlines must be positive and finite. Increase them for workloads whose
+normal reads, writes, or model warmup exceed these defaults. Automatic retries
+require `resume: true` and the `s3-markers` backend; otherwise the first failed
+attempt fails the shard. Ordinary model/configuration exceptions are not
+retried. Ray's own task retries are disabled so they cannot reset this retry
+budget. Beaker's experiment-level retry policy remains independent.
+
+On a stall, the supervisor saves uniquely named files for the shard and attempt:
+
+- `.json`: failure reason, last progress time, outstanding reads/writes, block
+  coordinates, input bounding boxes, Python/native thread IDs, and elapsed times;
+- `.python.txt`: all Python thread stacks, captured through `faulthandler`;
+- `.native.txt`: GDB backtraces for all native threads and Linux kernel wait
+  locations, or explicit errors explaining why these could not be captured.
+
+The Beaker image includes GDB. Native attachment is best effort: the runtime
+must permit ptrace; container seccomp/capability restrictions may deny it even
+though the child allows its supervisor to attach. GDB has a bounded timeout,
+and an unavailable debugger does not prevent recovery. Python dumps and the
+JSON operation details are still captured when available. No debugger locals
+or environment-variable dumps are requested.
+
+Diagnostics are collected before terminating the child. The supervisor
+escalates from termination to killing the process group, then reaps the child
+before starting another attempt. If it cannot reap the child within the final
+two-second kill wait, it fails without starting overlapping work. A fresh
+attempt reopens the stores and loads the same durable completion markers.
+Recovery settings do not change the resume namespace. Output creation/deletion
+remains a one-time launcher operation; retries use open-only output specs.
+
+Input/output future waits poll the stop event. Failure cleanup sets that event
+before joining threads and does not require delivery of sentinels into full
+queues. Unconfirmed output writes never receive a completion marker. Their
+source buffers remain referenced until the failed process exits because
+stopping a Python wait does not prove the native write has stopped.
+
+Direct calls to `run()` also have storage/progress deadlines and bounded thread
+joins, but cannot replace their caller's process. If a thread fails to stop,
+`run()` raises `PipelineTimeoutError` with a message to discard the process;
+do not retry inside that same process. Use the Ray or local-fallback launcher
+for process-isolated recovery. The periodic `--thread-dump-interval` remains
+an independent diagnostic timer and is not a recovery deadline.

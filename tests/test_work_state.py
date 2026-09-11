@@ -222,7 +222,20 @@ def test_run_id_ignores_lifecycle_and_sharding_but_tracks_workload():
         **common,
     )
     retry = derive_run_id(
-        cfg=_cfg(resume=True, shard_count=2, shard_index=1),
+        cfg=_cfg(
+            resume=True,
+            shard_count=2,
+            shard_index=1,
+            read_timeout_s=123,
+            write_timeout_s=234,
+            progress_timeout_s=345,
+            startup_timeout_s=456,
+            shutdown_timeout_s=12,
+            max_shard_retries=4,
+            retry_backoff_s=0,
+            diagnostic_timeout_s=3,
+            diagnostics_dir="/tmp/diagnostics",
+        ),
         output_specs=[_output_spec(create=False, open=True)],
         workload={"kind": "workflow", "name": "denoise", "params": {"x": 1}},
         **common,
@@ -296,10 +309,13 @@ class _WriteFuture:
         self.label = label
         self.fail = fail
 
-    def result(self):
+    def result(self, timeout=None):
         self.events.append(("result", self.label))
         if self.fail:
             raise RuntimeError(f"{self.label} failed")
+
+    def done(self):
+        return False
 
 
 class _WriteView:

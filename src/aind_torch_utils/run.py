@@ -28,6 +28,14 @@ from aind_torch_utils.execution import ExecutionPolicy
 from aind_torch_utils.model_registry import ModelRegistry
 from aind_torch_utils.monitoring import QueueMonitor, SystemMonitor
 from aind_torch_utils.outputs import OutputSpec
+from aind_torch_utils.recovery import (
+    PipelineProgress,
+    PipelineStopped,
+    PipelineTimeoutError,
+    capture_diagnostics,
+    diagnostic_directory,
+    stall_reason,
+)
 from aind_torch_utils.transforms import BlockPreprocessor
 from aind_torch_utils.utils import load_ts_spec, open_ts_spec
 from aind_torch_utils.work_state import (
@@ -306,6 +314,8 @@ def _guarded_worker(
         try:
             run_fn(stop_event)
         except Exception as exc:  # noqa: BLE001 - any worker death is fatal
+            if isinstance(exc, PipelineStopped) and stop_event.is_set():
+                return
             logger.exception("Worker thread %s died; stopping pipeline.", name)
             errors.append((name, exc))
             stop_event.set()
@@ -327,6 +337,8 @@ def _setup_worker_threads(
     execution: ExecutionPolicy,
     work_store: BlockWorkStore,
     worker_errors: List[Tuple[str, BaseException]],
+    *,
+    progress: Optional[PipelineProgress] = None,
 ) -> Tuple[List[threading.Thread], List[threading.Thread], List[threading.Thread]]:
     """Sets up the worker threads for the pipeline.
 
@@ -378,6 +390,8 @@ def _setup_worker_threads(
         execution,
         work_store,
     )
+    for worker in prep_workers + gpu_workers + writer_workers:
+        worker.progress = progress
 
     # Threads
     prep_threads = [
@@ -499,6 +513,7 @@ def run(
     execution: Optional[ExecutionPolicy] = None,
     thread_dump_interval: Optional[float] = None,
     work_store: Optional[BlockWorkStore] = None,
+    progress: Optional[PipelineProgress] = None,
 ) -> None:
     """Runs the inference pipeline.
 
@@ -546,6 +561,9 @@ def run(
         the watchdog. Dumps repeat until the run completes.
     work_store : BlockWorkStore, optional
         Block completion backend. Required when ``cfg.resume`` is enabled.
+    progress : PipelineProgress, optional
+        Progress channel supplied by the process supervisor. Direct callers
+        can omit it to use in-process deadline checks and diagnostic capture.
     """
     # Validate shapes
     T, C, Z, Y, X = tuple(input_store.domain.shape)
@@ -609,10 +627,8 @@ def run(
 
     stop_event = threading.Event()
 
-    # Monitors
-    q_monitor, sys_monitor = _setup_monitors(
-        prep_q, write_queues, metrics_interval, stop_event
-    )
+    externally_supervised = progress is not None
+    progress = progress if progress is not None else PipelineProgress()
 
     # Collects (thread_name, exception) from any worker that dies; re-raised
     # after joins so a failed run never looks like a successful one.
@@ -633,8 +649,13 @@ def run(
         execution,
         active_work_store,
         worker_errors,
+        progress=progress,
     )
     all_threads = prep_threads + gpu_threads + writer_threads
+
+    q_monitor, sys_monitor = _setup_monitors(
+        prep_q, write_queues, metrics_interval, stop_event
+    )
 
     prep_sentinels_sent = False
     writer_sentinels_sent = False
@@ -643,65 +664,107 @@ def run(
     )
 
     t0 = time.perf_counter()
+    started_threads = []
+    gpu_sentinels_remaining = len(cfg.devices)
+    writer_queues_to_close = list(write_queues)
+    progress.running()
     try:
         for th in all_threads:
-            th.daemon = False
+            # A failed native call cannot be killed as a Python thread. Direct
+            # callers get a bounded failure; supervised attempts retire the process.
+            th.daemon = True
             th.start()
+            started_threads.append(th)
 
         while any(th.is_alive() for th in all_threads):
+            if stop_event.is_set():
+                break
+            reason = stall_reason(progress.snapshot(), cfg, t0)
+            if reason:
+                raise PipelineTimeoutError(reason)
             # when all prep threads are done, send GPU sentinels
             if (not prep_sentinels_sent) and all(
                 not th.is_alive() for th in prep_threads
             ):
-                for _ in range(len(cfg.devices)):
-                    _put_until_stop(prep_q, None, stop_event, timeout=0.1)
-                prep_sentinels_sent = True
+                while gpu_sentinels_remaining:
+                    try:
+                        prep_q.put_nowait(None)
+                    except queue.Full:
+                        break
+                    gpu_sentinels_remaining -= 1
+                prep_sentinels_sent = gpu_sentinels_remaining == 0
 
             # when ALL GPU threads finish, close ALL writers (one sentinel per writer)
             if (not writer_sentinels_sent) and all(
                 not th.is_alive() for th in gpu_threads
             ):
-                for wq in write_queues:
-                    _put_until_stop(wq, None, stop_event, timeout=0.1)
-                writer_sentinels_sent = True
+                for wq in list(writer_queues_to_close):
+                    try:
+                        wq.put_nowait(None)
+                    except queue.Full:
+                        continue
+                    writer_queues_to_close.remove(wq)
+                writer_sentinels_sent = not writer_queues_to_close
 
             # cooperative wait
             stop_event.wait(0.05)
 
+        if worker_errors:
+            names = ", ".join(name for name, _ in worker_errors)
+            error_type = (
+                PipelineTimeoutError
+                if any(
+                    isinstance(exc, PipelineTimeoutError) for _, exc in worker_errors
+                )
+                else RuntimeError
+            )
+            raise error_type(
+                f"Worker thread(s) failed: {names}; see logged tracebacks."
+            ) from worker_errors[0][1]
+
     except (KeyboardInterrupt, Exception) as e:
         logger.exception(f"Caught {type(e).__name__}, initiating shutdown.")
+        if isinstance(e, PipelineTimeoutError) and not externally_supervised:
+            capture_diagnostics(
+                os.getpid(),
+                diagnostic_directory(cfg, metrics_json)
+                / f"shard{cfg.shard_index}-{time.time_ns()}",
+                progress.snapshot(),
+                str(e),
+                cfg.diagnostic_timeout_s,
+            )
         raise
     finally:
         try:
             logger.info("Setting stop event for all threads.")
-            # GUARANTEE sentinel delivery on shutdown
-            if not prep_sentinels_sent:
-                for _ in range(len(cfg.devices)):
-                    _put_until_stop(prep_q, None, stop_event, timeout=0.1)
-            if not writer_sentinels_sent:
-                for wq in write_queues:
-                    _put_until_stop(wq, None, stop_event, timeout=0.1)
-
             stop_event.set()
-
-            # Final join to ensure all threads have exited
-            for th in all_threads:
+            deadline = time.monotonic() + cfg.shutdown_timeout_s
+            # One shared shutdown budget, not a full timeout for every thread.
+            for th in started_threads:
                 if th.is_alive():
-                    th.join()
+                    th.join(timeout=max(0, deadline - time.monotonic()))
             # Stop monitors
-            q_monitor.join()
-            sys_monitor.join()
+            q_monitor.join(timeout=max(0, deadline - time.monotonic()))
+            sys_monitor.join(timeout=max(0, deadline - time.monotonic()))
+
+            alive = [th.name for th in started_threads if th.is_alive()]
+            if alive:
+                reason = f"Shutdown deadline exceeded; discard this process: {alive}"
+                if not externally_supervised:
+                    capture_diagnostics(
+                        os.getpid(),
+                        diagnostic_directory(cfg, metrics_json)
+                        / f"shard{cfg.shard_index}-{time.time_ns()}-shutdown",
+                        progress.snapshot(),
+                        reason,
+                        cfg.diagnostic_timeout_s,
+                    )
+                raise PipelineTimeoutError(reason)
 
             if metrics_json:
                 _write_metrics_json(metrics_json, q_monitor, sys_monitor)
         finally:
             _cancel_periodic_thread_dumps(thread_dumps_scheduled, shard_spec.index)
-
-    if worker_errors:
-        names = ", ".join(name for name, _ in worker_errors)
-        raise RuntimeError(
-            f"Worker thread(s) failed: {names}; see logged tracebacks."
-        ) from worker_errors[0][1]
 
     t1 = time.perf_counter()
     throughput = (Z * Y * X * input_store.dtype.numpy_dtype.itemsize) / 1e6 / (t1 - t0)

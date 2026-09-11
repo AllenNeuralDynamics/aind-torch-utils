@@ -11,12 +11,10 @@ from typing import Any, Dict, Optional, Sequence, Tuple, Union
 import tensorstore as ts
 
 from aind_torch_utils.config import InferenceConfig
+from aind_torch_utils.distributed.supervisor import supervise_shard
+from aind_torch_utils.recovery import PipelineProgress
 from aind_torch_utils.run import _parse_args as parse_inference_args
-from aind_torch_utils.run import (
-    load_model,
-    run,
-    run_workflow,
-)
+from aind_torch_utils.run import load_model, run, run_workflow
 from aind_torch_utils.utils import open_ts_spec
 from aind_torch_utils.work_state import (
     build_block_work_store,
@@ -141,6 +139,8 @@ def _run_shard(
     input_spec: Dict[str, Any],
     output_specs: Sequence[Dict[str, Any]],
     metrics_json: Optional[str],
+    *,
+    progress: Optional[PipelineProgress] = None,
 ) -> None:
     """Open a shard's stores and execute its selected model or workflow."""
     store_context = _make_shard_tensorstore_context(cfg)
@@ -185,6 +185,8 @@ def _run_shard(
         thread_dump_interval=run_args.thread_dump_interval,
         work_store=work_store,
     )
+    if progress is not None:
+        run_kwargs["progress"] = progress
 
     if run_args.workflow:
         workflow = WorkflowRegistry.build(
@@ -194,6 +196,23 @@ def _run_shard(
     else:
         model = load_model(run_args.model_type, run_args.weights)
         run(model, input_store, output_stores, cfg, **run_kwargs)
+
+
+def _run_shard_supervised(
+    run_args: argparse.Namespace,
+    workflow_params: Dict[str, Any],
+    cfg: InferenceConfig,
+    input_spec: Dict[str, Any],
+    output_specs: Sequence[Dict[str, Any]],
+    metrics_json: Optional[str],
+) -> None:
+    """Retire failed process state before reopening stores and resuming."""
+    supervise_shard(
+        _run_shard,
+        (run_args, workflow_params, cfg, input_spec, output_specs, metrics_json),
+        cfg,
+        metrics_json,
+    )
 
 
 def _launch_locally(
@@ -216,7 +235,7 @@ def _launch_locally(
         )
         cfg = InferenceConfig(**payload["config"])
         cfg.devices = list(_canonical_devices(cfg.devices))
-        _run_shard(
+        _run_shard_supervised(
             run_args,
             workflow_params,
             cfg,
@@ -477,14 +496,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if requested_gpus is None:
             requested_gpus = max(0.0, len(base_cfg.devices))
 
-        @ray.remote(num_cpus=cpus, num_gpus=requested_gpus)
+        @ray.remote(num_cpus=cpus, num_gpus=requested_gpus, max_retries=0)
         def shard_task(shard_idx: int, payload: Dict[str, Any]) -> None:
             cfg_dict = payload["config"]
             cfg_dict["shard_index"] = shard_idx
             cfg = InferenceConfig(**cfg_dict)
             cfg.devices = list(_canonical_devices(cfg.devices))
             metrics_json = payload["metrics_json"]
-            _run_shard(
+            _run_shard_supervised(
                 run_args,
                 workflow_params,
                 cfg,

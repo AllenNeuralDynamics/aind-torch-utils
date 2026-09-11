@@ -1,7 +1,9 @@
 import queue
 import threading
+import time
 import weakref
 from collections import Counter
+from types import SimpleNamespace
 from typing import Optional
 
 import numpy as np
@@ -15,6 +17,7 @@ from aind_torch_utils.context import BlockContext
 from aind_torch_utils.distributed.sharding import make_shard_spec
 from aind_torch_utils.execution import ExecutionPolicy
 from aind_torch_utils.outputs import OutputSpec, Threshold
+from aind_torch_utils.recovery import PipelineProgress, PipelineTimeoutError
 from aind_torch_utils.transforms import (
     GlobalNormalizer,
     IdentityTransform,
@@ -22,13 +25,86 @@ from aind_torch_utils.transforms import (
     from_config,
 )
 from aind_torch_utils.utils import iter_blocks_zyx
+from aind_torch_utils.work_state import BlockKey, BlockLease
 from aind_torch_utils.workers import (
+    _ABANDONED_WRITES,
     GpuWorker,
     Preds,
     PrepWorker,
     WriterWorker,
+    _BlockWriteGroup,
+    _BoundedPendingWrites,
     writer_for_key,
 )
+
+
+def test_input_read_deadline_reports_coordinates_before_any_batches(caplog):
+    promise, future = ts.Promise.new()
+
+    class Reader:
+        shape = (1, 1, 32, 32, 32)
+
+        def __getitem__(self, key):
+            return SimpleNamespace(read=lambda: future)
+
+    cfg = _prep_cfg(False).model_copy(update={"read_timeout_s": 0.1})
+    prepared = queue.Queue()
+    worker = PrepWorker(
+        cfg,
+        Reader(),
+        prepared,
+        cfg.patch,
+        _default_preprocess(cfg),
+        _default_execution(cfg),
+    )
+    worker.progress = PipelineProgress()
+    with pytest.raises(PipelineTimeoutError, match="input block BlockKey"):
+        worker.run(threading.Event())
+    assert prepared.empty()
+    assert "elapsed=" in caplog.text and "bbox=" in caplog.text
+    operation = next(iter(worker.progress.snapshot()["outstanding"].values()))
+    assert operation["block"] == (0, 0, 0, 0, 0)
+    promise.set_result(np.zeros((32, 32, 32)))
+
+
+def test_stalled_write_is_bounded_retains_source_and_never_marks_complete():
+    promise, future = ts.Promise.new()
+    completed = []
+    work_store = SimpleNamespace(
+        complete_block=completed.append,
+        fail_block=lambda *args: None,
+    )
+    group = _BlockWriteGroup(BlockLease(BlockKey(0, 0, 0, 0, 0, 0)), work_store)
+    source = np.ones((2, 2, 2))
+    ref = weakref.ref(source)
+    pending = _BoundedPendingWrites(1, timeout_s=0.1)
+    pending.submit(SimpleNamespace(write=lambda array: future), source, group)
+    group.seal()
+    del source
+    started = time.monotonic()
+    try:
+        with pytest.raises(PipelineTimeoutError):
+            pending.flush()
+        assert time.monotonic() - started < 1
+        assert ref() is not None
+        assert completed == [] and group.failed
+    finally:
+        promise.set_result(None)
+        _ABANDONED_WRITES[:] = [p for p in _ABANDONED_WRITES if p.group is not group]
+
+
+def test_committed_write_is_reaped_without_waiting_for_another_block():
+    promise, future = ts.Promise.new()
+    group = _BlockWriteGroup(None, SimpleNamespace())
+    progress = PipelineProgress()
+    pending = _BoundedPendingWrites(1, progress=progress)
+    pending.submit(SimpleNamespace(write=lambda array: future), np.ones(1), group)
+    group.seal()
+    assert progress.snapshot()["outstanding"]
+    promise.set_result(None)
+    pending.poll()
+    assert group.remaining == 0
+    assert not progress.snapshot()["outstanding"]
 
 
 def _default_preprocess(cfg):
@@ -91,8 +167,11 @@ def _drain(prep_q):
 
 
 class _FakeResult:
-    def result(self):
+    def result(self, timeout=None):
         return None
+
+    def done(self):
+        return True
 
 
 class _FakeSlice:
@@ -133,12 +212,15 @@ class _TrackedWriteFuture:
         self._source_ref = weakref.ref(source)
         self._fail = fail
 
-    def result(self):
+    def result(self, timeout=None):
         self._store.events.append(("result", self._write_index))
         self._store.source_alive_at_result.append(self._source_ref() is not None)
         self._store.inflight -= 1
         if self._fail:
             raise RuntimeError(f"asynchronous write {self._write_index} failed")
+
+    def done(self):
+        return False
 
 
 class _TrackedAsyncSlice:
@@ -149,9 +231,7 @@ class _TrackedAsyncSlice:
         write_index = self._store.write_count
         self._store.write_count += 1
         self._store.inflight += 1
-        self._store.max_inflight = max(
-            self._store.max_inflight, self._store.inflight
-        )
+        self._store.max_inflight = max(self._store.max_inflight, self._store.inflight)
         self._store.events.append(("write", write_index))
         return _TrackedWriteFuture(
             self._store,
@@ -322,9 +402,9 @@ def test_prep_worker_uses_execution_input_dtype():
     execution = ExecutionPolicy.from_config(
         amp=True, use_compile=False, compile_mode="default", compile_dynamic=None
     )
-    PrepWorker(
-        cfg, store, prep_q, cfg.patch, _default_preprocess(cfg), execution
-    ).run(threading.Event())
+    PrepWorker(cfg, store, prep_q, cfg.patch, _default_preprocess(cfg), execution).run(
+        threading.Event()
+    )
 
     batches = _drain(prep_q)
     assert batches
@@ -388,9 +468,7 @@ def test_stride_writer_keys_are_dense_and_balance_current_configuration():
             global_slot = global_block_index % global_prep
             if offset <= global_slot < offset + local_prep:
                 worker = workers[global_slot - offset]
-                keys.append(
-                    worker._writer_key_for_block(global_block_index, block_idx)
-                )
+                keys.append(worker._writer_key_for_block(global_block_index, block_idx))
 
         assert sorted(keys) == list(range(616))
         counts = Counter(writer_for_key(key, num_writers) for key in keys)
@@ -430,9 +508,7 @@ def test_contiguous_writer_keys_are_dense_and_balanced():
         for global_block_index, (block_idx, _) in enumerate(blocks):
             if workers[0]._block_in_shard(block_idx):
                 worker = workers[global_block_index % local_prep]
-                keys.append(
-                    worker._writer_key_for_block(global_block_index, block_idx)
-                )
+                keys.append(worker._writer_key_for_block(global_block_index, block_idx))
 
         assert sorted(keys) == list(range(len(keys)))
         counts = Counter(writer_for_key(key, num_writers) for key in keys)
